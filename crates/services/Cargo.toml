@@ -1,0 +1,11 @@
+[package]
+name = "turbodbn-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+turbodbn-core.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
