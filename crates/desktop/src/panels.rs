@@ -1,7 +1,7 @@
 use crate::cell::CellView;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, StyledExt,
+    ActiveTheme, IconName, StyledExt,
     dock::{Panel, PanelEvent},
 };
 use turbodbn_core::Note;
@@ -27,7 +27,7 @@ impl WorkbenchPanel {
         self.content = if connections {
             PanelContent::Info {
                 heading: "尚未添加连接",
-                body: "连接配置集中管理；表、视图与 DDL 位于右侧数据库结构面板。",
+                body: "连接配置集中管理；表、视图与 DDL 位于右侧表结构面板。",
             }
         } else {
             PanelContent::Info {
@@ -78,8 +78,26 @@ impl Panel for WorkbenchPanel {
     fn panel_name(&self) -> &'static str {
         self.name
     }
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        self.title
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let icon = match self.name {
+            "notebook" => IconName::BookOpen,
+            "navigation" => IconName::Folder,
+            "schema" => IconName::LayoutDashboard,
+            _ => IconName::Info,
+        };
+        crate::tabs::title(self.name, icon, crate::locale::t(cx, self.title), cx)
+    }
+    fn dropdown_menu(
+        &mut self,
+        menu: gpui_component::menu::PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_component::menu::PopupMenu {
+        if self.name == "notebook" {
+            crate::tabs::editor_menu(menu, self.name, cx)
+        } else {
+            menu
+        }
     }
     fn closable(&self, _: &App) -> bool {
         false
@@ -102,19 +120,26 @@ impl Render for WorkbenchPanel {
             PanelContent::Notebook(cells) => content
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(rems(crate::typography::META))
                         .text_color(cx.theme().muted_foreground)
-                        .child("工作区 / 入门工作台 · 本次编辑仅保留在内存中"),
+                        .child(crate::locale::t(
+                            cx,
+                            "工作区 / 入门工作台 · 本次编辑仅保留在内存中",
+                        )),
                 )
                 .children(cells.iter().cloned()),
-            PanelContent::Info { heading, body } => {
-                content.child(div().text_sm().child(*heading)).child(
+            PanelContent::Info { heading, body } => content
+                .child(
                     div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(*body),
+                        .text_size(rems(crate::typography::BODY))
+                        .child(crate::locale::t(cx, heading)),
                 )
-            }
+                .child(
+                    div()
+                        .text_size(rems(crate::typography::BODY))
+                        .text_color(cx.theme().muted_foreground)
+                        .child(crate::locale::t(cx, body)),
+                ),
         }
     }
 }

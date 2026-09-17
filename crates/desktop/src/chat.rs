@@ -3,7 +3,7 @@ use crate::preferences::EnginePreferences;
 use crate::{preferences::Preferences, settings::Category};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, Icon, IconName, Selectable, Sizable, StyledExt,
+    ActiveTheme, Disableable, Icon, IconName, Selectable, StyledExt,
     button::{Button, ButtonVariants},
     dock::{Panel, PanelEvent},
     input::{Input, InputState},
@@ -29,9 +29,14 @@ struct Message {
     visible: String,
 }
 
+struct LogLine {
+    time: String,
+    text: String,
+    error: bool,
+}
 pub struct AiLog {
     focus: FocusHandle,
-    lines: VecDeque<String>,
+    lines: VecDeque<LogLine>,
     scroll: ScrollHandle,
     follow: bool,
 }
@@ -44,11 +49,15 @@ impl AiLog {
             follow: true,
         }
     }
-    fn push(&mut self, text: String, cx: &mut Context<Self>) {
+    fn push(&mut self, text: String, error: bool, cx: &mut Context<Self>) {
         if self.lines.len() == 200 {
             self.lines.pop_front();
         }
-        self.lines.push_back(text.chars().take(2000).collect());
+        self.lines.push_back(LogLine {
+            time: chrono::Local::now().format("%H:%M:%S").to_string(),
+            text: text.chars().take(2000).collect(),
+            error,
+        });
         if self.follow {
             self.scroll.scroll_to_bottom();
         }
@@ -65,8 +74,59 @@ impl Panel for AiLog {
     fn panel_name(&self) -> &'static str {
         "ai-output"
     }
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "AI 运行输出"
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .h_flex()
+            .gap_2()
+            .child(IconName::SquareTerminal)
+            .child(crate::locale::t(cx, "输出"))
+    }
+    fn toolbar_buttons(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<Vec<Button>> {
+        Some(vec![
+            Button::new("follow-log")
+                .ghost()
+                .icon(IconName::ArrowDown)
+                .w(px(28.))
+                .h(px(28.))
+                .p_0()
+                .tooltip(crate::locale::t(cx, "跟随输出"))
+                .selected(self.follow)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.follow = !this.follow;
+                    if this.follow {
+                        this.scroll.scroll_to_bottom();
+                    }
+                    cx.notify();
+                })),
+            Button::new("clear-log")
+                .ghost()
+                .icon(IconName::Delete)
+                .w(px(28.))
+                .h(px(28.))
+                .p_0()
+                .tooltip(crate::locale::t(cx, "清空"))
+                .disabled(self.lines.is_empty())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.lines.clear();
+                    cx.notify();
+                })),
+            Button::new("close-output")
+                .ghost()
+                .icon(IconName::Close)
+                .w(px(28.))
+                .h(px(28.))
+                .p_0()
+                .tooltip(crate::locale::t(cx, "关闭输出"))
+                .on_click(|_, _, cx| {
+                    let events = cx.global::<crate::tabs::TabRouter>().0.clone();
+                    events.update(cx, |_, cx| {
+                        cx.emit(crate::tabs::CloseTabs {
+                            name: "ai-output",
+                            mode: crate::tabs::CloseMode::Current,
+                        })
+                    });
+                }),
+        ])
     }
     fn closable(&self, _: &App) -> bool {
         false
@@ -75,31 +135,15 @@ impl Panel for AiLog {
 impl Render for AiLog {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("output-log")
             .v_flex()
             .size_full()
-            .p_3()
-            .gap_2()
-            .text_sm()
-            .child(
-                Button::new("follow-log")
-                    .label("跟随输出")
-                    .selected(self.follow)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.follow = !this.follow;
-                        if this.follow {
-                            this.scroll.scroll_to_bottom();
-                        }
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new("clear-ai-log")
-                    .label("清空")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.lines.clear();
-                        cx.notify();
-                    })),
-            )
+            .min_h_0()
+            .px_3()
+            .py_2()
+            .track_focus(&self.focus)
+            .font_family(cx.theme().mono_font_family.clone())
+            .text_size(rems(crate::typography::BODY))
             .child(
                 div()
                     .id("ai-log-lines")
@@ -107,7 +151,45 @@ impl Render for AiLog {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(self.lines.iter().map(|line| div().child(line.clone()))),
+                    .on_scroll_wheel(cx.listener(|this, _, _, cx| {
+                        this.follow = false;
+                        cx.notify();
+                    }))
+                    .when(self.lines.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(crate::locale::t(cx, "暂无执行日志")),
+                        )
+                    })
+                    .children(self.lines.iter().enumerate().map(|(index, line)| {
+                        div()
+                            .id(("log-line", index))
+                            .h_flex()
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(line.time.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_color(if line.error {
+                                        cx.theme().danger
+                                    } else {
+                                        cx.theme().foreground
+                                    })
+                                    .child(format!(
+                                        "{}{}",
+                                        if line.error { "[ERROR] " } else { "" },
+                                        line.text
+                                    )),
+                            )
+                    })),
             )
     }
 }
@@ -125,7 +207,7 @@ pub struct ChatView {
     engine: Engine,
     sessions: HashMap<Engine, LastChat>,
     drafts: HashMap<Engine, EngineDraft>,
-    work_details: bool,
+    account_status: String,
     input_observer: Option<Subscription>,
     history: HistoryWriter,
     history_interrupted: bool,
@@ -331,7 +413,7 @@ impl ChatView {
         self.elapsed = Duration::from_secs(last.elapsed_seconds);
         self.history_interrupted = last.interrupted;
         self.selection_menu = None;
-        self.work_details = false;
+        self.account_status.clear();
         self.save_status.clear();
         self.resume_follow();
         self.status = error
@@ -357,22 +439,29 @@ impl ChatView {
         }
         cx.notify();
     }
-    fn engine_control(&self, cx: &Context<Self>) -> AnyElement {
+    fn engine_control(&self, compact: bool, cx: &Context<Self>) -> AnyElement {
         let active = self.engine;
         let view = cx.entity().downgrade();
         Button::new("engine-picker")
             .ghost()
-            .small()
             .icon(IconName::Bot)
-            .label(active.name())
-            .tooltip(if self.busy {
-                "请先停止当前生成，再切换引擎"
-            } else {
-                "切换 AI 引擎"
-            })
+            .when(!compact, |button| button.label(active.name()))
+            .when(compact, |button| button.w(px(32.)).h(px(32.)).p_0())
+            .tooltip(format!(
+                "{} · {}",
+                active.name(),
+                crate::locale::t(
+                    cx,
+                    if self.busy {
+                        "请先停止当前生成，再切换引擎"
+                    } else {
+                        "切换 AI 引擎"
+                    },
+                )
+            ))
             .disabled(self.busy || self.saving || self.connecting)
-            .dropdown_menu(move |mut menu, _, _| {
-                menu = menu.item(PopupMenuItem::label("AI 引擎"));
+            .dropdown_menu(move |mut menu, _, cx| {
+                menu = menu.item(PopupMenuItem::label(crate::locale::t(cx, "AI 引擎")));
                 for engine in [Engine::Codex, Engine::Claude] {
                     let view = view.clone();
                     menu = menu.item(
@@ -386,11 +475,13 @@ impl ChatView {
                 }
                 let view = view.clone();
                 menu.item(PopupMenuItem::separator()).item(
-                    PopupMenuItem::new("管理 AI 服务…").on_click(move |_, _, cx| {
-                        let _ = view.update(cx, |_, cx| {
-                            cx.emit(crate::settings::SettingsRequest::Open(Some(Category::Ai)))
-                        });
-                    }),
+                    PopupMenuItem::new(crate::locale::t(cx, "管理 AI 服务…")).on_click(
+                        move |_, _, cx| {
+                            let _ = view.update(cx, |_, cx| {
+                                cx.emit(crate::settings::SettingsRequest::Open(Some(Category::Ai)))
+                            });
+                        },
+                    ),
                 )
             })
             .into_any_element()
@@ -430,7 +521,7 @@ impl ChatView {
             self.history.save(self.history_snapshot());
             self.history_last_write = Instant::now();
             if let Some(error) = self.history.take_error() {
-                self.write_log(format!("保存聊天历史失败：{error}"), cx);
+                self.write_error(format!("保存聊天历史失败：{error}"), cx);
             }
         }
     }
@@ -476,7 +567,7 @@ impl ChatView {
             engine,
             sessions: HashMap::new(),
             drafts: HashMap::new(),
-            work_details: false,
+            account_status: String::new(),
             input_observer: None,
             history: HistoryWriter::new(),
             history_interrupted: last.interrupted,
@@ -609,7 +700,21 @@ impl ChatView {
         cx.notify();
     }
     fn write_log(&mut self, text: String, cx: &mut Context<Self>) {
-        self.log.update(cx, |log, cx| log.push(text, cx));
+        self.log.update(cx, |log, cx| log.push(text, false, cx));
+    }
+    fn write_error(&mut self, text: String, cx: &mut Context<Self>) {
+        self.log.update(cx, |log, cx| log.push(text, true, cx));
+    }
+    pub fn connection_status(&self) -> &'static str {
+        if self.busy {
+            "生成中"
+        } else if self.connecting {
+            "连接中"
+        } else if self.ready {
+            "已连接"
+        } else {
+            "未连接"
+        }
     }
     fn browse_codex(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let selection = cx.prompt_for_paths(PathPromptOptions {
@@ -775,13 +880,19 @@ impl ChatView {
             }
             Event::Account { ready, label } => {
                 self.ready = ready;
+                self.account_status = if ready { label.clone() } else { String::new() };
                 self.status = label.clone();
-                self.write_log(label, cx);
+                if ready {
+                    self.write_log(label, cx);
+                } else {
+                    self.write_error(label, cx);
+                }
             }
             Event::Log(line) => self.write_log(line, cx),
             Event::Delta { item, text } => self.apply_text(item, text, false, cx),
             Event::Snapshot { item, text } => self.apply_text(item, text, true, cx),
             Event::Completed(status) => {
+                let failed = !matches!(status.as_str(), "completed" | "interrupted" | "已停止");
                 self.history_interrupted = false;
                 self.finish_timing();
                 self.busy = false;
@@ -791,7 +902,11 @@ impl ChatView {
                     _ => "请求未成功完成",
                 }
                 .into();
-                self.write_log(self.status.clone(), cx);
+                if failed {
+                    self.write_error(self.status.clone(), cx);
+                } else {
+                    self.write_log(self.status.clone(), cx);
+                }
                 self.persist_history(true, cx);
             }
             Event::Error(error) => {
@@ -799,7 +914,7 @@ impl ChatView {
                 self.busy = false;
                 self.connecting = false;
                 self.status = error.clone();
-                self.write_log(error, cx);
+                self.write_error(error, cx);
                 self.persist_history(true, cx);
             }
             Event::Disconnected => {
@@ -907,8 +1022,13 @@ impl Panel for ChatView {
     fn panel_name(&self) -> &'static str {
         "ai-chat"
     }
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "AI Chat"
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::tabs::title(
+            "ai-chat",
+            IconName::Bot,
+            crate::locale::t(cx, "AI 对话"),
+            cx,
+        )
     }
     fn closable(&self, _: &App) -> bool {
         false
@@ -925,6 +1045,22 @@ fn duration_label(elapsed: Duration) -> String {
 }
 
 impl ChatView {
+    pub fn settings_engine(&self) -> Engine {
+        self.engine
+    }
+    pub fn settings_can_switch(&self, cx: &App) -> bool {
+        !self.busy && !self.saving && !self.connecting && !self.settings_dirty(cx)
+    }
+    pub fn select_settings_engine(
+        &mut self,
+        engine: Engine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings_can_switch(cx) {
+            self.switch_engine(engine, window, cx);
+        }
+    }
     pub fn settings_saving(&self) -> bool {
         self.saving
     }
@@ -957,8 +1093,23 @@ impl ChatView {
                 && (model != prefs.ai.get(self.engine).model.as_deref()
                     || self.effort != prefs.ai.get(self.engine).effort))
     }
+    pub fn settings_signature(&self, cx: &App) -> String {
+        format!(
+            "{:?}",
+            (
+                self.engine,
+                self.path.read(cx).value(),
+                self.cwd.read(cx).value(),
+                self.selected,
+                &self.effort,
+                self.auto_connect,
+                self.restore_last_session,
+                cx.theme().mode.is_dark()
+            )
+        )
+    }
     pub fn save_all_settings(&mut self, cx: &mut Context<Self>) {
-        self.save_settings(!self.path.read(cx).value().trim().is_empty(), cx);
+        self.persist_settings(true, false, cx);
     }
     pub fn discard_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let prefs = cx.global::<Preferences>().clone();
@@ -1034,10 +1185,13 @@ impl ChatView {
         self.save_status.clone()
     }
     pub fn save_settings(&mut self, ai: bool, cx: &mut Context<Self>) {
+        self.persist_settings(ai, true, cx);
+    }
+    fn persist_settings(&mut self, ai: bool, connect_after: bool, cx: &mut Context<Self>) {
         if self.saving {
             return;
         }
-        if ai && self.busy {
+        if ai && self.busy && connect_after {
             self.save_status = "请先停止当前回答，再修改 AI 设置".into();
             cx.notify();
             return;
@@ -1048,22 +1202,34 @@ impl ChatView {
             let model = self
                 .selected
                 .and_then(|i| self.models.get(i))
-                .map(|m| m.model.clone());
+                .map(|m| m.model.clone())
+                .or_else(|| {
+                    if !self.ready {
+                        prefs.ai.get(self.engine).model.clone()
+                    } else {
+                        None
+                    }
+                });
             let entry = prefs.ai.get_mut(self.engine);
             entry.executable = self.path.read(cx).value().trim().to_string();
             entry.working_directory = self.cwd.read(cx).value().trim().to_string();
             entry.model = model;
-            entry.effort = self.effort.clone();
+            if self.ready {
+                entry.effort = self.effort.clone();
+            }
             entry.auto_connect = self.auto_connect;
             entry.restore_last_session = self.restore_last_session;
             prefs.ai.active = self.engine;
         }
         let engine = self.engine;
+        if !connect_after {
+            self.automatic.suppress(engine);
+        }
         self.saving = true;
         self.save_status = "正在保存…".into();
         let saved = prefs.clone();
         let work = cx.background_executor().spawn(async move {
-            if ai {
+            if ai && (!saved.ai.get(engine).executable.is_empty() || connect_after) {
                 let exe = PathBuf::from(&saved.ai.get(engine).executable);
                 let cwd = PathBuf::from(&saved.ai.get(engine).working_directory);
                 if !exe.is_absolute() || !exe.is_file() {
@@ -1091,8 +1257,13 @@ impl ChatView {
                         cx.set_global(prefs);
                         this.save_status = "设置已保存".into();
                         if ai {
-                            this.configured = true;
-                            if this.connection.is_none() {
+                            this.configured = !cx
+                                .global::<Preferences>()
+                                .ai
+                                .get(engine)
+                                .executable
+                                .is_empty();
+                            if connect_after && this.connection.is_none() {
                                 this.connect(cx);
                             }
                         }
@@ -1183,16 +1354,19 @@ impl ChatView {
                     current.as_deref().unwrap_or("默认")
                 )
             })
-            .unwrap_or("选择模型".into());
+            .unwrap_or_else(|| crate::locale::t(cx, "选择模型").to_string());
         let view = cx.entity().downgrade();
         Button::new("composer-model")
             .ghost()
-            .small()
-            .label(label)
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
+            .tooltip(label.clone())
+            .child(div().min_w_0().max_w(rems(8.)).truncate().child(label))
             .icon(IconName::ChevronDown)
             .disabled(self.busy || models.is_empty())
-            .dropdown_menu(move |mut menu, _, _| {
-                menu = menu.item(PopupMenuItem::label("模型"));
+            .dropdown_menu(move |mut menu, _, cx| {
+                menu = menu.item(PopupMenuItem::label(crate::locale::t(cx, "模型")));
                 for (index, model) in models.iter().enumerate() {
                     let view = view.clone();
                     menu = menu.item(
@@ -1206,7 +1380,7 @@ impl ChatView {
                 if let Some(model) = selected.and_then(|i| models.get(i)) {
                     menu = menu
                         .item(PopupMenuItem::separator())
-                        .item(PopupMenuItem::label("推理强度"));
+                        .item(PopupMenuItem::label(crate::locale::t(cx, "推理强度")));
                     for effort in &model.supported_reasoning_efforts {
                         let value = effort.reasoning_effort.clone();
                         let view = view.clone();
@@ -1245,6 +1419,46 @@ impl ChatView {
             .flex_shrink_0()
             .child(
                 div()
+                    .h_flex()
+                    .gap_1()
+                    .min_w_0()
+                    .child(
+                        Button::new("chat-connection")
+                            .ghost()
+                            .icon(IconName::Globe)
+                            .flex_1()
+                            .min_w_0()
+                            .px_1()
+                            .child(
+                                div()
+                                    .max_w(rems(3.))
+                                    .truncate()
+                                    .child(crate::locale::t(cx, "连接")),
+                            )
+                            .dropdown_caret(true)
+                            .tooltip(crate::locale::t(cx, "数据库连接功能尚未接入"))
+                            .disabled(true),
+                    )
+                    .child(
+                        Button::new("chat-database")
+                            .ghost()
+                            .icon(Icon::default().path("icons/database.svg"))
+                            .flex_1()
+                            .min_w_0()
+                            .px_1()
+                            .child(
+                                div()
+                                    .max_w(rems(3.))
+                                    .truncate()
+                                    .child(crate::locale::t(cx, "数据库")),
+                            )
+                            .dropdown_caret(true)
+                            .tooltip(crate::locale::t(cx, "请先选择连接"))
+                            .disabled(true),
+                    ),
+            )
+            .child(
+                div()
                     .v_flex()
                     .gap_1()
                     .p_2()
@@ -1254,21 +1468,24 @@ impl ChatView {
                     .bg(cx.theme().muted)
                     .child(
                         Input::new(&self.input)
+                            .text_size(rems(crate::typography::BODY))
                             .appearance(false)
-                            .min_h(px(80.))
-                            .max_h(px(160.)),
+                            .min_h(rems(5.))
+                            .max_h(rems(10.)),
                     )
                     .child(
                         div()
                             .h_flex()
                             .gap_1()
-                            .flex_wrap()
+                            .min_w_0()
+                            .w_full()
                             .child(
                                 Button::new("quick-prompts")
                                     .ghost()
-                                    .small()
+                                    .w(px(32.))
+                                    .h(px(32.))
                                     .icon(IconName::Plus)
-                                    .tooltip("快捷提问")
+                                    .tooltip(crate::locale::t(cx, "快捷提问"))
                                     .disabled(self.busy)
                                     .dropdown_menu(move |mut menu, _, _| {
                                         for (label, text) in [
@@ -1312,32 +1529,37 @@ impl ChatView {
                             .child(
                                 Button::new("read-only-mode")
                                     .ghost()
-                                    .small()
+                                    .w(px(32.))
+                                    .h(px(32.))
                                     .icon(IconName::Eye)
-                                    .label("只读分析")
-                                    .tooltip("当前仅开放只读分析，不执行数据库写入"),
+                                    .tooltip(crate::locale::t(
+                                        cx,
+                                        "当前仅开放只读分析，不执行数据库写入",
+                                    )),
                             )
-                            .child(div().flex_1())
-                            .child(self.engine_control(cx))
-                            .child(self.composer_model(cx))
+                            .child(self.engine_control(true, cx))
+                            .child(div().flex_1().min_w_0().child(self.composer_model(cx)))
                             .child(
                                 Button::new("send-or-stop")
                                     .primary()
                                     .rounded(px(16.))
-                                    .w(px(32.))
                                     .h(px(32.))
+                                    .w(px(32.))
                                     .icon(if self.busy {
                                         Icon::default().path("icons/stop.svg")
                                     } else {
                                         Icon::new(IconName::ArrowUp)
                                     })
-                                    .tooltip(if self.stopping {
-                                        "正在停止…"
-                                    } else if self.busy {
-                                        "停止生成"
-                                    } else {
-                                        "发送"
-                                    })
+                                    .tooltip(crate::locale::t(
+                                        cx,
+                                        if self.stopping {
+                                            "正在停止…"
+                                        } else if self.busy {
+                                            "停止生成"
+                                        } else {
+                                            "发送"
+                                        },
+                                    ))
                                     .disabled(self.stopping || (!self.busy && !can_send))
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         if this.busy {
@@ -1363,23 +1585,27 @@ impl ChatView {
                     .h_flex()
                     .justify_between()
                     .gap_2()
-                    .text_xs()
+                    .text_size(rems(crate::typography::META))
                     .text_color(cx.theme().muted_foreground)
                     .child(
                         div()
                             .h_flex()
                             .gap_1()
+                            .flex_1()
                             .min_w_0()
                             .child(IconName::Folder)
-                            .child(directory),
+                            .child(div().flex_1().min_w_0().truncate().child(directory)),
                     )
-                    .child(if self.busy {
-                        "正在工作"
-                    } else if self.ready {
-                        "已连接 · 本地"
-                    } else {
-                        "未连接"
-                    }),
+                    .child(crate::locale::t(
+                        cx,
+                        if self.busy {
+                            "正在工作"
+                        } else if self.ready {
+                            "已连接 · 本地"
+                        } else {
+                            "未连接"
+                        },
+                    )),
             )
             .into_any_element()
     }
@@ -1389,48 +1615,47 @@ impl ChatView {
         div()
             .v_flex()
             .gap_3()
-            .child(div().text_lg().child("AI 服务"))
-            .child(self.engine_control(cx))
-            .child(Switch::new("auto-connect").label("打开 AI 面板时自动连接").checked(self.auto_connect)
+            .child(div().text_size(rems(crate::typography::HEADING)).child(crate::locale::t(cx,"AI 服务")))
+            .child(Switch::new("auto-connect").label(crate::locale::t(cx,"打开 AI 面板时自动连接")).checked(self.auto_connect)
                 .disabled(self.saving).on_click(cx.listener(|this,checked:&bool,_,cx|{this.auto_connect = *checked;cx.notify();})))
-            .child(Switch::new("restore-session").label("启动时恢复上次会话").checked(self.restore_last_session)
-                .tooltip("下次启动生效；关闭此项不会删除本地历史")
+            .child(Switch::new("restore-session").label(crate::locale::t(cx,"启动时恢复上次会话")).checked(self.restore_last_session)
+                .tooltip(crate::locale::t(cx,"下次启动生效；关闭此项不会删除本地历史"))
                 .disabled(self.saving).on_click(cx.listener(|this,checked:&bool,_,cx|{this.restore_last_session = *checked;cx.notify();})))
-            .when(self.engine==Engine::Claude,|el|el.child(div().text_xs().text_color(cx.theme().muted_foreground)
-                .child("Claude 使用 CLI 默认模型或官方别名，实际可用性由账号/服务配置决定；本版不覆盖推理强度。")))
+            .when(self.engine==Engine::Claude,|el|el.child(div().text_size(rems(crate::typography::META)).text_color(cx.theme().muted_foreground)
+                .child(crate::locale::t(cx,"Claude 使用 CLI 默认模型或官方别名，实际可用性由账号/服务配置决定；本版不覆盖推理强度。"))))
             .child(
                 div()
-                    .text_xs()
+                    .text_size(rems(crate::typography::META))
                     .text_color(cx.theme().muted_foreground)
-                    .child("Codex / Claude 分别保存配置与会话。切换引擎不会自动发送请求。"),
+                    .child(crate::locale::t(cx,"Codex / Claude 分别保存配置与会话。切换引擎不会自动发送请求。")),
             )
-            .child("可执行文件")
-            .child(Input::new(&self.path).disabled(self.connection.is_some() || self.saving))
+            .child(crate::locale::t(cx,"可执行文件"))
+            .child(Input::new(&self.path).text_size(rems(crate::typography::BODY)).disabled(self.connection.is_some() || self.saving))
             .child(
                 div()
                     .h_flex()
                     .gap_2()
                     .child(
-                        Button::new("browse")
-                            .label("浏览文件")
+                        Button::new("browse").icon(IconName::FolderOpen)
+                            .label(crate::locale::t(cx,"浏览文件"))
                             .disabled(self.connection.is_some() || self.saving)
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.browse_codex(window, cx)),
                             ),
                     )
                     .child(
-                        Button::new("detect")
-                            .label(if self.detecting {
+                        Button::new("detect").icon(IconName::Search)
+                            .label(crate::locale::t(cx,if self.detecting {
                                 "检测中…"
                             } else {
                                 "重新检测"
-                            })
+                            }))
                             .disabled(self.detecting || self.connection.is_some() || self.saving)
                             .on_click(cx.listener(|this, _, window, cx| this.detect(window, cx))),
                     )
                     .child(
-                        Button::new("candidates")
-                            .label("检测结果")
+                        Button::new("candidates").icon(IconName::ChevronDown)
+                            .label(crate::locale::t(cx,"检测结果"))
                             .disabled(
                                 candidates.is_empty() || self.connection.is_some() || self.saving,
                             )
@@ -1468,20 +1693,20 @@ impl ChatView {
             )
             .child(
                 div()
-                    .text_xs()
+                    .text_size(rems(crate::typography::META))
                     .text_color(cx.theme().muted_foreground)
                     .child(self.discovery_status.clone()),
             )
-            .child("工作目录")
-            .child(Input::new(&self.cwd).disabled(self.connection.is_some() || self.saving))
+            .child(crate::locale::t(cx,"工作目录"))
+            .child(Input::new(&self.cwd).text_size(rems(crate::typography::BODY)).disabled(self.connection.is_some() || self.saving))
             .child(
                 div()
-                    .text_xs()
+                    .text_size(rems(crate::typography::META))
                     .text_color(cx.theme().muted_foreground)
-                    .child("当前仅提供文本/只读分析；使用所选 CLI 的已有登录状态。"),
+                    .child(crate::locale::t(cx,"当前仅提供文本/只读分析；使用所选 CLI 的已有登录状态。")),
             )
             .when(!self.models.is_empty(), |el| {
-                el.child("默认模型与推理强度")
+                el.child(crate::locale::t(cx,"默认模型与推理强度"))
                     .child(self.model_controls(cx))
             })
             .child(
@@ -1489,29 +1714,26 @@ impl ChatView {
                     .h_flex()
                     .gap_2()
                     .child(
-                        Button::new("save-ai")
+                        Button::new("connect-ai")
+                            .icon(IconName::Bot)
                             .primary()
-                            .label(if self.connection.is_some() {
-                                "保存设置"
-                            } else {
-                                "保存并连接"
-                            })
-                            .disabled(self.busy || self.saving || self.connecting)
+                            .label(crate::locale::t(cx,"连接"))
+                            .disabled(self.saving || self.busy || self.connection.is_some())
                             .on_click(cx.listener(|this, _, _, cx| this.save_settings(true, cx))),
                     )
                     .when(self.connection.is_some(), |el| {
                         el.child(
-                            Button::new("disconnect-ai")
-                                .label("断开连接")
+                            Button::new("disconnect-ai").icon(IconName::Close)
+                                .label(crate::locale::t(cx,"断开连接"))
                                 .disabled(self.busy)
                                 .on_click(cx.listener(|this, _, _, cx| this.disconnect(cx))),
                         )
                     }),
             )
-            .child(div().text_sm().child(self.status.clone()))
+            .child(div().text_size(rems(crate::typography::BODY)).child(crate::locale::t(cx,&self.status)))
             .child(
                 div()
-                    .text_sm()
+                    .text_size(rems(crate::typography::BODY))
                     .text_color(cx.theme().muted_foreground)
                     .child(self.save_status.clone()),
             )
@@ -1529,32 +1751,47 @@ impl Render for ChatView {
             .v_flex()
             .size_full()
             .min_h_0()
-            .text_sm()
+            .text_size(rems(crate::typography::BODY))
             .bg(cx.theme().background)
             .track_focus(&self.focus);
         if !self.configured && self.messages.is_empty() {
             return shell
-                .child(self.engine_control(cx))
-                .items_center()
-                .justify_center()
-                .gap_4()
-                .p_6()
-                .child(IconName::Bot)
-                .child(div().text_lg().child("开始你的 SQL 分析"))
                 .child(
                     div()
-                        .text_color(cx.theme().muted_foreground)
-                        .child("配置 AI 服务，解释 SQL、分析问题并整理查询思路。"),
+                        .v_flex()
+                        .flex_1()
+                        .w_full()
+                        .min_h_0()
+                        .child(self.engine_control(false, cx))
+                        .items_center()
+                        .justify_center()
+                        .gap_4()
+                        .p_6()
+                        .child(IconName::Bot)
+                        .child(
+                            div()
+                                .text_size(rems(crate::typography::HEADING))
+                                .child(crate::locale::t(cx, "开始你的 SQL 分析")),
+                        )
+                        .child(div().text_color(cx.theme().muted_foreground).child(
+                            crate::locale::t(
+                                cx,
+                                "配置 AI 服务，解释 SQL、分析问题并整理查询思路。",
+                            ),
+                        ))
+                        .child(
+                            Button::new("configure-ai")
+                                .primary()
+                                .icon(IconName::Settings)
+                                .label(crate::locale::t(cx, "前往设置"))
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    cx.emit(crate::settings::SettingsRequest::Open(Some(
+                                        Category::Ai,
+                                    )))
+                                })),
+                        ),
                 )
-                .child(
-                    Button::new("configure-ai")
-                        .primary()
-                        .icon(IconName::Settings)
-                        .label("前往设置")
-                        .on_click(cx.listener(|_, _, _, cx| {
-                            cx.emit(crate::settings::SettingsRequest::Open(Some(Category::Ai)))
-                        })),
-                );
+                .child(self.composer(cx));
         }
         let elapsed = self.started.map(|t| t.elapsed()).unwrap_or(self.elapsed);
         let running = if self.stopping {
@@ -1583,14 +1820,16 @@ impl Render for ChatView {
                     .child(
                         Button::new("new-thread")
                             .ghost()
-                            .small()
                             .icon(IconName::Plus)
-                            .label("新会话")
-                            .tooltip(if self.busy {
-                                "请先停止当前回答"
-                            } else {
-                                "开始新会话"
-                            })
+                            .tooltip(crate::locale::t(cx, "新会话"))
+                            .tooltip(crate::locale::t(
+                                cx,
+                                if self.busy {
+                                    "请先停止当前回答"
+                                } else {
+                                    "开始新会话"
+                                },
+                            ))
                             .disabled(self.busy || self.connecting)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some(connection) = &this.connection
@@ -1626,11 +1865,14 @@ impl Render for ChatView {
                                     } else {
                                         IconName::Maximize
                                     })
-                                    .tooltip(if self.zoomed {
-                                        "恢复 AI 面板"
-                                    } else {
-                                        "扩大 AI 面板"
-                                    })
+                                    .tooltip(crate::locale::t(
+                                        cx,
+                                        if self.zoomed {
+                                            "恢复 AI 面板"
+                                        } else {
+                                            "扩大 AI 面板"
+                                        },
+                                    ))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let _ = this;
                                         cx.emit(crate::settings::SettingsRequest::ToggleAiZoom);
@@ -1641,7 +1883,7 @@ impl Render for ChatView {
                                 Button::new("chat-settings")
                                     .ghost()
                                     .icon(IconName::Settings)
-                                    .tooltip("AI 设置")
+                                    .tooltip(crate::locale::t(cx, "AI 设置"))
                                     .on_click(cx.listener(|_, _, _, cx| {
                                         cx.emit(crate::settings::SettingsRequest::Open(Some(
                                             Category::Ai,
@@ -1655,7 +1897,7 @@ impl Render for ChatView {
                     div()
                         .px_4()
                         .py_2()
-                        .text_xs()
+                        .text_size(rems(crate::typography::META))
                         .text_color(cx.theme().muted_foreground)
                         .child(notice),
                 )
@@ -1663,23 +1905,29 @@ impl Render for ChatView {
             .when(!self.ready, |el| {
                 el.child(
                     div()
-                        .v_flex()
+                        .h_flex()
                         .gap_2()
                         .p_3()
                         .bg(cx.theme().muted)
-                        .child(self.engine_control(cx))
-                        .child(if self.connecting {
-                            "正在连接 AI 服务…"
-                        } else {
-                            "AI 服务尚未连接，已有对话保留在下方。"
-                        })
-                        .when(!self.connecting, |el| {
-                            el.child(
-                                Button::new("retry-connect")
-                                    .label("连接 / 重试")
-                                    .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
-                            )
-                        }),
+                        .child(IconName::Info)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(rems(crate::typography::META))
+                                .child(crate::locale::t(cx, &self.status)),
+                        )
+                        .child(
+                            Button::new("retry-connect")
+                                .ghost()
+                                .icon(IconName::Redo)
+                                .w(px(32.))
+                                .h(px(32.))
+                                .p_0()
+                                .tooltip(crate::locale::t(cx, "连接 / 重试"))
+                                .disabled(self.connecting)
+                                .on_click(cx.listener(|this, _, _, cx| this.connect(cx))),
+                        ),
                 )
             })
             .child(
@@ -1736,17 +1984,18 @@ impl Render for ChatView {
                                 .gap_2()
                                 .py_6()
                                 .child(
-                                    div()
-                                        .h_flex()
-                                        .gap_2()
-                                        .child(IconName::Bot)
-                                        .child(div().text_lg().child("一起理清你的数据问题")),
+                                    div().h_flex().gap_2().child(IconName::Bot).child(
+                                        div()
+                                            .text_size(rems(crate::typography::HEADING))
+                                            .child(crate::locale::t(cx, "一起理清你的数据问题")),
+                                    ),
                                 )
-                                .child(
-                                    div()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child("从一段 SQL、一个错误，或一个分析目标开始。"),
-                                ),
+                                .child(div().text_color(cx.theme().muted_foreground).child(
+                                    crate::locale::t(
+                                        cx,
+                                        "从一段 SQL、一个错误，或一个分析目标开始。",
+                                    ),
+                                )),
                         )
                     })
                     .children(self.messages.iter().enumerate().map(|(index, message)| {
@@ -1762,7 +2011,7 @@ impl Render for ChatView {
                                 div()
                                     .h_flex()
                                     .gap_2()
-                                    .text_xs()
+                                    .text_size(rems(crate::typography::META))
                                     .text_color(cx.theme().muted_foreground)
                                     .child(if message.user {
                                         IconName::CircleUser
@@ -1788,14 +2037,14 @@ impl Render for ChatView {
                                             cx,
                                         )
                                         .selectable(true)
-                                        .code_block_actions(move |block, _, _| {
+                                        .code_block_actions(move |block, _, cx| {
                                             let code = block.code().to_string();
                                             let pointer_code = code.clone();
                                             div().id(("code-actions", index)).occlude().child(
                                                 Button::new(("copy-code", index))
                                                     .ghost()
                                                     .icon(IconName::Copy)
-                                                    .tooltip("复制代码")
+                                                    .tooltip(crate::locale::t(cx, "复制代码"))
                                                     .on_mouse_down(
                                                         MouseButton::Left,
                                                         move |_, window, cx| {
@@ -1823,7 +2072,7 @@ impl Render for ChatView {
                                     Button::new(("copy", index))
                                         .ghost()
                                         .icon(IconName::Copy)
-                                        .tooltip("复制全文")
+                                        .tooltip(crate::locale::t(cx, "复制全文"))
                                         .on_click(move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 text.clone(),
@@ -1858,7 +2107,7 @@ impl Render for ChatView {
                                             .id("copy-selected")
                                             .p_2()
                                             .cursor_pointer()
-                                            .child("复制选中内容")
+                                            .child(crate::locale::t(cx, "复制选中内容"))
                                             .capture_any_mouse_down(cx.listener(
                                                 move |this, event: &MouseDownEvent, window, cx| {
                                                     window.prevent_default();
@@ -1882,16 +2131,19 @@ impl Render for ChatView {
                     .with_priority(2),
                 )
             })
-            .when(!self.follow, |el| {
+            .when(show_latest(self.messages.len(), self.follow), |el| {
                 el.child(
                     div().h_flex().justify_end().px_3().child(
                         Button::new("latest")
                             .icon(IconName::ArrowDown)
-                            .label(if self.frozen {
-                                "最新 · 恢复显示"
-                            } else {
-                                "最新"
-                            })
+                            .label(crate::locale::t(
+                                cx,
+                                if self.frozen {
+                                    "最新 · 恢复显示"
+                                } else {
+                                    "最新"
+                                },
+                            ))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.resume_follow();
                                 cx.notify();
@@ -1899,50 +2151,20 @@ impl Render for ChatView {
                     ),
                 )
             })
-            .child(
-                div()
-                    .v_flex()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .child(
-                        Button::new("work-details")
-                            .ghost()
-                            .small()
-                            .icon(if self.work_details {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .label(status)
-                            .tooltip("查看本次工作状态")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.work_details = !this.work_details;
-                                cx.notify();
-                            })),
+            .when(
+                show_activity(self.busy, self.ready, &self.status, &self.account_status),
+                |el| {
+                    el.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .text_size(rems(crate::typography::META))
+                            .text_color(cx.theme().muted_foreground)
+                            .child(crate::locale::t(cx, &status)),
                     )
-                    .when(self.work_details, |el| {
-                        el.child(
-                            div()
-                                .v_flex()
-                                .gap_1()
-                                .p_2()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .children(
-                                    self.log
-                                        .read(cx)
-                                        .lines
-                                        .iter()
-                                        .rev()
-                                        .take(5)
-                                        .rev()
-                                        .map(|line| div().child(line.clone())),
-                                ),
-                        )
-                    }),
+                },
             )
-            .when(self.ready || self.busy, |el| el.child(self.composer(cx)))
+            .child(self.composer(cx))
     }
 }
 
@@ -1951,5 +2173,40 @@ impl Drop for ChatView {
         if !self.messages.is_empty() {
             self.history.save(self.history_snapshot());
         }
+    }
+}
+
+fn show_latest(message_count: usize, following: bool) -> bool {
+    message_count > 0 && !following
+}
+fn show_activity(busy: bool, ready: bool, status: &str, account_status: &str) -> bool {
+    busy || (ready && !status.is_empty() && status != account_status && status != "新会话")
+}
+#[cfg(test)]
+mod presentation_tests {
+    use super::{show_activity, show_latest};
+    #[test]
+    fn empty_chat_never_offers_latest_even_when_following_is_paused() {
+        assert!(!show_latest(0, false));
+        assert!(!show_latest(1, true));
+        assert!(show_latest(1, false));
+    }
+    #[test]
+    fn readiness_is_quiet_but_generation_and_errors_remain_visible() {
+        assert!(!show_activity(false, true, "账号已就绪", "账号已就绪"));
+        assert!(!show_activity(
+            false,
+            true,
+            "Account ready",
+            "Account ready"
+        ));
+        assert!(show_activity(true, true, "Account ready", "Account ready"));
+        assert!(show_activity(
+            false,
+            true,
+            "Request failed",
+            "Account ready"
+        ));
+        assert!(!show_activity(false, true, "新会话", "账号已就绪"));
     }
 }

@@ -1,11 +1,17 @@
 use crate::chat::{AiLog, ChatView};
 use crate::panels::WorkbenchPanel;
 use crate::settings::{SettingsRequest, SettingsView};
+use crate::{
+    catalog,
+    locale::t,
+    tabs::{CloseMode, CloseTabs, TabRouter},
+};
 use gpui::{prelude::*, *};
 use gpui_component::{
     ActiveTheme, Icon, IconName, Selectable, StyledExt, Theme, ThemeMode, TitleBar, WindowExt,
     button::{Button, ButtonVariants},
-    dock::{DockArea, DockEvent, DockItem, DockPlacement, TabPanel},
+    dock::{DockArea, DockEvent, DockItem, DockPlacement, PanelView, TabPanel},
+    menu::{DropdownMenu, PopupMenuItem},
 };
 use std::sync::Arc;
 
@@ -22,18 +28,29 @@ pub struct Workspace {
     center_tabs: Entity<TabPanel>,
     right_tabs: Entity<TabPanel>,
     settings_open: bool,
+    settings_layout: Option<[bool; 3]>,
+    closing_window: bool,
+    panels: Vec<Arc<dyn PanelView>>,
+    center_order: Vec<&'static str>,
+    right_order: Vec<&'static str>,
+    pending_close: Vec<&'static str>,
+    _tab_subscription: Subscription,
+    update_status: String,
+    checking_update: bool,
+    update_task: Option<Task<()>>,
     _settings_subscription: Subscription,
+    _status_observe: Subscription,
     navigation: Entity<WorkbenchPanel>,
     connections: bool,
     focus_snapshot: Option<([bool; 3], Option<FocusHandle>)>,
     _dock_subscription: Subscription,
 }
 
-fn icon_button(id: &'static str, icon: impl Into<Icon>, tooltip: &'static str) -> Button {
+fn icon_button(id: &'static str, icon: impl Into<Icon>, tooltip: &'static str, cx: &App) -> Button {
     Button::new(id)
         .ghost()
         .icon(icon)
-        .tooltip(tooltip)
+        .tooltip(t(cx, tooltip))
         .w(px(32.))
         .h(px(32.))
 }
@@ -54,7 +71,7 @@ impl Workspace {
         });
         let output = cx.new(AiLog::new);
         let ai = cx.new(|cx| ChatView::new(output.clone(), window, cx));
-        let settings = cx.new(|cx| SettingsView::new(ai.clone(), cx));
+        let settings = cx.new(|cx| SettingsView::new(ai.clone(), window, cx));
         let properties = cx.new(|cx| {
             WorkbenchPanel::info(
                 "properties",
@@ -67,12 +84,19 @@ impl Workspace {
         let schema = cx.new(|cx| {
             WorkbenchPanel::info(
                 "schema",
-                "数据库结构",
+                "表结构",
                 "先选择数据库连接",
                 "这里将展示表、视图、函数、字段、索引及 DDL。",
                 cx,
             )
         });
+        let panels: Vec<Arc<dyn PanelView>> = vec![
+            Arc::new(notebook.clone()),
+            Arc::new(settings.clone()),
+            Arc::new(ai.clone()),
+            Arc::new(properties.clone()),
+            Arc::new(schema.clone()),
+        ];
         let center = DockItem::tab(notebook, &weak, window, cx);
         let DockItem::Tabs {
             view: center_tabs, ..
@@ -134,12 +158,20 @@ impl Workspace {
                     this.ai.update(cx, |chat, cx| chat.sync_zoom(zoomed, cx));
                 }
                 SettingsRequest::Open(category) => this.open_settings(*category, window, cx),
+                SettingsRequest::CancelClose => {
+                    this.closing_window = false;
+                    this.pending_close.clear();
+                }
                 SettingsRequest::Close => {
-                    this.center_tabs.update(cx, |tabs, cx| {
-                        tabs.remove_panel(Arc::new(this.settings.clone()), window, cx)
-                    });
-                    this.settings_open = false;
-                    cx.notify();
+                    if this.closing_window {
+                        window.remove_window();
+                        return;
+                    }
+                    let mut names = std::mem::take(&mut this.pending_close);
+                    if !names.contains(&"settings") {
+                        names.push("settings");
+                    }
+                    this.close_names(&names, window, cx);
                 }
                 SettingsRequest::ReturnToChat => {
                     this.leave_focus(window, cx);
@@ -152,11 +184,9 @@ impl Workspace {
                         .active_panel(cx)
                         .is_none_or(|panel| panel.view().entity_id() != this.ai.entity_id())
                     {
-                        this.right_tabs.update(cx, |tabs, cx| {
-                            let panel = Arc::new(this.ai.clone());
-                            tabs.remove_panel(panel.clone(), window, cx);
-                            tabs.add_panel(panel, window, cx);
-                        });
+                        // Rebuild only the tab container: the three tools and their
+                        // editor/session entities remain alive, in the same order.
+                        this.rebuild_tabs(false, window, cx);
                     }
                     if !this.dock.read(cx).is_dock_open(DockPlacement::Right, cx) {
                         this.dock.update(cx, |dock, cx| {
@@ -167,14 +197,64 @@ impl Workspace {
                 }
             },
         );
+        let router = cx.global::<TabRouter>().0.clone();
+        let tab_subscription =
+            cx.subscribe_in(&router, window, |this, _, event: &CloseTabs, window, cx| {
+                if crate::tabs::is_fixed(event.name) {
+                    return;
+                }
+                if event.name == "navigation" || event.name == "ai-output" {
+                    if matches!(event.mode, CloseMode::Current) {
+                        let region = if event.name == "navigation" {
+                            DockPlacement::Left
+                        } else {
+                            DockPlacement::Bottom
+                        };
+                        this.toggle_region(region, window, cx);
+                    }
+                    return;
+                }
+                let order = if this.center_order.contains(&event.name) {
+                    &this.center_order
+                } else {
+                    &this.right_order
+                };
+                let names = crate::tabs::targets(order, event.name, event.mode);
+                if names.contains(&"settings") {
+                    if this.ai.read(cx).settings_saving() {
+                        return;
+                    }
+                    this.pending_close = names;
+                    this.open_settings(None, window, cx);
+                    this.settings.update(cx, |settings, cx| settings.close(cx));
+                } else {
+                    this.close_names(&names, window, cx);
+                }
+            });
+        let status_observe = cx.observe(&ai, |_, _, cx| cx.notify());
         Self {
+            panels,
+            center_order: vec!["notebook"],
+            right_order: vec!["ai-chat", "properties", "schema"],
+            pending_close: vec![],
+            _tab_subscription: tab_subscription,
+            update_status: cx
+                .global::<crate::preferences::Preferences>()
+                .load_error
+                .clone()
+                .unwrap_or_default(),
+            checking_update: false,
+            update_task: None,
             dock,
             ai,
             settings,
             center_tabs,
             right_tabs,
             settings_open: false,
+            settings_layout: None,
+            closing_window: false,
             _settings_subscription: settings_subscription,
+            _status_observe: status_observe,
             navigation,
             connections: false,
             focus_snapshot: None,
@@ -192,6 +272,10 @@ impl Workspace {
         self.dock
             .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
         self.ai.update(cx, |chat, cx| chat.sync_zoom(false, cx));
+        if !self.settings_open {
+            self.settings_layout = Some(self.visibility(cx));
+            self.restore_visibility([false; 3], window, cx);
+        }
         self.settings
             .update(cx, |settings, cx| settings.select(category, cx));
         let panel = Arc::new(self.settings.clone());
@@ -208,8 +292,138 @@ impl Workspace {
                 tabs.add_panel(panel, window, cx);
             });
         }
+        if !active {
+            self.center_order.retain(|name| *name != "settings");
+            self.center_order.push("settings");
+        }
         self.settings_open = true;
         window.focus(&self.settings.read(cx).focus_handle(cx));
+        cx.notify();
+    }
+
+    pub fn prepare_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.settings.read(cx).pending(cx) {
+            self.closing_window = true;
+            self.open_settings(None, window, cx);
+            self.settings.update(cx, |settings, cx| settings.close(cx));
+            false
+        } else {
+            true
+        }
+    }
+
+    fn rebuild_tabs(&mut self, center: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let order = if center {
+            &self.center_order
+        } else {
+            &self.right_order
+        };
+        let panels = order
+            .iter()
+            .filter_map(|name| {
+                self.panels
+                    .iter()
+                    .find(|p| p.panel_name(cx) == *name)
+                    .cloned()
+            })
+            .collect();
+        let item = DockItem::tabs(panels, &self.dock.downgrade(), window, cx);
+        let DockItem::Tabs { view, .. } = &item else {
+            unreachable!()
+        };
+        if center {
+            self.center_tabs = view.clone();
+        } else {
+            self.right_tabs = view.clone();
+        }
+        // GPUI 0.5.1 exposes dock dimensions through its serializable layout.
+        let right_size = serde_json::to_value(self.dock.read(cx).dump(cx))
+            .ok()
+            .and_then(|layout| layout.get("right_dock")?.get("size")?.as_f64())
+            .map(|value| px(value as f32))
+            .unwrap_or(px(480.));
+        self.dock.update(cx, |dock, cx| {
+            if center {
+                dock.set_center(item, window, cx);
+            } else {
+                dock.set_right_dock(
+                    item,
+                    Some(right_size),
+                    !self.right_order.is_empty(),
+                    window,
+                    cx,
+                );
+            }
+        });
+    }
+    fn close_names(&mut self, names: &[&'static str], window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_focus(window, cx);
+        self.dock
+            .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
+        self.ai.update(cx, |chat, cx| chat.sync_zoom(false, cx));
+        for name in names {
+            if crate::tabs::is_fixed(name) {
+                continue;
+            }
+            let Some(panel) = self
+                .panels
+                .iter()
+                .find(|p| p.panel_name(cx) == *name)
+                .cloned()
+            else {
+                continue;
+            };
+            if self.center_order.contains(name) {
+                self.center_tabs
+                    .update(cx, |tabs, cx| tabs.remove_panel(panel, window, cx));
+            } else if self.right_order.contains(name) {
+                self.right_tabs
+                    .update(cx, |tabs, cx| tabs.remove_panel(panel, window, cx));
+            }
+        }
+        self.center_order.retain(|n| !names.contains(n));
+        self.right_order
+            .retain(|n| crate::tabs::is_fixed(n) || !names.contains(n));
+        self.settings_open = self.center_order.contains(&"settings");
+        if names.contains(&"settings")
+            && let Some(states) = self.settings_layout.take()
+        {
+            self.restore_visibility(states, window, cx);
+        }
+        if self.center_order.is_empty() {
+            self.rebuild_tabs(true, window, cx);
+        }
+        if self.right_order.is_empty() {
+            self.rebuild_tabs(false, window, cx);
+        }
+        cx.notify();
+    }
+    fn restore_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.center_order.contains(&"notebook") {
+            self.center_order.push("notebook");
+            self.rebuild_tabs(true, window, cx);
+        }
+        self.right_order = vec!["ai-chat", "properties", "schema"];
+        self.rebuild_tabs(false, window, cx);
+        cx.notify();
+    }
+    fn check_update(&mut self, cx: &mut Context<Self>) {
+        if self.checking_update {
+            return;
+        }
+        self.checking_update = true;
+        self.update_status = t(cx, "正在获取…").to_string();
+        let work = cx
+            .background_executor()
+            .spawn(async { catalog::latest_release() });
+        self.update_task = Some(cx.spawn(async move |view, cx| {
+            let result = work.await;
+            let _ = view.update(cx, |this, cx| {
+                this.checking_update = false;
+                this.update_status = t(cx, &result.unwrap_or_else(|error| error)).to_string();
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
@@ -278,23 +492,39 @@ impl Workspace {
     }
 
     fn help(window: &mut Window, cx: &mut App) {
-        window.open_dialog(cx, |dialog, _, _| {
+        window.open_dialog(cx, |dialog, _, cx| {
             dialog.title("使用帮助").child(
                 div()
                     .v_flex()
                     .gap_3()
-                    .child("项目 / 连接：点击切换侧栏，再次点击当前项收起。")
-                    .child("顶部布局图标：显示或隐藏左侧栏、运行输出与右侧辅助面板。")
-                    .child("专注模式：收起所有辅助区域，再次点击恢复原布局。")
-                    .child("太阳 / 月亮：切换 Light / Dark 主题。")
-                    .child("当前编辑仅保留在内存中，关闭窗口后丢失。"),
+                    .child(crate::locale::t(
+                        cx,
+                        "项目 / 连接：点击切换侧栏，再次点击当前项收起。",
+                    ))
+                    .child(crate::locale::t(
+                        cx,
+                        "顶部布局图标：显示或隐藏左侧栏、运行输出与右侧辅助面板。",
+                    ))
+                    .child(crate::locale::t(
+                        cx,
+                        "专注模式：收起所有辅助区域，再次点击恢复原布局。",
+                    ))
+                    .child(crate::locale::t(
+                        cx,
+                        "太阳 / 月亮：切换 Light / Dark 主题。",
+                    ))
+                    .child(crate::locale::t(
+                        cx,
+                        "当前编辑仅保留在内存中，关闭窗口后丢失。",
+                    )),
             )
         });
     }
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dialog_layer = gpui_component::Root::render_dialog_layer(window, cx);
         let [left, bottom, right] = self.visibility(cx);
         let focused = self.focus_snapshot.is_some();
         let dark = cx.theme().mode.is_dark();
@@ -310,7 +540,7 @@ impl Render for Workspace {
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
-                icon_button("project", IconName::Folder, "项目")
+                icon_button("project", IconName::Folder, "项目", cx)
                     .selected(left && !self.connections)
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
             )
@@ -319,19 +549,61 @@ impl Render for Workspace {
                     "connections",
                     Icon::default().path("icons/database.svg"),
                     "连接",
+                    cx,
                 )
                 .selected(left && self.connections)
                 .on_click(cx.listener(|this, _, window, cx| this.navigate(true, window, cx))),
             )
             .child(div().flex_1())
             .child(
-                icon_button("settings", IconName::Settings, "设置").on_click(
+                icon_button("settings", IconName::Settings, "设置", cx).on_click(
                     cx.listener(|this, _, window, cx| this.open_settings(None, window, cx)),
                 ),
             )
             .child(
-                icon_button("help", IconName::Info, "帮助")
-                    .on_click(|_, window, cx| Self::help(window, cx)),
+                icon_button("help", IconName::Info, "帮助", cx).dropdown_menu({
+                    let entity = cx.entity();
+                    move |menu, _, cx| {
+                        let update = entity.clone();
+                        let restore = entity.clone();
+                        menu.item(
+                            PopupMenuItem::new(t(cx, "关于我们"))
+                                .icon(IconName::Info)
+                                .on_click(|_, window, cx| {
+                                    crate::about::open(window, cx);
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new("GitHub")
+                                .icon(IconName::GitHub)
+                                .on_click(|_, _, cx| cx.open_url(catalog::REPOSITORY)),
+                        )
+                        .item(
+                            PopupMenuItem::new(t(cx, "检查更新"))
+                                .icon(IconName::Redo)
+                                .on_click(move |_, _, cx| {
+                                    update.update(cx, |this, cx| this.check_update(cx))
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(t(cx, "发布页面"))
+                                .icon(IconName::ExternalLink)
+                                .on_click(|_, _, cx| cx.open_url(catalog::RELEASES)),
+                        )
+                        .item(
+                            PopupMenuItem::new(t(cx, "恢复辅助页签"))
+                                .icon(IconName::PanelRight)
+                                .on_click(move |_, window, cx| {
+                                    restore.update(cx, |this, cx| this.restore_tabs(window, cx))
+                                }),
+                        )
+                        .item(
+                            PopupMenuItem::new(t(cx, "使用帮助"))
+                                .icon(IconName::BookOpen)
+                                .on_click(|_, window, cx| Self::help(window, cx)),
+                        )
+                    }
+                }),
             );
         let header = div()
             .h_flex()
@@ -345,23 +617,29 @@ impl Render for Workspace {
                     .path("icons/data-note.svg")
                     .text_color(if dark { rgb(0x67e8d0) } else { rgb(0x087f78) }),
             )
-            .child(div().flex_1().pl_2().text_sm().child("TurboDbNote"))
             .child(
-                icon_button("left", IconName::PanelLeft, "显示 / 隐藏左侧栏")
+                div()
+                    .flex_1()
+                    .pl_2()
+                    .text_size(rems(crate::typography::BODY))
+                    .child("TurboDbNote"),
+            )
+            .child(
+                icon_button("left", IconName::PanelLeft, "显示 / 隐藏左侧栏", cx)
                     .selected(left)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_region(DockPlacement::Left, window, cx)
                     })),
             )
             .child(
-                icon_button("bottom", IconName::PanelBottom, "显示 / 隐藏运行输出")
+                icon_button("bottom", IconName::PanelBottom, "显示 / 隐藏运行输出", cx)
                     .selected(bottom)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_region(DockPlacement::Bottom, window, cx)
                     })),
             )
             .child(
-                icon_button("right", IconName::PanelRight, "显示 / 隐藏辅助面板")
+                icon_button("right", IconName::PanelRight, "显示 / 隐藏辅助面板", cx)
                     .selected(right)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_region(DockPlacement::Right, window, cx)
@@ -381,6 +659,7 @@ impl Render for Workspace {
                     } else {
                         "进入专注模式"
                     },
+                    cx,
                 )
                 .selected(focused)
                 .on_click(cx.listener(|this, _, window, cx| this.toggle_focus(window, cx))),
@@ -394,15 +673,19 @@ impl Render for Workspace {
                     } else {
                         "切换黑夜 Dark"
                     },
+                    cx,
                 )
-                .on_click(|_, window, cx| {
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.settings
+                        .update(cx, |settings, cx| settings.reset_theme(cx));
                     let mode = if cx.theme().mode.is_dark() {
                         ThemeMode::Light
                     } else {
                         ThemeMode::Dark
                     };
                     Theme::change(mode, Some(window), cx);
-                }),
+                    crate::locale::apply_font(cx);
+                })),
             );
         div()
             .size_full()
@@ -421,14 +704,32 @@ impl Render for Workspace {
                         .when(!focused, |el| {
                             el.child(
                                 div()
+                                    .h_flex()
+                                    .gap_3()
                                     .px_3()
                                     .py_1()
-                                    .text_xs()
+                                    .flex_shrink_0()
+                                    .border_t_1()
+                                    .border_color(cx.theme().border)
+                                    .text_size(rems(crate::typography::META))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("未连接数据库    ·    内存示例    ·    SQL Notebook"),
+                                    .child(div().flex_shrink_0().child(t(cx, "数据库：未连接")))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .truncate()
+                                            .child(self.update_status.clone()),
+                                    )
+                                    .child(div().flex_shrink_0().child(format!(
+                                        "{}{}",
+                                        t(cx, "AI："),
+                                        t(cx, self.ai.read(cx).connection_status())
+                                    ))),
                             )
                         }),
                 ),
             )
+            .children(dialog_layer)
     }
 }
