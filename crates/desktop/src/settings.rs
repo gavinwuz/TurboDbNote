@@ -10,6 +10,7 @@ use gpui_component::{
 pub enum Category {
     General,
     Ai,
+    Database,
 }
 pub enum SettingsRequest {
     ToggleAiZoom,
@@ -21,6 +22,7 @@ impl EventEmitter<SettingsRequest> for ChatView {}
 pub struct SettingsView {
     category: Category,
     chat: Entity<ChatView>,
+    drivers: Entity<crate::drivers::DriverManager>,
     _observe: Subscription,
     _inputs: Vec<Subscription>,
     focus: FocusHandle,
@@ -28,7 +30,11 @@ pub struct SettingsView {
     close_after_save: bool,
 }
 impl SettingsView {
-    pub fn new(chat: Entity<ChatView>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        chat: Entity<ChatView>,
+        drivers: Entity<crate::drivers::DriverManager>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let inputs = chat.read(cx).settings_inputs();
         Self {
             _inputs: inputs
@@ -51,6 +57,7 @@ impl SettingsView {
                 cx.notify();
             }),
             chat,
+            drivers,
         }
     }
     pub fn select(&mut self, category: Option<Category>, cx: &mut Context<Self>) {
@@ -104,7 +111,9 @@ impl Render for SettingsView {
         let ai = self.category == Category::Ai;
         let dark = cx.theme().mode.is_dark();
         let body =
-            if ai {
+            if self.category == Category::Database {
+                self.drivers.clone().into_any_element()
+            } else if ai {
                 self.chat
                     .update(cx, |chat, cx| chat.render_ai_settings(window, cx))
                     .into_any_element()
@@ -227,9 +236,18 @@ impl Render for SettingsView {
                                 Button::new("general")
                                     .icon(IconName::Settings)
                                     .label("通用")
-                                    .selected(!ai)
+                                    .selected(self.category == Category::General)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.category = Category::General;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("database-settings")
+                                    .label("数据库")
+                                    .selected(self.category == Category::Database)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.category = Category::Database;
                                         cx.notify();
                                     })),
                             )

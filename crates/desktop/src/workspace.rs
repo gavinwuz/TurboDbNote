@@ -1,9 +1,11 @@
 use crate::chat::{AiLog, ChatView};
+use crate::database::{DatabaseView, OpenDatabase, OpenObjects};
 use crate::panels::WorkbenchPanel;
 use crate::settings::{SettingsRequest, SettingsView};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Icon, IconName, Selectable, StyledExt, Theme, ThemeMode, TitleBar, WindowExt,
+    ActiveTheme, Icon, IconName, Root, Selectable, StyledExt, Theme, ThemeMode, TitleBar,
+    WindowExt,
     button::{Button, ButtonVariants},
     dock::{DockArea, DockEvent, DockItem, DockPlacement, TabPanel},
 };
@@ -24,6 +26,12 @@ pub struct Workspace {
     settings_open: bool,
     _settings_subscription: Subscription,
     navigation: Entity<WorkbenchPanel>,
+    database: Entity<DatabaseView>,
+    schema: Entity<WorkbenchPanel>,
+    _objects_subscription: Subscription,
+    database_open: bool,
+    _database_subscription: Subscription,
+    _database_observe: Subscription,
     connections: bool,
     focus_snapshot: Option<([bool; 3], Option<FocusHandle>)>,
     _dock_subscription: Subscription,
@@ -43,6 +51,7 @@ impl Workspace {
         let dock = cx.new(|cx| DockArea::new("workbench", Some(2), window, cx));
         let weak = dock.downgrade();
         let notebook = cx.new(|cx| WorkbenchPanel::notebook(window, cx));
+        let database = cx.new(|cx| DatabaseView::new(window, cx));
         let navigation = cx.new(|cx| {
             WorkbenchPanel::info(
                 "navigation",
@@ -54,7 +63,7 @@ impl Workspace {
         });
         let output = cx.new(AiLog::new);
         let ai = cx.new(|cx| ChatView::new(output.clone(), window, cx));
-        let settings = cx.new(|cx| SettingsView::new(ai.clone(), cx));
+        let settings = cx.new(|cx| SettingsView::new(ai.clone(), database.read(cx).drivers(), cx));
         let properties = cx.new(|cx| {
             WorkbenchPanel::info(
                 "properties",
@@ -64,15 +73,7 @@ impl Workspace {
                 cx,
             )
         });
-        let schema = cx.new(|cx| {
-            WorkbenchPanel::info(
-                "schema",
-                "数据库结构",
-                "先选择数据库连接",
-                "这里将展示表、视图、函数、字段、索引及 DDL。",
-                cx,
-            )
-        });
+        let schema = cx.new(|cx| WorkbenchPanel::database_objects(database.clone(), cx));
         let center = DockItem::tab(notebook, &weak, window, cx);
         let DockItem::Tabs {
             view: center_tabs, ..
@@ -83,7 +84,11 @@ impl Workspace {
         let center_tabs = center_tabs.clone();
         let left = DockItem::tab(navigation.clone(), &weak, window, cx);
         let right = DockItem::tabs(
-            vec![Arc::new(ai.clone()), Arc::new(properties), Arc::new(schema)],
+            vec![
+                Arc::new(ai.clone()),
+                Arc::new(properties),
+                Arc::new(schema.clone()),
+            ],
             &weak,
             window,
             cx,
@@ -98,7 +103,7 @@ impl Workspace {
         let right_tabs = right_tabs.clone();
         dock.update(cx, |dock, cx| {
             dock.set_center(center, window, cx);
-            dock.set_left_dock(left, Some(px(220.)), true, window, cx);
+            dock.set_left_dock(left, Some(px(280.)), true, window, cx);
             dock.set_right_dock(
                 right,
                 Some(px(
@@ -167,7 +172,62 @@ impl Workspace {
                 }
             },
         );
+        let db_subscription = cx.subscribe_in(
+            &database,
+            window,
+            |this, _, _: &OpenDatabase, window, cx| {
+                this.leave_focus(window, cx);
+                this.dock
+                    .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
+                this.ai.update(cx, |ai, cx| ai.sync_zoom(false, cx));
+                let active = this
+                    .center_tabs
+                    .read(cx)
+                    .active_panel(cx)
+                    .is_some_and(|p| p.view().entity_id() == this.database.entity_id());
+                if !active {
+                    this.center_tabs.update(cx, |tabs, cx| {
+                        let panel = Arc::new(this.database.clone());
+                        if this.database_open {
+                            tabs.remove_panel(panel.clone(), window, cx);
+                        }
+                        tabs.add_panel(panel, window, cx);
+                    });
+                }
+                this.database_open = true;
+                cx.notify();
+            },
+        );
+        let db_observe = cx.observe(&database, |this, _, cx| {
+            this.navigation.update(cx, |_, cx| cx.notify());
+            this.schema.update(cx, |_, cx| cx.notify());
+            cx.notify();
+        });
+        let objects_subscription =
+            cx.subscribe_in(&database, window, |this, _, _: &OpenObjects, window, cx| {
+                this.leave_focus(window, cx);
+                this.dock
+                    .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
+                this.ai.update(cx, |ai, cx| ai.sync_zoom(false, cx));
+                this.right_tabs.update(cx, |tabs, cx| {
+                    let panel = Arc::new(this.schema.clone());
+                    tabs.remove_panel(panel.clone(), window, cx);
+                    tabs.add_panel(panel, window, cx);
+                });
+                if !this.dock.read(cx).is_dock_open(DockPlacement::Right, cx) {
+                    this.dock.update(cx, |dock, cx| {
+                        dock.toggle_dock(DockPlacement::Right, window, cx)
+                    });
+                }
+                cx.notify();
+            });
         Self {
+            schema,
+            _objects_subscription: objects_subscription,
+            database,
+            database_open: false,
+            _database_subscription: db_subscription,
+            _database_observe: db_observe,
             dock,
             ai,
             settings,
@@ -267,8 +327,13 @@ impl Workspace {
         let open = self.visibility(cx)[0];
         let same = self.connections == connections;
         self.connections = connections;
-        self.navigation
-            .update(cx, |panel, cx| panel.show_navigation(connections, cx));
+        self.navigation.update(cx, |panel, cx| {
+            if connections {
+                panel.show_databases(self.database.clone(), cx);
+            } else {
+                panel.show_navigation(false, cx);
+            }
+        });
         if !open || same {
             self.dock.update(cx, |dock, cx| {
                 dock.toggle_dock(DockPlacement::Left, window, cx)
@@ -294,7 +359,8 @@ impl Workspace {
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dialogs = Root::render_dialog_layer(window, cx);
         let [left, bottom, right] = self.visibility(cx);
         let focused = self.focus_snapshot.is_some();
         let dark = cx.theme().mode.is_dark();
@@ -318,7 +384,7 @@ impl Render for Workspace {
                 icon_button(
                     "connections",
                     Icon::default().path("icons/database.svg"),
-                    "连接",
+                    "数据库管理",
                 )
                 .selected(left && self.connections)
                 .on_click(cx.listener(|this, _, window, cx| this.navigate(true, window, cx))),
@@ -405,6 +471,7 @@ impl Render for Workspace {
                 }),
             );
         div()
+            .relative()
             .size_full()
             .v_flex()
             .bg(cx.theme().background)
@@ -425,10 +492,11 @@ impl Render for Workspace {
                                     .py_1()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("未连接数据库    ·    内存示例    ·    SQL Notebook"),
+                                    .child(self.database.read(cx).summary()),
                             )
                         }),
                 ),
             )
+            .children(dialogs)
     }
 }

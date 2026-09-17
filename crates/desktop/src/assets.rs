@@ -6,6 +6,11 @@ pub struct Assets;
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         let bytes: Option<&'static [u8]> = match path {
+            "icons/db-mysql.svg" => Some(include_bytes!("../assets/icons/db-mysql.svg")),
+            "icons/db-postgres.svg" => Some(include_bytes!("../assets/icons/db-postgres.svg")),
+            "icons/db-sqlite.svg" => Some(include_bytes!("../assets/icons/db-sqlite.svg")),
+            "icons/db-clickhouse.svg" => Some(include_bytes!("../assets/icons/db-clickhouse.svg")),
+            "icons/db-redis.svg" => Some(include_bytes!("../assets/icons/db-redis.svg")),
             "icons/data-note.svg" => Some(include_bytes!("../assets/icons/data-note.svg")),
             "icons/database.svg" => Some(include_bytes!("../assets/icons/database.svg")),
             "icons/stop.svg" => Some(include_bytes!("../assets/icons/stop.svg")),
@@ -20,6 +25,11 @@ impl AssetSource for Assets {
         let mut items = gpui_component_assets::Assets.list(path)?;
         items.extend(
             [
+                "icons/db-mysql.svg",
+                "icons/db-postgres.svg",
+                "icons/db-sqlite.svg",
+                "icons/db-clickhouse.svg",
+                "icons/db-redis.svg",
                 "icons/data-note.svg",
                 "icons/database.svg",
                 "icons/stop.svg",

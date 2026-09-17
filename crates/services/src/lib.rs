@@ -3,6 +3,11 @@ pub mod agent;
 pub mod claude;
 pub mod codex;
 pub mod codex_discovery;
+pub mod credentials;
+pub mod database;
+pub mod mysql;
+pub mod mysql_drivers;
+pub mod mysql_legacy;
 use std::{future::Future, pin::Pin, sync::Arc};
 use turbodbn_core::QueryToken;
 use uuid::Uuid;
@@ -21,11 +26,46 @@ pub enum ServiceError {
     Backend(String),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum DatabaseKind {
     PostgreSql,
+    #[default]
     MySql,
     Sqlite,
+    ClickHouse,
+    Redis,
+}
+impl DatabaseKind {
+    pub const ALL: [Self; 5] = [
+        Self::MySql,
+        Self::Sqlite,
+        Self::PostgreSql,
+        Self::ClickHouse,
+        Self::Redis,
+    ];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::MySql => "MySQL",
+            Self::Sqlite => "SQLite",
+            Self::PostgreSql => "PostgreSQL",
+            Self::ClickHouse => "ClickHouse",
+            Self::Redis => "Redis",
+        }
+    }
+    pub fn port(self) -> u16 {
+        match self {
+            Self::MySql => 3306,
+            Self::Sqlite => 1,
+            Self::PostgreSql => 5432,
+            Self::ClickHouse => 8443,
+            Self::Redis => 6379,
+        }
+    }
+    pub fn can_create_database(self) -> bool {
+        matches!(self, Self::MySql | Self::PostgreSql | Self::ClickHouse)
+    }
 }
 
 /// No credentials: resolve a connection ID inside the adapter, never inside a prompt.

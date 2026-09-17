@@ -5,6 +5,8 @@ mod auto_connect;
 mod cell;
 mod chat;
 mod chat_history;
+mod database;
+mod drivers;
 mod panels;
 mod preferences;
 mod settings;

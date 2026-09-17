@@ -14,7 +14,7 @@ The minimal editor uses a 48px icon navigation rail with Data Note branding, pro
 
 The 40px unified title bar combines Data Note branding, the product name, layout/theme actions and window controls in one row. The navigation rail starts below it. This replaces the separate native caption and toolbar; see the [title bar design (Chinese)](docs/plans/2026-09-11-unified-titlebar.md).
 
-> Notebook edits are currently kept only in memory and are lost when the window closes. Database execution, file saving, notebook Markdown preview and result tables are not connected. With saved settings, AI Chat can automatically check the selected CLI when first displayed; model requests start only when you send a message.
+> Notebook edits are currently kept only in memory and are lost when the window closes. Notebook SQL cell execution, note-file saving, notebook Markdown preview and result tables are not connected. With saved settings, AI Chat can automatically check the selected CLI when first displayed; model requests start only when you send a message.
 
 ## Development environment
 
@@ -77,6 +77,12 @@ VERSIONINFO provides FileDescription / ProductName (TurboDbNote) and version fie
 
 For compatibility, 16–128px frames use traditional 32-bit DIB + AND masks; 256px uses PNG. Windows startup also explicitly sets `ICON_SMALL` and `ICON_BIG`. The resource verifier calls native Windows decoding APIs. `python scripts/verify-window-icons.py` launches a separate empty instance, verifies both window icon slots and closes that instance.
 
+## MySQL connection management
+
+Use the left database icon to create or search connection profiles. Profiles open in a central editor with grouping, host/port, credentials, database, driver/version hints, UTF-8 session charset, TLS certificates and timeouts. Test releases its connection; Connect retains a management session until disconnect. Save the profile before opening a persistent connection. Duplicate excludes credentials; deletion requires confirmation.
+
+SQLx 0.8.6 is the modern adapter for MySQL 5.6/5.7/8.0. MySQL 4.0/4.1/5.0–5.5 use the legacy adapter: a separate helper process loads the managed client or an explicitly selected MySQL 5.1–5.6 x64 `libmysql.dll`. Auto routing uses the configured version hint; it never retries authentication with a weaker driver. The detected server version is shown separately from the requested version hint. TLS verifies identity by default and never silently falls back to plaintext. Passwords are either session-only or stored in Windows Credential Manager; `connections.json` never contains a password field. The connection manager browses tables, columns and indexes; Notebook SQL cell execution remains separate and is not connected yet. See the [implementation plan (Chinese)](docs/plans/2026-09-17-mysql-connections.md).
+
 ## Packaging and releases
 
 Targets Windows 10 1809+ / Windows 11 x64. Windows 7 is not supported. Install Inno Setup 6.7.3 and Windows SDK, then supply compiler paths as arguments. If `-FxcPath` is omitted, SDK discovery uses the registry and standard installation directories. No custom tool-path environment variables or PATH changes are used. A temporary, version-checked GPUI source adapter reads the compiler path from a local file; the registry source and repository lockfile remain unchanged.
@@ -110,3 +116,57 @@ Validated against Codex CLI 0.153.4 and Claude Code CLI 2.1.139. Claude uses pri
 ## Documentation maintenance
 
 Keep English and Chinese README sections, commands, versions and feature scope synchronized. Use matching `## [Unreleased]` / `## [0.1.0]` headings in `CHANGELOG.md` and `CHANGELOG.zh-CN.md`, with newest versions first and third-level headings inside each version. `docs/plans/` remains in Chinese for now. Do not maintain separate per-version release-note source files.
+
+### Legacy MySQL connections
+
+Select a legacy target version (or the Legacy driver), then browse to your trusted MySQL 5.1–5.6 **x64** `libmysql.dll`. Keep its dependent DLLs alongside it. Release packaging now includes the verified 5.1.73 x64 client with its license and source. Leave the DLL override empty to use the bundled or managed driver. The ZIP and installer include `turbodbnote-mysql-legacy.exe`, which must stay beside the application.
+
+Legacy connections currently require explicitly disabled TLS; use an appropriate protected network or tunnel. Select `server-default` for MySQL 4.0, and `utf8` or `server-default` for 4.1/early 5.x. Clients older than 5.6 require explicit permission for old password authentication because their secure-auth switch does not reliably cover authentication switches. Modern connections retain identity-verifying TLS by default.
+
+The helper isolates native-driver crashes, bounds connection time, and is terminated on disconnect/cancel. Passwords travel through stdin, not command-line arguments. Legacy verification can be reproduced with `scripts/verify-mysql-legacy.ps1 -ServerDirectory <extracted-server> -ClientDirectory <extracted-x64-client>`; it creates a temporary localhost instance under `target`, without modifying an existing database.
+
+Verified against real MySQL 4.0.27, 4.1.22 and 5.1.73 servers using the 5.1.73 x64 client: connection, disconnect, wrong password, old authentication opt-in/refusal, and TLS refusal. Other 5.x versions and the 5.6 client remain unverified.
+
+### Driver management and connection editor
+
+Settings → Database provides an official download (~119 MiB), offline import of `mysql-noinstall-5.1.73-winx64.zip`, progress, cancellation and retry. SHA-256 is pinned for both archive and DLL; incomplete downloads never become installed drivers. Custom DLLs remain available in each connection’s Advanced tab. Downloaded drivers live beside settings in `drivers`; bundled drivers live beside the executable in `drivers` and take precedence on restart. DLL paths are explicit and PATH is not modified.
+
+Connections have Connection / TLS / Advanced tabs and a fixed action area with Test and Save & Connect. Environment offers Development, Test, Staging and Production (Chinese labels), plus free text; groups suggest existing saved groups and allow new names. TLS and old-auth permission remain explicit choices.
+
+Windows packaging includes the x64 5.1.73 client for 4.x servers, **not** the incompatible win32 4.x DLLs. It downloads the official client and matching source by default. For offline builds, add `-LegacyDriverArchive <official-zip> -LegacySourceArchive <mysql-5.1.73.tar.gz>` to `scripts/package-windows.ps1`. Release folders include MySQL source and the current application source. No MySQL server is installed or started.
+
+### Database discovery and character sets
+
+The connection charset offers UTF-8, GB2312, GBK and free-text MySQL charset names; the server/client must support the chosen value. MySQL 4.0 still requires `server-default` because it has no per-session charset negotiation. Metadata is read as UTF-8 for newer servers and the requested result charset is restored afterward.
+
+Use Detect beside Database to list databases visible to the account, without saving the draft or changing the entered database. The dropdown also accepts manual input. Saved connections show an expandable database list: a configured database restricts the display to that one; an empty database lists the detected visible databases. Discovery is bounded to 512 entries, reports permission/encoding problems, and invalidates suggestions when connection settings change. Malformed names returned by historical servers are skipped with a message instead of silently replacing bytes.
+
+The action bar uses icons with labels; undo/copy/delete are under More. Connection details and driver paths are collapsed by default. Driver details provide Copy Path and Open Location.
+
+### TLS recovery
+
+Modern connections default to encrypted identity verification. The TLS page offers **Encrypt & verify identity**, **Encrypt only**, and **No encryption** (Chinese UI labels). Literal loopback addresses only receive a local-development hint; IP addresses, private networks and domain names never automatically change TLS settings. Legacy adapters provide an explicit No encryption shortcut.
+
+Certificate, handshake and missing-TLS-capability failures open a recovery dialog. Certificate failures offer an encrypted test without identity verification; a plaintext test is also available unless the server requires encryption. Protocol/invalid-data errors without TLS evidence do not trigger downgrade guidance. No retry is automatic.
+
+Retry tests keep saved configuration unchanged by default. Enable “save this connection and mode after a successful test” to save the current draft on success; failed tests do not save it. The success dialog can connect once using the tested mode. Dialog actions are bound to the tested connection snapshot and discard stale actions after the draft changes.
+
+### Multiple database types
+
+New Connection first selects MySQL, SQLite, PostgreSQL, ClickHouse or Redis, then opens the appropriate configuration form. Each type retains its own unsaved draft when switching back. Existing MySQL profiles load unchanged. Files containing other database types use connection format v2 so older applications reject them instead of treating them as MySQL; this version reads both v1 and v2.
+
+Navigation is Group → Connection → Database. Groups collapse and reorder by drag handle or Move Up/Down; order and collapse state persist in `database-navigation.json`. Connections display a type icon, environment color marker and status icon. Catalogs start with 20 entries, offer local filtering/Load More and use virtual scrolling. Search only examines known metadata and never connects automatically. A configured database restricts navigation to that database.
+
+Click a database in a live connection to open the right-hand Objects panel. Columns and indexes stay in that panel. Operations reuse the live adapter, carry request IDs and run off the UI thread. Connection loss and adapter failures release pending operations. Creating a database requires an explicit dialog submission, shows the target/environment and does not retry automatically. Unrestricted connections select the new database after success.
+
+| Adapter | Browsing | Creation |
+| --- | --- | --- |
+| MySQL (SQLx / legacy C client) | Tables, views, columns, indexes | Server database |
+| SQLite | Tables, views, columns, indexes; read-only by default | Explicit new file; existing files are never overwritten |
+| PostgreSQL | Schema-qualified tables/views, columns, indexes | Server database |
+| ClickHouse HTTP/HTTPS | Tables/views, columns, data-skipping indexes | Server database |
+| Redis | Logical DBs, incremental SCAN, key type/TTL/length | No CREATE DATABASE; clusters use DB 0 and browse the current node |
+
+ClickHouse uses the HTTP endpoint (typically 8123 without TLS or 8443 with TLS), not the native TCP port. Redis enumeration may be restricted by CONFIG permissions; a database number can be entered manually. SQL object lists are bounded to 500 entries and connection catalogs to 512.
+
+Validation: real SQLite 3.46.0, PostgreSQL 16.4, Redis 5.0.14.1 and MySQL instances were used for connection/object workflows. ClickHouse passed a local HTTP contract fixture; a real ClickHouse server was unavailable on this Windows host. `scripts/verify-database-adapters.py` accepts explicit Redis/PostgreSQL binary paths and `--http-contract`; it only creates isolated localhost fixtures.

@@ -14,6 +14,8 @@ pub struct WorkbenchPanel {
 }
 
 enum PanelContent {
+    Databases(Entity<crate::database::DatabaseView>),
+    DatabaseObjects(Entity<crate::database::DatabaseView>),
     Notebook(Vec<Entity<CellView>>),
     Info {
         heading: &'static str,
@@ -22,6 +24,27 @@ enum PanelContent {
 }
 
 impl WorkbenchPanel {
+    pub fn database_objects(
+        view: Entity<crate::database::DatabaseView>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            name: "schema",
+            title: "数据库对象",
+            focus: cx.focus_handle(),
+            content: PanelContent::DatabaseObjects(view),
+        }
+    }
+
+    pub fn show_databases(
+        &mut self,
+        view: Entity<crate::database::DatabaseView>,
+        cx: &mut Context<Self>,
+    ) {
+        self.title = "数据库管理";
+        self.content = PanelContent::Databases(view);
+        cx.notify();
+    }
     pub fn show_navigation(&mut self, connections: bool, cx: &mut Context<Self>) {
         self.title = if connections { "连接" } else { "项目" };
         self.content = if connections {
@@ -87,7 +110,7 @@ impl Panel for WorkbenchPanel {
 }
 
 impl Render for WorkbenchPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let content = div()
             .id(self.name)
             .track_focus(&self.focus)
@@ -99,6 +122,12 @@ impl Render for WorkbenchPanel {
             .text_color(cx.theme().foreground)
             .bg(cx.theme().background);
         match &self.content {
+            PanelContent::Databases(view) => {
+                content.child(view.update(cx, |view, cx| view.navigation(window, cx)))
+            }
+            PanelContent::DatabaseObjects(view) => {
+                content.child(view.update(cx, |view, cx| view.render_objects(window, cx)))
+            }
             PanelContent::Notebook(cells) => content
                 .child(
                     div()

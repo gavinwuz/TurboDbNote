@@ -8,6 +8,10 @@ Version history is maintained here. Release notes are generated from the matchin
 
 ### Fixed
 
+- Added two-step connection setup for MySQL/SQLite/PostgreSQL/ClickHouse/Redis; grouped navigation with persistent ordering, environment/status icons and virtual catalogs; live object inspection and capability-specific database creation.
+- Added TLS failure classification and recovery dialogs with explicit encrypted/plaintext trial modes, opt-in save after success, legacy shortcuts, and the missing global dialog render layer.
+- Added GB2312/GBK and custom charsets, bounded visible-database discovery and selection, expandable connection catalogs, compact icon actions, and collapsed driver-path details.
+- Added managed legacy-driver download/import with pinned hashes, cancellation, default release bundling and source/license files; simplified connection tabs, editable environment/group dropdowns and Save & Connect.
 - Removed nested ChatView updates from AI Settings clicks that could panic; added last-chat snapshots and deferred Codex thread resume after restart.
 
 - Isolated code-copy pointer events, added a selection-preserving copy context menu, and synchronized AI expansion with Settings navigation and Return to Chat.
@@ -15,6 +19,8 @@ Version history is maintained here. Release notes are generated from the matchin
 - Windows packaging uses explicit compiler parameters and an isolated GPUI build adapter, avoiding `Failed to find fxc.exe` without custom environment variables.
 
 ### Added
+
+- MySQL connection management with saved profiles, search/grouping, test/connect/cancel, Windows credential storage, TLS controls and detected server details. Modern adapter targets 5.6/5.7/8.0; legacy 4.0/4.1/5.x connections use an isolated helper and an explicitly selected MySQL C client DLL, with old-auth opt-in and no silent TLS downgrade.
 
 - Per-engine automatic connection on first panel display and optional last-session restoration. Defaults are enabled; manual disconnect and failures suppress further automatic attempts for the current run, with no automatic inference or message replay.
 

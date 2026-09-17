@@ -1,5 +1,6 @@
 [package]
 name = "turbodbnote"
+default-run = "turbodbnote"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -16,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 dirs = "6"
 tempfile = "3"
+uuid.workspace = true
 
 [build-dependencies]
 embed-resource = "=3.0.11"

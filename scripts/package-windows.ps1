@@ -1,6 +1,8 @@
 param(
     [string]$OutputDirectory = 'dist',
     [string]$FxcPath,
+    [string]$LegacyDriverArchive,
+    [string]$LegacySourceArchive,
     [Parameter(Mandatory)][string]$IsccPath
 )
 $ErrorActionPreference = 'Stop'
@@ -12,6 +14,9 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'prepare-package-build.ps1')
 Push-Location $root
 try {
+    if ($LegacySourceArchive -and -not $LegacyDriverArchive) { throw 'LegacySourceArchive requires LegacyDriverArchive' }
+    if ($LegacyDriverArchive) { $LegacyDriverArchive = (Resolve-Path -LiteralPath $LegacyDriverArchive).Path }
+    if ($LegacySourceArchive) { $LegacySourceArchive = (Resolve-Path -LiteralPath $LegacySourceArchive).Path }
     $compiler = Resolve-GpuiFxc -FxcPath $FxcPath
     if (-not (Test-Path -LiteralPath $IsccPath -PathType Leaf)) { throw "ISCC compiler not found: $IsccPath" }
     $IsccPath = (Resolve-Path -LiteralPath $IsccPath).Path
@@ -62,6 +67,25 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Unable to resolve Rust version' }
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'turbodbnote.exe')
+    $legacyHelper=Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote-mysql-legacy.exe'
+    if (-not (Test-Path -LiteralPath $legacyHelper)) {throw 'Legacy helper was not built'}
+    Copy-Item -LiteralPath $legacyHelper -Destination $stage
+    # Curated x64 client supports legacy 4.x servers; win32 4.x DLLs cannot load in this app.
+    $driverArguments = @('run', '--locked', '-p', 'turbodbn-services', '--example', 'prepare_mysql_driver', '--', (Join-Path $stage 'drivers'))
+    if ($LegacyDriverArchive) { $driverArguments += (Resolve-Path -LiteralPath $LegacyDriverArchive).Path }
+    if ($LegacySourceArchive) { $driverArguments += (Resolve-Path -LiteralPath $LegacySourceArchive).Path }
+    Invoke-Checked cargo $driverArguments
+    # Include the exact application source used for this build alongside the third-party source.
+    $sourceStage = Join-Path $stage 'sources/TurboDbNote'
+    $sourceFiles = & git ls-files --cached --others --exclude-standard
+    if ($LASTEXITCODE -ne 0) { throw 'Unable to enumerate release source' }
+    foreach ($sourceFile in ($sourceFiles | Sort-Object -Unique)) {
+        if ($sourceFile -notmatch '^(crates/|scripts/|installer/|Cargo\.(toml|lock)$|LICENSE$|README|CHANGELOG)' -or -not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) { continue }
+        $destination = Join-Path $sourceStage $sourceFile
+        New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
+        Copy-Item -LiteralPath $sourceFile -Destination $destination
+    }
+
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stage
     $notes | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.md') -Encoding utf8
     $notesZh | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.zh-CN.md') -Encoding utf8
@@ -69,7 +93,7 @@ try {
 TurboDbNote v$version (Preview) / Windows x64
 Run turbodbnote.exe from this extracted folder.
 Edits are in-memory only and are LOST when the app exits.
-File saving and database execution are not available yet.
+Note-file saving and Notebook SQL cell execution are not available yet.
 AI Chat requires a separately installed Codex or Claude Code CLI and its configured login.
 This build is unsigned. Read RELEASE-NOTES.md before use.
 简体中文：编辑内容仅保留在内存中，退出后丢失。使用前请阅读 RELEASE-NOTES.zh-CN.md。
