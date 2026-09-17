@@ -69,7 +69,8 @@ try {
 TurboDbNote v$version (Preview) / Windows x64
 Run turbodbnote.exe from this extracted folder.
 Edits are in-memory only and are LOST when the app exits.
-File saving, database execution and AI integration are not available yet.
+File saving and database execution are not available yet.
+AI Chat requires a separately installed Codex or Claude Code CLI and its configured login.
 This build is unsigned. Read RELEASE-NOTES.md before use.
 简体中文：编辑内容仅保留在内存中，退出后丢失。使用前请阅读 RELEASE-NOTES.zh-CN.md。
 "@ | Set-Content -LiteralPath (Join-Path $stage 'README.txt') -Encoding utf8
@@ -77,6 +78,8 @@ This build is unsigned. Read RELEASE-NOTES.md before use.
         target='x86_64-pc-windows-msvc'; gpui_adapter='0.2.2-fxc-file-v1'; fxc_version=(Get-Item $compiler).VersionInfo.FileVersion;
         built_at=[DateTime]::UtcNow.ToString('o') } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'BUILD-INFO.json') -Encoding utf8
+    'Portable settings are stored in data/settings.json beside the executable.' |
+        Set-Content -LiteralPath (Join-Path $stage 'portable.flag') -Encoding ascii
     Compress-Archive -LiteralPath $stage -DestinationPath $zip -CompressionLevel Optimal
     Invoke-Checked $IsccPath @("/DAppVersion=$version", "/DSourceDir=$stage", "/DOutputDir=$output",
         "/DIconFile=$(Join-Path $root 'crates/desktop/assets/turbodbnote.ico')", (Join-Path $root 'installer/turbodbnote.iss'))

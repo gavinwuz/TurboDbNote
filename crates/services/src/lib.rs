@@ -1,4 +1,8 @@
-//! Integration contracts only. Drivers and process adapters are deliberately not simulated.
+//! Database contracts and the concrete Codex App Server adapter.
+pub mod agent;
+pub mod claude;
+pub mod codex;
+pub mod codex_discovery;
 use std::{future::Future, pin::Pin, sync::Arc};
 use turbodbn_core::QueryToken;
 use uuid::Uuid;

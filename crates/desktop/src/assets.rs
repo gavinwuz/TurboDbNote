@@ -8,6 +8,7 @@ impl AssetSource for Assets {
         let bytes: Option<&'static [u8]> = match path {
             "icons/data-note.svg" => Some(include_bytes!("../assets/icons/data-note.svg")),
             "icons/database.svg" => Some(include_bytes!("../assets/icons/database.svg")),
+            "icons/stop.svg" => Some(include_bytes!("../assets/icons/stop.svg")),
             _ => None,
         };
         match bytes {
@@ -18,10 +19,14 @@ impl AssetSource for Assets {
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
         let mut items = gpui_component_assets::Assets.list(path)?;
         items.extend(
-            ["icons/data-note.svg", "icons/database.svg"]
-                .into_iter()
-                .filter(|name| name.starts_with(path))
-                .map(Into::into),
+            [
+                "icons/data-note.svg",
+                "icons/database.svg",
+                "icons/stop.svg",
+            ]
+            .into_iter()
+            .filter(|name| name.starts_with(path))
+            .map(Into::into),
         );
         Ok(items)
     }
