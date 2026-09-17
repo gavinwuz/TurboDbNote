@@ -319,6 +319,8 @@ impl DatabaseView {
             // Explicit discard confirmation is inline; selection changes never touch live sessions.
             if self.dirty(cx) {
                 self.status = "请先保存当前修改，或点击“取消修改”后选择其他连接".into();
+                // The tab may have been closed through the shared tab router; retain and reopen its draft.
+                cx.emit(OpenDatabase);
                 cx.notify();
                 return;
             }
@@ -926,8 +928,21 @@ impl Panel for DatabaseView {
     fn panel_name(&self) -> &'static str {
         "database-manager"
     }
-    fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "数据库连接"
+    fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        crate::tabs::title(
+            "database-manager",
+            IconName::GalleryVerticalEnd,
+            crate::locale::t(cx, "数据库连接"),
+            cx,
+        )
+    }
+    fn dropdown_menu(
+        &mut self,
+        menu: gpui_component::menu::PopupMenu,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_component::menu::PopupMenu {
+        crate::tabs::editor_menu(menu, "database-manager", cx)
     }
     fn closable(&self, _: &App) -> bool {
         false

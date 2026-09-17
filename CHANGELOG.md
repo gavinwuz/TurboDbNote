@@ -22,6 +22,14 @@ Version history is maintained here. Release notes are generated from the matchin
 
 - MySQL connection management with saved profiles, search/grouping, test/connect/cancel, Windows credential storage, TLS controls and detected server details. Modern adapter targets 5.6/5.7/8.0; legacy 4.0/4.1/5.x connections use an isolated helper and an explicitly selected MySQL C client DLL, with old-auth opt-in and no silent TLS downgrade.
 
+- Compact Output header actions, timestamped monospace logs with error markers, and a database/AI connection status bar.
+
+- Compact AI composer with disabled database-context selectors, icon-only actions, persistent typography scales, and Codex/Claude/OpenClaw settings tabs. Empty chats hide Latest; account readiness moves out of the conversation area while errors and generation progress remain visible.
+
+- Editor menus now include Close all tabs; AI Chat, Properties and Schema are fixed tools. About uses localized release metadata cards, and built-in dock menus follow the selected language.
+
+- Icon-and-label tabs/buttons, group close menus, categorized settings with 600 ms auto-save, SQLite migration, language/theme packs, provider/model configuration and Help release checks. OpenClaw/extensions can be registered with installation links; their chat transport is not yet integrated.
+
 - Per-engine automatic connection on first panel display and optional last-session restoration. Defaults are enabled; manual disconnect and failures suppress further automatic attempts for the current run, with no automatic inference or message replay.
 
 - Claude Code CLI engine alongside Codex: native discovery, login checks, streaming replies, Stop and session resume; per-engine settings, drafts and history isolation. Claude model aliases do not reuse Codex effort settings.
