@@ -1,6 +1,6 @@
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, StyledExt,
+    ActiveTheme, IconName, StyledExt,
     button::Button,
     input::{Input, InputState},
 };
@@ -80,7 +80,15 @@ impl Render for CellView {
                     .gap_2()
                     .child(
                         Button::new("fold")
-                            .label(if self.collapsed { "+" } else { "−" })
+                            .icon(if self.collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .label(crate::locale::t(
+                                cx,
+                                if self.collapsed { "展开" } else { "折叠" },
+                            ))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.collapsed = !this.collapsed;
                                 cx.notify();
@@ -88,7 +96,7 @@ impl Render for CellView {
                     )
                     .child(
                         div()
-                            .text_xs()
+                            .text_size(rems(crate::typography::META))
                             .text_color(cx.theme().muted_foreground)
                             .child(kind),
                     )
@@ -96,29 +104,33 @@ impl Render for CellView {
                     .when(self.dirty, |el| {
                         el.child(
                             div()
-                                .text_xs()
+                                .text_size(rems(crate::typography::META))
                                 .text_color(cx.theme().muted_foreground)
-                                .child("未保存"),
+                                .child(crate::locale::t(cx, "未保存")),
                         )
                     }),
             )
             .when(!self.collapsed, |el| {
-                el.child(Input::new(&self.editor).h(px(if task_status.is_some() {
-                    76.
-                } else {
-                    150.
-                })))
+                el.child(
+                    Input::new(&self.editor)
+                        .text_size(rems(crate::typography::BODY))
+                        .h(rems(if task_status.is_some() { 4.75 } else { 9.375 })),
+                )
                 .when(is_sql, |el| {
                     el.child(
                         div()
-                            .text_sm()
+                            .text_size(rems(crate::typography::BODY))
                             .text_color(cx.theme().muted_foreground)
-                            .child("尚未连接数据库 · 查询结果将在这里展示"),
+                            .child(crate::locale::t(
+                                cx,
+                                "尚未连接数据库 · 查询结果将在这里展示",
+                            )),
                     )
                 })
                 .when_some(task_status, |el, status| {
                     el.child(
                         Button::new("task-status")
+                            .icon(IconName::CircleCheck)
                             .label(match status {
                                 TaskStatus::Pending => "待完成",
                                 TaskStatus::InProgress => "进行中",

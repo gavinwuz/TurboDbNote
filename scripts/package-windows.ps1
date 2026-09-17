@@ -78,7 +78,7 @@ This build is unsigned. Read RELEASE-NOTES.md before use.
         target='x86_64-pc-windows-msvc'; gpui_adapter='0.2.2-fxc-file-v1'; fxc_version=(Get-Item $compiler).VersionInfo.FileVersion;
         built_at=[DateTime]::UtcNow.ToString('o') } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'BUILD-INFO.json') -Encoding utf8
-    'Portable settings are stored in data/settings.json beside the executable.' |
+    'Portable settings are stored in data/settings.db beside the executable.' |
         Set-Content -LiteralPath (Join-Path $stage 'portable.flag') -Encoding ascii
     Compress-Archive -LiteralPath $stage -DestinationPath $zip -CompressionLevel Optimal
     Invoke-Checked $IsccPath @("/DAppVersion=$version", "/DSourceDir=$stage", "/DOutputDir=$output",
