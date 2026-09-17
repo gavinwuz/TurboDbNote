@@ -8,12 +8,29 @@ Version history is maintained here. Release notes are generated from the matchin
 
 ### Fixed
 
+- Removed nested ChatView updates from AI Settings clicks that could panic; added last-chat snapshots and deferred Codex thread resume after restart.
+
+- Isolated code-copy pointer events, added a selection-preserving copy context menu, and synchronized AI expansion with Settings navigation and Return to Chat.
+
 - Windows packaging uses explicit compiler parameters and an isolated GPUI build adapter, avoiding `Failed to find fxc.exe` without custom environment variables.
 
 ### Added
 
+- Per-engine automatic connection on first panel display and optional last-session restoration. Defaults are enabled; manual disconnect and failures suppress further automatic attempts for the current run, with no automatic inference or message replay.
+
+- Claude Code CLI engine alongside Codex: native discovery, login checks, streaming replies, Stop and session resume; per-engine settings, drafts and history isolation. Claude model aliases do not reuse Codex effort settings.
+
+- Agent-style composer card with a Codex engine menu, combined model/effort picker, draft-preserving prompt shortcuts, collapsible work status and a local workspace footer.
+
+- A reusable Settings tab in the main editor with General/AI categories, direct AI entry navigation and unsaved-change close handling.
+
+- Conversation-first AI layout, shared General/AI settings with persistence, onboarding, expand/restore, elapsed time and a stop icon. Selectable Markdown, code copying and pause/resume following preserve reading space.
+
+- Automatic Codex executable discovery through PATH and npm/Volta layouts, version validation, manual file browsing and multiple-candidate selection without overwriting user input.
+
 - Inno Setup EXE alongside the portable ZIP, with bilingual installation, per-user shortcuts, uninstall support and a running-application guard. Windows 7 support is out of scope.
 - A unified 40px title bar combining branding, layout/theme actions and window controls.
+- Codex App Server chat: dynamic model/effort selection, existing-login detection, streaming Markdown, cancellation, new conversations, copy and bounded runtime logs. First stage uses read-only analysis; UI history is session-only.
 
 ## [0.1.0]
 

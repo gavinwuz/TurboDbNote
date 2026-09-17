@@ -1,8 +1,13 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod assets;
+mod auto_connect;
 mod cell;
+mod chat;
+mod chat_history;
 mod panels;
+mod preferences;
+mod settings;
 #[cfg(target_os = "windows")]
 mod windows_icon;
 mod workspace;
@@ -16,6 +21,19 @@ fn main() {
         windows_icon::install_guard().expect("Unable to register running application");
     Application::new().with_assets(assets::Assets).run(|cx| {
         gpui_component::init(cx);
+        let preferences = preferences::Preferences::load();
+        if let Some(dark) = preferences.dark {
+            gpui_component::Theme::change(
+                if dark {
+                    gpui_component::ThemeMode::Dark
+                } else {
+                    gpui_component::ThemeMode::Light
+                },
+                None,
+                cx,
+            );
+        }
+        cx.set_global(preferences);
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();

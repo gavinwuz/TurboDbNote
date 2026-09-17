@@ -9,3 +9,11 @@ publish.workspace = true
 turbodbn-core.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-channel = "2"
+dunce = "1"
+tokio = { version = "=1.48.0", features = ["rt", "process", "io-util", "time", "sync", "macros"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }

@@ -10,6 +10,12 @@ gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
 turbodbn-core.workspace = true
+turbodbn-services.workspace = true
+async-channel = "2"
+serde.workspace = true
+serde_json.workspace = true
+dirs = "6"
+tempfile = "3"
 
 [build-dependencies]
 embed-resource = "=3.0.11"
