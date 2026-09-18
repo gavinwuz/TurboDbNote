@@ -35,16 +35,16 @@ pub fn open(window: &mut Window, cx: &mut App) {
         let date = release
             .released_on
             .map(SharedString::from)
-            .unwrap_or_else(|| t(cx, "尚未正式发布"));
+            .unwrap_or_else(|| t(cx, "about.release.unpublished"));
         let channel = t(
             cx,
             if release.channel == "stable" {
-                "正式版"
+                "about.channel.stable"
             } else {
-                "预览版"
+                "about.channel.preview"
             },
         );
-        dialog.title(t(cx, "关于我们")).w(px(480.)).child(
+        dialog.title(t(cx, "about.title")).w(px(480.)).child(
             div()
                 .v_flex()
                 .gap_4()
@@ -66,7 +66,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
                                     div()
                                         .text_size(rems(crate::typography::BODY))
                                         .text_color(cx.theme().muted_foreground)
-                                        .child(t(cx, "SQL 笔记与 AI 数据工作台")),
+                                        .child(t(cx, "about.description")),
                                 ),
                         ),
                 )
@@ -78,21 +78,31 @@ pub fn open(window: &mut Window, cx: &mut App) {
                         .bg(cx.theme().muted)
                         .child(row(
                             IconName::Info,
-                            "版本",
+                            "about.version.label",
                             format!("v{}", release.version),
                             cx,
                         ))
-                        .child(row(IconName::Calendar, "发布日期", date, cx))
-                        .child(row(IconName::GalleryVerticalEnd, "发布通道", channel, cx))
+                        .child(row(
+                            IconName::Calendar,
+                            "about.release_date.label",
+                            date,
+                            cx,
+                        ))
+                        .child(row(
+                            IconName::GalleryVerticalEnd,
+                            "about.channel.label",
+                            channel,
+                            cx,
+                        ))
                         .child(row(
                             IconName::SquareTerminal,
-                            "运行平台",
+                            "about.platform.label",
                             format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH),
                             cx,
                         ))
                         .child(row(
                             IconName::BookOpen,
-                            "开源许可",
+                            "about.license.label",
                             env!("CARGO_PKG_LICENSE"),
                             cx,
                         )),
@@ -111,7 +121,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
                         .child(
                             Button::new("about-releases")
                                 .icon(IconName::ExternalLink)
-                                .label(t(cx, "发布记录"))
+                                .label(t(cx, "about.action.releases"))
                                 .on_click(|_, _, cx| cx.open_url(catalog::RELEASES)),
                         ),
                 ),

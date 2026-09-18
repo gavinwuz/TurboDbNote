@@ -169,9 +169,9 @@ impl Panel for SettingsView {
     fn title(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let title =
             if self.chat.read(cx).settings_dirty(cx) || self.configuration.read(cx).dirty(cx) {
-                format!("{} •", t(cx, "设置"))
+                format!("{} •", t(cx, "settings.title"))
             } else {
-                t(cx, "设置").to_string()
+                t(cx, "settings.title").to_string()
             };
         crate::tabs::title("settings", IconName::Settings, title, cx)
     }
@@ -216,7 +216,7 @@ impl Render for SettingsView {
                         .label(engine.name())
                         .selected(ai && active_engine == engine)
                         .disabled(active_engine != engine && !can_switch)
-                        .tooltip(t(cx, "切换前会自动保存；生成或连接期间不可切换"))
+                        .tooltip(t(cx, "agents.switch.tooltip"))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.category = Category::Ai;
                             this.chat.update(cx, |chat, cx| {
@@ -266,7 +266,7 @@ impl Render for SettingsView {
                         .gap_2()
                         .p_3()
                         .bg(cx.theme().muted)
-                        .child(t(cx, "自动保存未完成，请检查配置"))
+                        .child(t(cx, "settings.autosave.error"))
                         .child(
                             div()
                                 .h_flex()
@@ -275,7 +275,7 @@ impl Render for SettingsView {
                                 .child(
                                     Button::new("save-close")
                                         .icon(IconName::Check)
-                                        .label(t(cx, "重试"))
+                                        .label(t(cx, "common.action.retry"))
                                         .disabled(saving || self.chat.read(cx).settings_busy())
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.flush(true, cx);
@@ -285,7 +285,7 @@ impl Render for SettingsView {
                                 .child(
                                     Button::new("discard-close")
                                         .icon(IconName::Delete)
-                                        .label(t(cx, "放弃"))
+                                        .label(t(cx, "common.action.discard"))
                                         .disabled(saving)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.configuration
@@ -302,7 +302,7 @@ impl Render for SettingsView {
                                 .child(
                                     Button::new("continue-settings")
                                         .icon(IconName::ArrowLeft)
-                                        .label(t(cx, "继续编辑"))
+                                        .label(t(cx, "common.action.continue"))
                                         .disabled(saving)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.close_prompt = false;
@@ -313,8 +313,14 @@ impl Render for SettingsView {
                                         })),
                                 ),
                         )
-                        .child(self.chat.read(cx).settings_status())
-                        .child(crate::locale::t(cx, &self.configuration.read(cx).status)),
+                        .child(crate::locale::message(
+                            cx,
+                            &self.chat.read(cx).settings_status(),
+                        ))
+                        .child(crate::locale::message(
+                            cx,
+                            &self.configuration.read(cx).status,
+                        )),
                 )
             })
             .child(
@@ -336,7 +342,7 @@ impl Render for SettingsView {
                             .child(
                                 Button::new("general")
                                     .icon(IconName::Settings)
-                                    .label(t(cx, "通用"))
+                                    .label(t(cx, "settings.general.title"))
                                     .selected(self.category == Category::General)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.category = Category::General;
@@ -346,7 +352,7 @@ impl Render for SettingsView {
                             .child(
                                 Button::new("ai-settings")
                                     .icon(IconName::Bot)
-                                    .label(t(cx, "AI 智能体"))
+                                    .label(t(cx, "settings.agents.title"))
                                     .selected(ai || self.category == Category::Extensions)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.category = Category::Ai;
@@ -356,7 +362,7 @@ impl Render for SettingsView {
                             .child(
                                 Button::new("providers-settings")
                                     .icon(IconName::Globe)
-                                    .label(t(cx, "AI 提供商"))
+                                    .label(t(cx, "settings.providers.title"))
                                     .selected(self.category == Category::Providers)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.category = Category::Providers;
@@ -379,27 +385,35 @@ impl Render for SettingsView {
                     .text_size(rems(crate::typography::BODY))
                     .text_color(cx.theme().muted_foreground)
                     .child(if self.chat.read(cx).settings_saving() {
-                        t(cx, "正在自动保存…")
+                        t(cx, "settings.autosave.saving")
                     } else if self.configuration.read(cx).dirty(cx)
                         || self.chat.read(cx).settings_dirty(cx)
                     {
-                        t(cx, "等待自动保存…")
+                        t(cx, "settings.autosave.pending")
                     } else {
-                        t(cx, "所有更改已自动保存")
+                        t(cx, "settings.autosave.saved")
                     })
                     .when(self.pending(cx), |el| {
-                        el.child(crate::locale::t(cx, &self.chat.read(cx).settings_status()))
+                        el.child(crate::locale::message(
+                            cx,
+                            &self.chat.read(cx).settings_status(),
+                        ))
                     })
                     .when(
                         !self.configuration.read(cx).status.is_empty()
-                            && self.configuration.read(cx).status != t(cx, "已保存").as_ref(),
-                        |el| el.child(crate::locale::t(cx, &self.configuration.read(cx).status)),
+                            && self.configuration.read(cx).status != "common.status.saved",
+                        |el| {
+                            el.child(crate::locale::message(
+                                cx,
+                                &self.configuration.read(cx).status,
+                            ))
+                        },
                     ),
             )
             .child(
                 Button::new("return-chat")
                     .icon(IconName::ArrowRight)
-                    .label(t(cx, "返回聊天"))
+                    .label(t(cx, "chat.action.return"))
                     .on_click({
                         let chat = self.chat.clone();
                         move |_, _, cx| {

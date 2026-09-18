@@ -11,7 +11,7 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("TurboDbNote/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|_| "Unable to create HTTP client".into())
+        .map_err(|_| "common.error.http_client".into())
 }
 fn json(response: reqwest::blocking::Response) -> Result<Value, String> {
     if !response.status().is_success() {
@@ -21,14 +21,14 @@ fn json(response: reqwest::blocking::Response) -> Result<Value, String> {
     response
         .take(2_097_153)
         .read_to_end(&mut bytes)
-        .map_err(|_| "Unable to read response")?;
+        .map_err(|_| "common.error.response_read")?;
     if bytes.len() > 2_097_152 {
-        return Err("Response exceeds 2 MiB".into());
+        return Err("common.error.response_large".into());
     }
-    serde_json::from_slice(&bytes).map_err(|_| "Invalid JSON response".into())
+    serde_json::from_slice(&bytes).map_err(|_| "common.error.invalid_json".into())
 }
 pub fn endpoint(value: &str) -> Result<reqwest::Url, String> {
-    let url = reqwest::Url::parse(value.trim()).map_err(|_| "Invalid API Endpoint")?;
+    let url = reqwest::Url::parse(value.trim()).map_err(|_| "providers.error.endpoint_invalid")?;
     let local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
     if !(url.scheme() == "https" || (url.scheme() == "http" && local))
         || !url.username().is_empty()
@@ -36,16 +36,13 @@ pub fn endpoint(value: &str) -> Result<reqwest::Url, String> {
         || url.query().is_some()
         || url.fragment().is_some()
     {
-        return Err(
-            "Use HTTPS (HTTP is allowed for localhost); omit credentials, query and fragment"
-                .into(),
-        );
+        return Err("providers.error.endpoint_security".into());
     }
     Ok(url)
 }
 pub fn validate_provider(provider: &ProviderPreferences) -> Result<(), String> {
     if provider.display_name.trim().is_empty() {
-        return Err("Display name is required".into());
+        return Err("providers.error.name_required".into());
     }
     endpoint(&provider.endpoint)?;
     if ![
@@ -55,18 +52,18 @@ pub fn validate_provider(provider: &ProviderPreferences) -> Result<(), String> {
     ]
     .contains(&provider.api_mode.as_str())
     {
-        return Err("Unsupported API mode".into());
+        return Err("providers.error.api_mode".into());
     }
-    let advanced: Value = serde_json::from_str(&provider.advanced)
-        .map_err(|_| "Advanced parameters must be a JSON object")?;
+    let advanced: Value =
+        serde_json::from_str(&provider.advanced).map_err(|_| "providers.error.advanced_object")?;
     if !advanced.is_object() {
-        return Err("Advanced parameters must be a JSON object".into());
+        return Err("providers.error.advanced_object".into());
     }
     if advanced.get("model").is_some()
         || advanced.get("messages").is_some()
         || advanced.get("input").is_some()
     {
-        return Err("Advanced parameters cannot override model, messages or input".into());
+        return Err("providers.error.advanced_reserved".into());
     }
     Ok(())
 }
@@ -89,7 +86,7 @@ pub fn models(provider: &ProviderPreferences) -> Result<Vec<String>, String> {
     let value = json(
         request
             .send()
-            .map_err(|_| "Model request failed or timed out")?,
+            .map_err(|_| "providers.error.models_request")?,
     )?;
     parse_models(&value)
 }
@@ -97,7 +94,7 @@ fn parse_models(value: &Value) -> Result<Vec<String>, String> {
     let data = value
         .get("data")
         .and_then(Value::as_array)
-        .ok_or("Missing model data array")?;
+        .ok_or("providers.error.models_missing")?;
     let mut models: Vec<String> = data
         .iter()
         .filter_map(|item| item.get("id")?.as_str().map(str::to_owned))
@@ -107,28 +104,33 @@ fn parse_models(value: &Value) -> Result<Vec<String>, String> {
     models.truncate(1000);
     Ok(models)
 }
-pub fn latest_release() -> Result<String, String> {
+pub enum ReleaseStatus {
+    NoRelease,
+    Available(String),
+    Current(String),
+}
+pub fn latest_release() -> Result<ReleaseStatus, String> {
     let response = client()?
         .get("https://api.github.com/repos/gavinwuz/TurboDbNote/releases/latest")
         .header("Accept", "application/vnd.github+json")
         .send()
-        .map_err(|_| "Update check failed or timed out")?;
+        .map_err(|_| "updates.error.request")?;
     if response.status().as_u16() == 404 {
-        return Ok("No published stable release".into());
+        return Ok(ReleaseStatus::NoRelease);
     }
     let value = json(response)?;
     let tag = value
         .get("tag_name")
         .and_then(Value::as_str)
-        .ok_or("Missing release version")?;
+        .ok_or("updates.error.version_missing")?;
     let latest = semver::Version::parse(tag.trim_start_matches('v'))
-        .map_err(|_| "Invalid release version")?;
+        .map_err(|_| "updates.error.version_invalid")?;
     let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|_| "Invalid application version")?;
+        .map_err(|_| "updates.error.app_version")?;
     Ok(if latest > current {
-        format!("New version available: {tag}")
+        ReleaseStatus::Available(tag.to_string())
     } else {
-        format!("Up to date: v{current}")
+        ReleaseStatus::Current(format!("v{current}"))
     })
 }
 

@@ -6401,6 +6401,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "turbodbn-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "libloading",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "turbodbn-services"
 version = "0.1.0"
 dependencies = [
@@ -6432,8 +6445,10 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "syn 2.0.119",
  "tempfile",
  "turbodbn-core",
+ "turbodbn-diagnostics",
  "turbodbn-services",
  "windows-sys 0.61.2",
 ]
