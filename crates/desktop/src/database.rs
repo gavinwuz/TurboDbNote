@@ -932,7 +932,7 @@ impl Panel for DatabaseView {
         crate::tabs::title(
             "database-manager",
             IconName::GalleryVerticalEnd,
-            crate::locale::t(cx, "数据库连接"),
+            crate::locale::t(cx, "database.connection.title"),
             cx,
         )
     }

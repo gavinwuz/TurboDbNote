@@ -30,7 +30,7 @@ impl WorkbenchPanel {
     ) -> Self {
         Self {
             name: "schema",
-            title: "数据库对象",
+            title: "database.objects.title",
             focus: cx.focus_handle(),
             content: PanelContent::DatabaseObjects(view),
         }
@@ -41,21 +41,25 @@ impl WorkbenchPanel {
         view: Entity<crate::database::DatabaseView>,
         cx: &mut Context<Self>,
     ) {
-        self.title = "数据库管理";
+        self.title = "database.navigation.title";
         self.content = PanelContent::Databases(view);
         cx.notify();
     }
     pub fn show_navigation(&mut self, connections: bool, cx: &mut Context<Self>) {
-        self.title = if connections { "连接" } else { "项目" };
+        self.title = if connections {
+            "navigation.connections"
+        } else {
+            "navigation.projects"
+        };
         self.content = if connections {
             PanelContent::Info {
-                heading: "尚未添加连接",
-                body: "连接配置集中管理；表、视图与 DDL 位于右侧表结构面板。",
+                heading: "connections.empty.title",
+                body: "connections.empty.description",
             }
         } else {
             PanelContent::Info {
-                heading: "入门工作台.note",
-                body: "仅管理 .note 文件。当前为示例文档，文件管理将在后续接入。",
+                heading: "notebook.welcome.title",
+                body: "projects.empty.description",
             }
         };
         cx.notify();
@@ -69,7 +73,7 @@ impl WorkbenchPanel {
             .collect();
         Self {
             name: "notebook",
-            title: "入门工作台.note",
+            title: "notebook.welcome.title",
             focus: cx.focus_handle(),
             content: PanelContent::Notebook(cells),
         }
@@ -151,10 +155,7 @@ impl Render for WorkbenchPanel {
                     div()
                         .text_size(rems(crate::typography::META))
                         .text_color(cx.theme().muted_foreground)
-                        .child(crate::locale::t(
-                            cx,
-                            "工作区 / 入门工作台 · 本次编辑仅保留在内存中",
-                        )),
+                        .child(crate::locale::t(cx, "notebook.memory.description")),
                 )
                 .children(cells.iter().cloned()),
             PanelContent::Info { heading, body } => content

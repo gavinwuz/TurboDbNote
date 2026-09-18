@@ -3,6 +3,7 @@ param(
     [string]$FxcPath,
     [string]$LegacyDriverArchive,
     [string]$LegacySourceArchive,
+    [string]$CrashSightSdkDirectory,
     [Parameter(Mandatory)][string]$IsccPath
 )
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,7 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'release-notes.ps1')
 . (Join-Path $PSScriptRoot 'windows-sdk.ps1')
 . (Join-Path $PSScriptRoot 'prepare-package-build.ps1')
+. (Join-Path $PSScriptRoot 'stage-crashsight.ps1')
 Push-Location $root
 try {
     if ($LegacySourceArchive -and -not $LegacyDriverArchive) { throw 'LegacySourceArchive requires LegacyDriverArchive' }
@@ -86,6 +88,16 @@ try {
         Copy-Item -LiteralPath $sourceFile -Destination $destination
     }
 
+    if ($CrashSightSdkDirectory) {
+        Copy-CrashSightRuntime -SdkDirectory $CrashSightSdkDirectory -Destination (Join-Path $stage 'diagnostics')
+    }
+    # Preserve matching EXE/PDB privately for symbol upload; do not bundle PDBs.
+    $symbols = Join-Path $output "$name-symbols"
+    if (Test-Path -LiteralPath $symbols) { throw 'Symbol output already exists' }
+    $pdb = [IO.Path]::ChangeExtension($exe, '.pdb')
+    if (-not (Test-Path -LiteralPath $pdb -PathType Leaf)) { throw 'Release PDB missing; crash reports would not be symbolicated' }
+    New-Item -ItemType Directory -Path $symbols | Out-Null
+    Copy-Item -LiteralPath $exe, $pdb -Destination $symbols
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stage
     $notes | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.md') -Encoding utf8
     $notesZh | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.zh-CN.md') -Encoding utf8

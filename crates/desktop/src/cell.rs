@@ -59,7 +59,7 @@ impl Render for CellView {
         let kind = match self.cell.content {
             CellContent::Sql { .. } => "SQL",
             CellContent::Markdown { .. } => "MD",
-            CellContent::Task { .. } => "任务",
+            CellContent::Task { .. } => "notebook.kind.task",
         };
         let is_sql = matches!(self.cell.content, CellContent::Sql { .. });
         let task_status = match self.cell.content {
@@ -87,7 +87,11 @@ impl Render for CellView {
                             })
                             .label(crate::locale::t(
                                 cx,
-                                if self.collapsed { "展开" } else { "折叠" },
+                                if self.collapsed {
+                                    "notebook.action.expand"
+                                } else {
+                                    "notebook.action.collapse"
+                                },
                             ))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.collapsed = !this.collapsed;
@@ -98,7 +102,7 @@ impl Render for CellView {
                         div()
                             .text_size(rems(crate::typography::META))
                             .text_color(cx.theme().muted_foreground)
-                            .child(kind),
+                            .child(crate::locale::message(cx, kind)),
                     )
                     .child(div().flex_1().child(self.cell.title.clone()))
                     .when(self.dirty, |el| {
@@ -106,7 +110,7 @@ impl Render for CellView {
                             div()
                                 .text_size(rems(crate::typography::META))
                                 .text_color(cx.theme().muted_foreground)
-                                .child(crate::locale::t(cx, "未保存")),
+                                .child(crate::locale::t(cx, "common.status.unsaved")),
                         )
                     }),
             )
@@ -121,21 +125,21 @@ impl Render for CellView {
                         div()
                             .text_size(rems(crate::typography::BODY))
                             .text_color(cx.theme().muted_foreground)
-                            .child(crate::locale::t(
-                                cx,
-                                "尚未连接数据库 · 查询结果将在这里展示",
-                            )),
+                            .child(crate::locale::t(cx, "notebook.results.empty")),
                     )
                 })
                 .when_some(task_status, |el, status| {
                     el.child(
                         Button::new("task-status")
                             .icon(IconName::CircleCheck)
-                            .label(match status {
-                                TaskStatus::Pending => "待完成",
-                                TaskStatus::InProgress => "进行中",
-                                TaskStatus::Completed => "已完成",
-                            })
+                            .label(crate::locale::t(
+                                cx,
+                                match status {
+                                    TaskStatus::Pending => "notebook.task.pending",
+                                    TaskStatus::InProgress => "notebook.task.in_progress",
+                                    TaskStatus::Completed => "notebook.task.completed",
+                                },
+                            ))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let CellContent::Task { status, .. } = &mut this.cell.content {
                                     *status = match status {
