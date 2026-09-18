@@ -63,9 +63,9 @@ impl Workspace {
         let navigation = cx.new(|cx| {
             WorkbenchPanel::info(
                 "navigation",
-                "项目",
-                "入门工作台.note",
-                "仅管理 .note 文件。当前为示例文档，文件管理将在后续接入。",
+                "navigation.projects",
+                "notebook.welcome.title",
+                "projects.empty.description",
                 cx,
             )
         });
@@ -75,18 +75,18 @@ impl Workspace {
         let properties = cx.new(|cx| {
             WorkbenchPanel::info(
                 "properties",
-                "属性",
-                "入门工作台.note",
-                "包含 SQL、Markdown 与任务。当前为内存示例，尚未保存到磁盘。",
+                "panel.inspector.title",
+                "notebook.welcome.title",
+                "panel.inspector.description",
                 cx,
             )
         });
         let schema = cx.new(|cx| {
             WorkbenchPanel::info(
                 "schema",
-                "表结构",
-                "先选择数据库连接",
-                "这里将展示表、视图、函数、字段、索引及 DDL。",
+                "panel.schema.title",
+                "panel.schema.empty",
+                "panel.schema.description",
                 cx,
             )
         });
@@ -268,6 +268,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        turbodbn_diagnostics::track(turbodbn_diagnostics::Event::SettingsOpened);
         self.leave_focus(window, cx);
         self.dock
             .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
@@ -408,11 +409,12 @@ impl Workspace {
         cx.notify();
     }
     fn check_update(&mut self, cx: &mut Context<Self>) {
+        turbodbn_diagnostics::track(turbodbn_diagnostics::Event::UpdateChecked);
         if self.checking_update {
             return;
         }
         self.checking_update = true;
-        self.update_status = t(cx, "正在获取…").to_string();
+        self.update_status = t(cx, "common.status.loading").to_string();
         let work = cx
             .background_executor()
             .spawn(async { catalog::latest_release() });
@@ -420,7 +422,17 @@ impl Workspace {
             let result = work.await;
             let _ = view.update(cx, |this, cx| {
                 this.checking_update = false;
-                this.update_status = t(cx, &result.unwrap_or_else(|error| error)).to_string();
+                this.update_status = match result {
+                    Ok(catalog::ReleaseStatus::NoRelease) => t(cx, "updates.status.no_release"),
+                    Ok(catalog::ReleaseStatus::Available(version)) => {
+                        crate::locale::tr(cx, "updates.status.available", &[("version", &version)])
+                    }
+                    Ok(catalog::ReleaseStatus::Current(version)) => {
+                        crate::locale::tr(cx, "updates.status.current", &[("version", &version)])
+                    }
+                    Err(error) => crate::locale::message(cx, &error),
+                }
+                .to_string();
                 cx.notify();
             });
         }));
@@ -477,6 +489,11 @@ impl Workspace {
     }
 
     fn navigate(&mut self, connections: bool, window: &mut Window, cx: &mut Context<Self>) {
+        turbodbn_diagnostics::track(if connections {
+            turbodbn_diagnostics::Event::ConnectionsOpened
+        } else {
+            turbodbn_diagnostics::Event::ProjectsOpened
+        });
         self.leave_focus(window, cx);
         let open = self.visibility(cx)[0];
         let same = self.connections == connections;
@@ -493,30 +510,15 @@ impl Workspace {
 
     fn help(window: &mut Window, cx: &mut App) {
         window.open_dialog(cx, |dialog, _, cx| {
-            dialog.title("使用帮助").child(
+            dialog.title(t(cx, "help.usage.title")).child(
                 div()
                     .v_flex()
                     .gap_3()
-                    .child(crate::locale::t(
-                        cx,
-                        "项目 / 连接：点击切换侧栏，再次点击当前项收起。",
-                    ))
-                    .child(crate::locale::t(
-                        cx,
-                        "顶部布局图标：显示或隐藏左侧栏、运行输出与右侧辅助面板。",
-                    ))
-                    .child(crate::locale::t(
-                        cx,
-                        "专注模式：收起所有辅助区域，再次点击恢复原布局。",
-                    ))
-                    .child(crate::locale::t(
-                        cx,
-                        "太阳 / 月亮：切换 Light / Dark 主题。",
-                    ))
-                    .child(crate::locale::t(
-                        cx,
-                        "当前编辑仅保留在内存中，关闭窗口后丢失。",
-                    )),
+                    .child(crate::locale::t(cx, "help.navigation.description"))
+                    .child(crate::locale::t(cx, "help.layout.description"))
+                    .child(crate::locale::t(cx, "help.focus.description"))
+                    .child(crate::locale::t(cx, "help.theme.description"))
+                    .child(crate::locale::t(cx, "help.memory.description")),
             )
         });
     }
@@ -540,7 +542,7 @@ impl Render for Workspace {
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
-                icon_button("project", IconName::Folder, "项目", cx)
+                icon_button("project", IconName::Folder, "navigation.projects", cx)
                     .selected(left && !self.connections)
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
             )
@@ -548,7 +550,7 @@ impl Render for Workspace {
                 icon_button(
                     "connections",
                     Icon::default().path("icons/database.svg"),
-                    "连接",
+                    "navigation.connections",
                     cx,
                 )
                 .selected(left && self.connections)
@@ -556,18 +558,18 @@ impl Render for Workspace {
             )
             .child(div().flex_1())
             .child(
-                icon_button("settings", IconName::Settings, "设置", cx).on_click(
+                icon_button("settings", IconName::Settings, "settings.title", cx).on_click(
                     cx.listener(|this, _, window, cx| this.open_settings(None, window, cx)),
                 ),
             )
             .child(
-                icon_button("help", IconName::Info, "帮助", cx).dropdown_menu({
+                icon_button("help", IconName::Info, "help.title", cx).dropdown_menu({
                     let entity = cx.entity();
                     move |menu, _, cx| {
                         let update = entity.clone();
                         let restore = entity.clone();
                         menu.item(
-                            PopupMenuItem::new(t(cx, "关于我们"))
+                            PopupMenuItem::new(t(cx, "about.title"))
                                 .icon(IconName::Info)
                                 .on_click(|_, window, cx| {
                                     crate::about::open(window, cx);
@@ -579,26 +581,26 @@ impl Render for Workspace {
                                 .on_click(|_, _, cx| cx.open_url(catalog::REPOSITORY)),
                         )
                         .item(
-                            PopupMenuItem::new(t(cx, "检查更新"))
+                            PopupMenuItem::new(t(cx, "help.action.check_updates"))
                                 .icon(IconName::Redo)
                                 .on_click(move |_, _, cx| {
                                     update.update(cx, |this, cx| this.check_update(cx))
                                 }),
                         )
                         .item(
-                            PopupMenuItem::new(t(cx, "发布页面"))
+                            PopupMenuItem::new(t(cx, "help.action.releases"))
                                 .icon(IconName::ExternalLink)
                                 .on_click(|_, _, cx| cx.open_url(catalog::RELEASES)),
                         )
                         .item(
-                            PopupMenuItem::new(t(cx, "恢复辅助页签"))
+                            PopupMenuItem::new(t(cx, "workspace.action.restore_panels"))
                                 .icon(IconName::PanelRight)
                                 .on_click(move |_, window, cx| {
                                     restore.update(cx, |this, cx| this.restore_tabs(window, cx))
                                 }),
                         )
                         .item(
-                            PopupMenuItem::new(t(cx, "使用帮助"))
+                            PopupMenuItem::new(t(cx, "help.usage.title"))
                                 .icon(IconName::BookOpen)
                                 .on_click(|_, window, cx| Self::help(window, cx)),
                         )
@@ -625,21 +627,26 @@ impl Render for Workspace {
                     .child("TurboDbNote"),
             )
             .child(
-                icon_button("left", IconName::PanelLeft, "显示 / 隐藏左侧栏", cx)
+                icon_button("left", IconName::PanelLeft, "workspace.sidebar.toggle", cx)
                     .selected(left)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_region(DockPlacement::Left, window, cx)
                     })),
             )
             .child(
-                icon_button("bottom", IconName::PanelBottom, "显示 / 隐藏运行输出", cx)
-                    .selected(bottom)
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_region(DockPlacement::Bottom, window, cx)
-                    })),
+                icon_button(
+                    "bottom",
+                    IconName::PanelBottom,
+                    "workspace.output.toggle",
+                    cx,
+                )
+                .selected(bottom)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_region(DockPlacement::Bottom, window, cx)
+                })),
             )
             .child(
-                icon_button("right", IconName::PanelRight, "显示 / 隐藏辅助面板", cx)
+                icon_button("right", IconName::PanelRight, "workspace.panels.toggle", cx)
                     .selected(right)
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.toggle_region(DockPlacement::Right, window, cx)
@@ -655,9 +662,9 @@ impl Render for Workspace {
                         IconName::Maximize
                     },
                     if focused {
-                        "退出专注模式"
+                        "workspace.focus.exit"
                     } else {
-                        "进入专注模式"
+                        "workspace.focus.enter"
                     },
                     cx,
                 )
@@ -669,9 +676,9 @@ impl Render for Workspace {
                     "theme",
                     if dark { IconName::Sun } else { IconName::Moon },
                     if dark {
-                        "切换白天 Light"
+                        "settings.theme.switch_light"
                     } else {
-                        "切换黑夜 Dark"
+                        "settings.theme.switch_dark"
                     },
                     cx,
                 )
@@ -713,7 +720,11 @@ impl Render for Workspace {
                                     .border_color(cx.theme().border)
                                     .text_size(rems(crate::typography::META))
                                     .text_color(cx.theme().muted_foreground)
-                                    .child(div().flex_shrink_0().child(t(cx, "数据库：未连接")))
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .child(t(cx, "status.database.disconnected")),
+                                    )
                                     .child(
                                         div()
                                             .flex_1()
@@ -721,10 +732,13 @@ impl Render for Workspace {
                                             .truncate()
                                             .child(self.update_status.clone()),
                                     )
-                                    .child(div().flex_shrink_0().child(format!(
-                                        "{}{}",
-                                        t(cx, "AI："),
-                                        t(cx, self.ai.read(cx).connection_status())
+                                    .child(div().flex_shrink_0().child(crate::locale::tr(
+                                        cx,
+                                        "status.ai.summary",
+                                        &[(
+                                            "state",
+                                            t(cx, self.ai.read(cx).connection_status()).as_ref(),
+                                        )],
                                     ))),
                             )
                         }),

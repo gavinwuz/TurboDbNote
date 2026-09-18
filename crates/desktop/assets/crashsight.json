@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "app_id": "35c613b255",
+  "region": "global",
+  "fallback": { "app_id": "67d434599d", "region": "china" },
+  "record_usage": true,
+  "analytics_endpoint": null
+}

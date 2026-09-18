@@ -1,0 +1,8 @@
+{
+  "sdk_version": "2.2.9.1087",
+  "source_page": "https://crashsight.wetest.net/documents/zh/crashsight/changelog/",
+  "archive_url": "https://cdn.crashsight.qq.com/upload-cdn-file/zip/crashsight-file-2026-07-01-05da7ac9-6067-4583-9214-c08ab15007a0.zip",
+  "archive_sha256": "a08133a0bfa0c17b685ce8947c6ce7497d800663ea1c0e5de7f7b969598452b6",
+  "archive_member": "CrashSightSDK4.3.8.1087/Win/CrashSight64.dll",
+  "inspection": "PE exports and FileVersion only; no initialization or upload performed"
+}

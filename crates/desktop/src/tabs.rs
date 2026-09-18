@@ -54,7 +54,7 @@ fn send(name: &'static str, mode: CloseMode, cx: &mut App) {
 }
 pub fn editor_menu(menu: PopupMenu, name: &'static str, cx: &App) -> PopupMenu {
     menu.item(
-        PopupMenuItem::new(t(cx, "关闭全部"))
+        PopupMenuItem::new(t(cx, "tabs.close.all"))
             .icon(IconName::Delete)
             .on_click(move |_, _, cx| send(name, CloseMode::All, cx)),
     )
@@ -79,7 +79,7 @@ pub fn title(
             Button::new(SharedString::from(format!("tab-close-{name}")))
                 .ghost()
                 .icon(IconName::Close)
-                .tooltip(t(cx, "关闭"))
+                .tooltip(t(cx, "common.action.close"))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
                     send(name, CloseMode::Current, cx);
@@ -87,11 +87,11 @@ pub fn title(
         )
         .context_menu(move |mut menu, _, cx| {
             for (label, icon, mode) in [
-                ("关闭", IconName::Close, CloseMode::Current),
-                ("关闭其它页签", IconName::Delete, CloseMode::Others),
-                ("关闭右侧页签", IconName::ArrowRight, CloseMode::Right),
-                ("关闭左侧页签", IconName::ArrowLeft, CloseMode::Left),
-                ("关闭全部", IconName::Delete, CloseMode::All),
+                ("common.action.close", IconName::Close, CloseMode::Current),
+                ("tabs.close.others", IconName::Delete, CloseMode::Others),
+                ("tabs.close.right", IconName::ArrowRight, CloseMode::Right),
+                ("tabs.close.left", IconName::ArrowLeft, CloseMode::Left),
+                ("tabs.close.all", IconName::Delete, CloseMode::All),
             ] {
                 menu = menu.item(
                     PopupMenuItem::new(t(cx, label))

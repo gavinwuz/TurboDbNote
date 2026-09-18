@@ -16,11 +16,15 @@ Version history is maintained here. Release notes are generated from the matchin
 
 ### Added
 
+- Stable semantic translation keys, named interpolation, English fallback, legacy language-pack aliases and build-time catalog/reference validation.
+
+- CrashSight Windows FFI, macOS bridge source, local panic replay and bounded allowlisted usage queue; overseas-first configuration with an explicit next-launch domestic fallback marker. SDK delivery and automatic failure detection are not yet verified.
+
 - Compact Output header actions, timestamped monospace logs with error markers, and a database/AI connection status bar.
 
 - Compact AI composer with disabled database-context selectors, icon-only actions, persistent typography scales, and Codex/Claude/OpenClaw settings tabs. Empty chats hide Latest; account readiness moves out of the conversation area while errors and generation progress remain visible.
 
-- Editor menus now include Close all tabs; AI Chat, Properties and Schema are fixed tools. About uses localized release metadata cards, and built-in dock menus follow the selected language.
+- Editor menus now include Close all tabs; AI Chat, Inspector and Schema are fixed tools. About uses localized release metadata cards, and built-in dock menus follow the selected language.
 
 - Icon-and-label tabs/buttons, group close menus, categorized settings with 600 ms auto-save, SQLite migration, language/theme packs, provider/model configuration and Help release checks. OpenClaw/extensions can be registered with installation links; their chat transport is not yet integrated.
 

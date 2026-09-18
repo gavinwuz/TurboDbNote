@@ -8,7 +8,9 @@ mod cell;
 mod chat;
 mod chat_history;
 mod configuration;
+mod diagnostics;
 mod locale;
+mod locale_catalog;
 mod panels;
 mod preferences;
 mod settings;
@@ -27,6 +29,7 @@ fn main() {
         windows_icon::install_guard().expect("Unable to register running application");
     Application::new().with_assets(assets::Assets).run(|cx| {
         gpui_component::init(cx);
+        let diagnostics = diagnostics::start();
         let preferences = preferences::Preferences::load();
         if let Some(dark) = preferences.dark {
             gpui_component::Theme::change(
@@ -83,8 +86,10 @@ fn main() {
                 cx.refresh_windows();
             });
         }
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(move |cx| {
+            let _keep_alive = &diagnostics;
             if cx.windows().is_empty() {
+                turbodbn_diagnostics::shutdown();
                 cx.quit();
             }
         })

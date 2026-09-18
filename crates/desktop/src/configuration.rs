@@ -208,23 +208,23 @@ impl Configuration {
         self.capture(cx);
         let result = (|| -> Result<(), String> {
             if self.general.font_family.is_empty() {
-                return Err("Font family is required".into());
+                return Err("settings.error.font_required".into());
             }
             for p in &self.providers {
                 catalog::validate_provider(p)?;
             }
             for a in &self.extensions {
                 if a.name.is_empty() {
-                    return Err("Agent name is required".into());
+                    return Err("agents.error.name_required".into());
                 }
                 catalog::endpoint(&a.install_url)?;
                 if !a.executable.is_empty() && !std::path::Path::new(&a.executable).is_file() {
-                    return Err("Agent executable does not exist".into());
+                    return Err("agents.error.executable_missing".into());
                 }
                 if !a.working_directory.is_empty()
                     && !std::path::Path::new(&a.working_directory).is_dir()
                 {
-                    return Err("Agent working directory does not exist".into());
+                    return Err("agents.error.directory_missing".into());
                 }
             }
             let mut prefs = cx.global::<Preferences>().clone();
@@ -254,7 +254,7 @@ impl Configuration {
         })();
         let success = result.is_ok();
         self.status = match result {
-            Ok(()) => t(cx, "已保存").to_string(),
+            Ok(()) => "common.status.saved".into(),
             Err(error) => error,
         };
         cx.notify();
@@ -265,7 +265,7 @@ impl Configuration {
         let requested = p.clone();
         self.loading = true;
         self.models.clear();
-        self.status = t(cx, "正在获取…").to_string();
+        self.status = "common.status.loading".into();
         self.generation += 1;
         let generation = self.generation;
         let work = cx
@@ -286,9 +286,14 @@ impl Configuration {
                 match result {
                     Ok(models) => {
                         this.status = if models.is_empty() {
-                            t(cx, "模型列表为空，可手动输入模型 ID").to_string()
+                            t(cx, "providers.models.empty").to_string()
                         } else {
-                            format!("{} models", models.len())
+                            crate::locale::tr(
+                                cx,
+                                "chat.models.loaded",
+                                &[("count", &models.len().to_string())],
+                            )
+                            .to_string()
                         };
                         this.models = models;
                     }
@@ -336,9 +341,9 @@ impl Render for Configuration {
                 .child(
                     div()
                         .text_size(rems(crate::typography::HEADING))
-                        .child(t(cx, "通用")),
+                        .child(t(cx, "settings.general.title")),
                 )
-                .child(t(cx, "外观"))
+                .child(t(cx, "settings.appearance.label"))
                 .child(
                     div()
                         .h_flex()
@@ -346,7 +351,7 @@ impl Render for Configuration {
                         .child(
                             Button::new("light")
                                 .icon(IconName::Sun)
-                                .label(t(cx, "白天"))
+                                .label(t(cx, "settings.theme.light"))
                                 .selected(!dark)
                                 .disabled(self.locked)
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -359,7 +364,7 @@ impl Render for Configuration {
                         .child(
                             Button::new("dark")
                                 .icon(IconName::Moon)
-                                .label(t(cx, "黑夜"))
+                                .label(t(cx, "settings.theme.dark"))
                                 .selected(dark)
                                 .disabled(self.locked)
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -373,7 +378,7 @@ impl Render for Configuration {
                 .child(
                     Button::new("extra-themes")
                         .icon(IconName::Palette)
-                        .label(t(cx, "扩展主题"))
+                        .label(t(cx, "settings.theme.additional"))
                         .disabled(self.locked)
                         .dropdown_caret(true)
                         .dropdown_menu({
@@ -399,7 +404,7 @@ impl Render for Configuration {
                             }
                         }),
                 )
-                .child(t(cx, "语言"))
+                .child(t(cx, "settings.language.label"))
                 .child(
                     Button::new("language")
                         .icon(IconName::Globe)
@@ -425,8 +430,8 @@ impl Render for Configuration {
                             }
                         }),
                 )
-                .child(self.field("字体", &self.font, cx))
-                .child(t(cx, "字号"))
+                .child(self.field("settings.font.family", &self.font, cx))
+                .child(t(cx, "settings.font.size"))
                 .child(
                     Button::new("font-size")
                         .icon(IconName::ALargeSmall)
@@ -458,12 +463,12 @@ impl Render for Configuration {
                 .child(
                     div()
                         .text_size(rems(crate::typography::HEADING))
-                        .child(t(cx, "AI 提供商")),
+                        .child(t(cx, "settings.providers.title")),
                 )
                 .child(
                     Button::new("add-provider")
                         .icon(IconName::Plus)
-                        .label(t(cx, "添加模型配置"))
+                        .label(t(cx, "providers.action.add"))
                         .disabled(self.locked)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.capture(cx);
@@ -512,16 +517,16 @@ impl Render for Configuration {
                     p.display_name=name.into();p.api_key.clear();p.model.clear();p.api_mode=MODES[0].into();
                     p.endpoint=match name {"Gemini"=>"https://generativelanguage.googleapis.com/v1beta/openai", "DeepSeek"=>"https://api.deepseek.com/v1", "Qwen"=>"https://dashscope.aliyuncs.com/compatible-mode/v1", "Ollama"=>"http://localhost:11434/v1", "Custom"=>"", _=>"https://api.openai.com/v1"}.into();this.sync_fields(window,cx);cx.notify();
                 })));} menu}}))
-                .child(self.field("显示名",&self.fields[0],cx))
+                .child(self.field("providers.name.label",&self.fields[0],cx))
                 .child(Button::new("api-mode").icon(IconName::Settings2).label(p.api_mode).disabled(self.locked).dropdown_caret(true).dropdown_menu({let entity=cx.entity();move |mut menu,_,_| {for mode in MODES {let entity=entity.clone();menu=menu.item(PopupMenuItem::new(mode).on_click(move |_,_,cx| entity.update(cx,|this,cx| {this.providers[this.provider].api_mode=mode.into();this.generation+=1;this.loading=false;this.models.clear();cx.notify();})));} menu}}))
-                .child(self.field("API Endpoint",&self.fields[1],cx)).child(self.field("API Key",&self.fields[2],cx)).child(self.field("Model ID",&self.fields[3],cx))
-                .child(Button::new("fetch-models").icon(IconName::Search).label(t(cx,"获取模型列表")).disabled(self.loading || self.locked).on_click(cx.listener(|this,_,_,cx| this.fetch(cx))));
+                .child(self.field("providers.endpoint.label",&self.fields[1],cx)).child(self.field("providers.key.label",&self.fields[2],cx)).child(self.field("providers.model.label",&self.fields[3],cx))
+                .child(Button::new("fetch-models").icon(IconName::Search).label(t(cx,"providers.models.fetch")).disabled(self.loading || self.locked).on_click(cx.listener(|this,_,_,cx| this.fetch(cx))));
                 if !self.models.is_empty() {
                     let models = self.models.clone();
                     body = body.child(
                         Button::new("models")
                             .icon(IconName::Bot)
-                            .label("Model ID")
+                            .label(t(cx, "providers.model.label"))
                             .dropdown_caret(true)
                             .dropdown_menu({
                                 let entity = cx.entity();
@@ -553,19 +558,19 @@ impl Render for Configuration {
                     .child(
                         Button::new("advanced")
                             .icon(IconName::Settings2)
-                            .label(t(cx, "高级参数 (JSON)"))
+                            .label(t(cx, "providers.advanced.label"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.advanced = !this.advanced;
                                 cx.notify();
                             })),
                     )
                     .when(self.advanced, |el| {
-                        el.child(self.field("高级参数 (JSON)", &self.fields[4], cx))
+                        el.child(self.field("providers.advanced.label", &self.fields[4], cx))
                     })
                     .child(
                         Button::new("delete-provider")
                             .icon(IconName::Delete)
-                            .label(t(cx, "删除配置"))
+                            .label(t(cx, "common.action.delete"))
                             .disabled(self.locked)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.capture(cx);
@@ -581,13 +586,13 @@ impl Render for Configuration {
                 .child(
                     div()
                         .text_size(rems(crate::typography::HEADING))
-                        .child(t(cx, "OpenClaw / 扩展智能体")),
+                        .child(t(cx, "agents.extensions.title")),
                 )
-                .child(t(cx, "安装后配置可执行文件；扩展智能体暂不接入内置聊天。"))
+                .child(t(cx, "agents.extensions.description"))
                 .child(
                     Button::new("add-agent")
                         .icon(IconName::Plus)
-                        .label(t(cx, "添加智能体"))
+                        .label(t(cx, "agents.action.add"))
                         .disabled(self.locked)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.capture(cx);
@@ -629,9 +634,14 @@ impl Render for Configuration {
                             }
                         }),
                 );
-                for (i, label) in ["智能体名称", "可执行文件", "工作目录", "安装地址"]
-                    .into_iter()
-                    .enumerate()
+                for (i, label) in [
+                    "agents.name.label",
+                    "agents.executable.label",
+                    "agents.directory.label",
+                    "agents.install.url",
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     body = body.child(self.field(label, &self.agent_fields[i], cx));
                 }
@@ -639,7 +649,7 @@ impl Render for Configuration {
                     .child(
                         Button::new("install-agent")
                             .icon(IconName::ExternalLink)
-                            .label(t(cx, "安装指南"))
+                            .label(t(cx, "agents.install.guide"))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let a = this.agent_value(cx);
                                 match catalog::endpoint(&a.install_url) {
@@ -654,7 +664,7 @@ impl Render for Configuration {
                     .child(
                         Button::new("remove-agent")
                             .icon(IconName::Delete)
-                            .label(t(cx, "删除配置"))
+                            .label(t(cx, "common.action.delete"))
                             .disabled(self.locked)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.capture(cx);
