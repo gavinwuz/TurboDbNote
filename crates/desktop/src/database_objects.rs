@@ -1,6 +1,71 @@
 use super::*;
 use gpui_component::WindowExt;
 impl DatabaseView {
+    pub(super) fn clear_object_view(&mut self) {
+        self.object_scroll = UniformListScrollHandle::new();
+        self.selected_object = None;
+        self.object_items.clear();
+        self.object_details.clear();
+        self.object_cursor = None;
+        self.catalog_objects.clear();
+        self.schemas.clear();
+        self.pending_object_action = None;
+        self.expanded_objects.clear();
+    }
+    pub(super) fn follow_connection(
+        &mut self,
+        id: Uuid,
+        refresh: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !refresh
+            && self
+                .selected_database
+                .as_ref()
+                .is_some_and(|(current, _)| *current == id)
+        {
+            return true;
+        }
+        let Some(profile) = self.profiles.iter().find(|p| p.id == id).cloned() else {
+            return false;
+        };
+        if let Some((_, _, kind)) = &self.active_operation {
+            if self.workbench_target.is_some() || !is_metadata_read(kind) {
+                feedback::error(crate::locale::t(cx, "dbwork.switch.busy"), cx);
+                return false;
+            }
+            // Metadata requests are read-only. Retire the request ID without disconnecting;
+            // its late result must not populate the newly selected connection's object tree.
+            self.active_operation = None;
+        }
+        let names = self.catalog(&profile);
+        let database = self
+            .navigation
+            .databases
+            .get(&id)
+            .filter(|db| names.contains(db))
+            .cloned()
+            .or_else(|| names.first().cloned())
+            .unwrap_or_else(|| {
+                if profile.kind == DatabaseKind::Sqlite {
+                    std::path::Path::new(&profile.sqlite_path)
+                        .file_name()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                } else {
+                    profile.database.clone()
+                }
+            });
+        self.selected_database = Some((id, database.clone()));
+        self.clear_object_view();
+        if self.states.get(&id).is_some_and(|s| s == "已连接") {
+            self.select_database(id, database, cx);
+        } else {
+            self.object_notice = crate::locale::t(cx, "dbwork.switch.disconnected").to_string();
+            cx.notify();
+        }
+        true
+    }
     pub(super) fn request_operation(
         &mut self,
         id: Uuid,
@@ -9,11 +74,13 @@ impl DatabaseView {
     ) -> bool {
         if self.active_operation.is_some() {
             self.object_notice = "请等待当前操作完成；断开可取消".into();
+            feedback::error(self.object_notice.clone(), cx);
             cx.notify();
             return false;
         }
         let Some(session) = self.sessions.get(&id) else {
             self.object_notice = "请先连接数据库".into();
+            feedback::error(self.object_notice.clone(), cx);
             cx.notify();
             return false;
         };
@@ -33,6 +100,15 @@ impl DatabaseView {
         if let OperationKind::Details { object, .. } = &kind {
             self.selected_object = Some(object.clone());
         }
+        if let OperationKind::Workbench(request) = &kind
+            && let Action::Describe(object) = &request.action
+        {
+            self.selected_object = Some(ObjectItem::new(
+                object.schema.clone(),
+                object.name.clone(),
+                object.kind.clone(),
+            ));
+        }
         self.active_operation = Some((id, request, kind));
         self.object_notice = "正在读取 / 执行…".into();
         cx.notify();
@@ -41,19 +117,26 @@ impl DatabaseView {
     pub(super) fn select_database(&mut self, id: Uuid, database: String, cx: &mut Context<Self>) {
         if self.request_operation(
             id,
-            OperationKind::Objects {
-                database: database.clone(),
-                cursor: None,
+            if self
+                .profiles
+                .iter()
+                .any(|p| p.id == id && p.kind == DatabaseKind::Redis)
+            {
+                OperationKind::Objects {
+                    database: database.clone(),
+                    cursor: None,
+                }
+            } else {
+                OperationKind::Workbench(Box::new(workbench::Request {
+                    database: database.clone(),
+                    action: Action::Catalog,
+                }))
             },
             cx,
         ) {
+            self.navigation.databases.insert(id, database.clone());
             self.selected_database = Some((id, database));
-            self.object_scroll = UniformListScrollHandle::new();
-            self.selected_object = None;
-            self.object_items.clear();
-            self.object_details.clear();
-            self.object_cursor = None;
-            cx.emit(OpenObjects);
+            self.clear_object_view();
             cx.notify();
         }
     }
@@ -71,9 +154,66 @@ impl DatabaseView {
             return;
         }
         self.active_operation = None;
+        if result.is_ok() {
+            self.remember_connection(id, cx);
+        }
+        if let Some(target) = self.workbench_target.take() {
+            let result = result.and_then(|r| match r {
+                OperationResult::Workbench(r) => Ok(*r),
+                _ => Err("响应类型不匹配".into()),
+            });
+            let _ = target.update(cx, |view, cx| view.receive(result, cx));
+            self.object_notice = format!("{} 个对象", self.catalog_objects.len());
+            cx.notify();
+            return;
+        }
         match result {
+            Ok(OperationResult::Workbench(reply)) => match *reply {
+                Reply::Catalog { objects, notice } => {
+                    self.catalog_objects = objects;
+                    self.object_notice = if notice.is_empty() {
+                        format!("{} 个对象", self.catalog_objects.len())
+                    } else {
+                        notice
+                    };
+                }
+                Reply::Schema(mut schema) => {
+                    if let OperationKind::Workbench(request) = kind
+                        && let Action::Describe(object) = request.action
+                    {
+                        self.object_details = schema
+                            .columns
+                            .iter()
+                            .map(|c| (c.name.clone(), format!("{} · {}", c.data_type, c.comment)))
+                            .collect();
+                        self.object_details.push(("DDL".into(), schema.ddl.clone()));
+                        if schema.triggers.values.is_empty() {
+                            schema.triggers.values = self
+                                .catalog_objects
+                                .iter()
+                                .filter(|o| {
+                                    o.kind == "trigger"
+                                        && o.parent == object.name
+                                        && o.schema == object.schema
+                                })
+                                .map(|o| vec![Some(o.name.clone())])
+                                .collect();
+                        }
+                        self.schemas.insert(Self::object_key(&object), schema);
+                    }
+                    self.object_notice = "结构已更新".into();
+                }
+                Reply::Executed => {
+                    self.object_notice = "SQL 已执行，请刷新对象列表".into();
+                    feedback::success(crate::locale::t(cx, "dbwork.executed"), cx);
+                    self.schemas.clear();
+                }
+                Reply::Page { .. } => {}
+            },
             Err(error) => {
+                self.pending_object_action = None;
                 self.object_notice = error.clone();
+                feedback::error(error.clone(), cx);
                 self.status = error;
             }
             Ok(OperationResult::Databases(names)) => {
@@ -118,6 +258,7 @@ impl DatabaseView {
             }
             Ok(OperationResult::Created(name)) => {
                 self.status = format!("数据库已创建：{name}");
+                feedback::success(self.status.clone(), cx);
                 self.object_notice = self.status.clone();
                 if let Some(profile) = self.profiles.iter().find(|p| p.id == id)
                     && profile.database.is_empty()
@@ -128,18 +269,6 @@ impl DatabaseView {
                         info.databases.push(name.clone());
                         info.databases.sort();
                     }
-                    self.db_filters.remove(&id);
-                    self.db_filter_subscriptions.remove(&id);
-                    if let Some(info) = self.info.get(&id) {
-                        self.db_limits.insert(id, info.databases.len());
-                        if let Some(index) = info.databases.iter().position(|n| n == &name) {
-                            self.db_scrolls
-                                .entry(id)
-                                .or_default()
-                                .scroll_to_item(index, ScrollStrategy::Center);
-                        }
-                    }
-                    self.collapsed.remove(&id);
                     self.select_database(id, name, cx);
                 } else {
                     self.object_notice
@@ -161,84 +290,87 @@ impl DatabaseView {
         if !profile.kind.can_create_database() {
             return;
         }
-        self.object_notice.clear();
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("新数据库名称"));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::locale::t(cx, "feedback.database.name"))
+        });
         let view = cx.entity().downgrade();
+        let generation = self.generation.get(&id).copied().unwrap_or_default();
         window.open_dialog(cx, move |dialog, _, cx| {
-            let source = view.clone();
+            let view = view.clone();
             let field = input.clone();
-            let target = profile.clone();
-            let available = view.upgrade().is_some_and(|v| {
-                let this = v.read(cx);
-                this.active_operation.is_none()
-                    && this.states.get(&id).is_some_and(|s| s == "已连接")
-            });
+            let profile = profile.clone();
             dialog
-                .title("创建数据库")
-                .w(px(480.))
+                .title(crate::locale::t(cx, "dbwork.database.new"))
+                .w(px(500.))
                 .overlay_closable(false)
                 .child(
                     div()
                         .v_flex()
                         .gap_3()
                         .child(format!(
-                            "{} · {} · {}",
-                            profile.kind.label(),
-                            profile.name,
-                            profile.environment
+                            "{} · {} · {}:{}",
+                            profile.name, profile.environment, profile.host, profile.port
                         ))
-                        .child(format!("目标：{}:{}", profile.host, profile.port))
-                        .child(Input::new(&input))
-                        .when(!profile.database.is_empty(), |el| {
-                            el.child("当前连接限定单库；创建不会修改原连接配置。")
-                        })
-                        .child(
-                            div()
-                                .h_flex()
-                                .gap_2()
-                                .child(
-                                    Button::new("confirm-create-database")
-                                        .primary()
-                                        .icon(IconName::Plus)
-                                        .label("创建")
-                                        .disabled(!available)
-                                        .on_click(move |_, window, cx| {
-                                            let name = field.read(cx).value().trim().to_string();
-                                            let sent = source
-                                                .update(cx, |this, cx| {
-                                                    if let Err(error) =
-                                                        turbodbn_services::database::validate_name(
-                                                            target.kind,
-                                                            &name,
-                                                        )
-                                                    {
-                                                        this.object_notice = error;
-                                                        cx.notify();
-                                                        return false;
-                                                    }
-                                                    this.request_operation(
-                                                        id,
-                                                        OperationKind::CreateDatabase { name },
+                        .child(Input::new(&input)),
+                )
+                .child(
+                    feedback::actions().child(feedback::close_button(cx)).child(
+                        Button::new("confirm-create-database")
+                            .primary()
+                            .icon(IconName::Plus)
+                            .label(crate::locale::t(cx, "feedback.database.create"))
+                            .on_click(move |_, window, cx| {
+                                let name = field.read(cx).value().trim().to_string();
+                                if let Err(error) =
+                                    turbodbn_services::database::validate_name(profile.kind, &name)
+                                {
+                                    feedback::error(error, cx);
+                                    return;
+                                }
+                                let view = view.clone();
+                                feedback::confirm(
+                                    crate::locale::t(cx, "feedback.database.confirm"),
+                                    format!(
+                                        "{} · {} / {}",
+                                        profile.name, profile.environment, name
+                                    ),
+                                    window,
+                                    cx,
+                                    move |window, cx| {
+                                        let sent = view
+                                            .update(cx, |this, cx| {
+                                                if this
+                                                    .generation
+                                                    .get(&id)
+                                                    .copied()
+                                                    .unwrap_or_default()
+                                                    != generation
+                                                {
+                                                    feedback::error(
+                                                        crate::locale::t(
+                                                            cx,
+                                                            "dbwork.context.changed",
+                                                        ),
                                                         cx,
-                                                    )
-                                                })
-                                                .unwrap_or(false);
-                                            if sent {
-                                                window.close_dialog(cx);
-                                            }
-                                        }),
-                                )
-                                .child(
-                                    Button::new("cancel-create-database")
-                                        .label("取消")
-                                        .on_click(|_, window, cx| window.close_dialog(cx)),
-                                ),
-                        )
-                        .child(
-                            view.upgrade()
-                                .map(|v| v.read(cx).object_notice.clone())
-                                .unwrap_or_default(),
-                        ),
+                                                    );
+                                                    return false;
+                                                }
+                                                this.request_operation(
+                                                    id,
+                                                    OperationKind::CreateDatabase {
+                                                        name: name.clone(),
+                                                    },
+                                                    cx,
+                                                )
+                                            })
+                                            .unwrap_or(false);
+                                        if sent {
+                                            window.close_dialog(cx);
+                                        }
+                                    },
+                                );
+                            }),
+                    ),
                 )
         });
     }
@@ -419,5 +551,17 @@ impl DatabaseView {
             );
         }
         body.into_any_element()
+    }
+}
+
+fn is_metadata_read(kind: &OperationKind) -> bool {
+    match kind {
+        OperationKind::Databases
+        | OperationKind::Objects { .. }
+        | OperationKind::Details { .. } => true,
+        OperationKind::Workbench(request) => {
+            matches!(request.action, Action::Catalog | Action::Describe(_))
+        }
+        OperationKind::CreateDatabase { .. } => false,
     }
 }

@@ -574,10 +574,35 @@ impl Render for Configuration {
                             .disabled(self.locked)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.capture(cx);
-                                this.providers.remove(this.provider);
-                                this.provider = 0;
-                                this.sync_fields(window, cx);
-                                cx.notify();
+                                let index = this.provider;
+                                let name = this.providers[index].display_name.clone();
+                                let view = cx.entity().downgrade();
+                                crate::feedback::confirm(
+                                    t(cx, "feedback.provider.delete"),
+                                    name.clone(),
+                                    window,
+                                    cx,
+                                    move |window, cx| {
+                                        let _ = view.update(cx, |this, cx| {
+                                            if !this.locked
+                                                && this.provider == index
+                                                && this
+                                                    .providers
+                                                    .get(index)
+                                                    .is_some_and(|p| p.display_name == name)
+                                            {
+                                                this.providers.remove(index);
+                                                this.provider = 0;
+                                                this.sync_fields(window, cx);
+                                                crate::feedback::success(
+                                                    t(cx, "feedback.item.removed"),
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            }
+                                        });
+                                    },
+                                );
                             })),
                     );
             }
@@ -668,10 +693,35 @@ impl Render for Configuration {
                             .disabled(self.locked)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.capture(cx);
-                                this.extensions.remove(this.agent);
-                                this.agent = 0;
-                                this.sync_fields(window, cx);
-                                cx.notify();
+                                let index = this.agent;
+                                let name = this.extensions[index].name.clone();
+                                let view = cx.entity().downgrade();
+                                crate::feedback::confirm(
+                                    t(cx, "feedback.agent.delete"),
+                                    name.clone(),
+                                    window,
+                                    cx,
+                                    move |window, cx| {
+                                        let _ = view.update(cx, |this, cx| {
+                                            if !this.locked
+                                                && this.agent == index
+                                                && this
+                                                    .extensions
+                                                    .get(index)
+                                                    .is_some_and(|p| p.name == name)
+                                            {
+                                                this.extensions.remove(index);
+                                                this.agent = 0;
+                                                this.sync_fields(window, cx);
+                                                crate::feedback::success(
+                                                    t(cx, "feedback.item.removed"),
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            }
+                                        });
+                                    },
+                                );
                             })),
                     );
             }

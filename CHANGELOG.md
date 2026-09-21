@@ -6,7 +6,24 @@ Version history is maintained here. Release notes are generated from the matchin
 
 ## [Unreleased]
 
+### Added
+
+- Follow the selected connection in the object browser, clearing offline targets and ignoring retired metadata responses.
+- Display database connection icons, names and muted addresses on a single row, retaining status and disconnect controls.
+- Enable password saving for new connections with a memory-only warning when disabled; prevent clipped connection rows from opening context menus over the object tree.
+- Encrypt saved connection passwords with Windows user DPAPI inside SQLite; hide storage paths behind an open-folder action; double-click connections to connect and use a shared context menu.
+- Allow testing without a connection name or database; load passwords masked with a visibility toggle; retry TLS failures once without encryption and retain the option only after success.
+- Add a searchable detected-database picker and move database creation into the Objects header plus menu.
+
+- Migrate connection profiles to a dedicated SQLite store with creation/update/usage timestamps; retain passwords securely while editing, unify icon feedback and right-aligned dialog actions, confirm risky changes, and add IDX/key/import/export icons.
+
+- Require explicit connection names and database targets; show two-line connection rows, status dots and disconnect controls, cap recent entries at five, and scope table menus and tree indentation correctly.
+
+- Add a resizable connection/object sidebar, grouping and recent connections, table data tabs, reviewed SQL changes, and bounded CSV workflows.
+
 ### Fixed
+
+- Renamed the database sidebar to Databases and removed close controls from both Projects and Databases; navigation/layout buttons still toggle the sidebar.
 
 - Added two-step connection setup for MySQL/SQLite/PostgreSQL/ClickHouse/Redis; grouped navigation with persistent ordering, environment/status icons and virtual catalogs; live object inspection and capability-specific database creation.
 - Added TLS failure classification and recovery dialogs with explicit encrypted/plaintext trial modes, opt-in save after success, legacy shortcuts, and the missing global dialog render layer.

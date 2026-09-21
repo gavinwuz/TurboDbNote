@@ -33,10 +33,11 @@ pub struct Workspace {
     settings_layout: Option<[bool; 3]>,
     closing_window: bool,
     panels: Vec<Arc<dyn PanelView>>,
-    center_order: Vec<&'static str>,
-    right_order: Vec<&'static str>,
-    pending_close: Vec<&'static str>,
+    center_order: Vec<String>,
+    right_order: Vec<String>,
+    pending_close: Vec<String>,
     _tab_subscription: Subscription,
+    _feedback_subscription: Subscription,
     update_status: String,
     checking_update: bool,
     update_task: Option<Task<()>>,
@@ -46,6 +47,8 @@ pub struct Workspace {
     database: Entity<DatabaseView>,
     schema: Entity<WorkbenchPanel>,
     _objects_subscription: Subscription,
+    _table_subscription: Subscription,
+    table_panels: std::collections::HashMap<String, Entity<crate::table_view::TableView>>,
     database_open: bool,
     _database_subscription: Subscription,
     _database_observe: Subscription,
@@ -65,6 +68,24 @@ fn icon_button(id: &'static str, icon: impl Into<Icon>, tooltip: &'static str, c
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let events = cx.global::<crate::feedback::Hub>().0.clone();
+        let feedback_subscription = cx.subscribe_in(
+            &events,
+            window,
+            |_, _, event: &crate::feedback::Message, window, cx| {
+                window.push_notification(
+                    gpui_component::notification::Notification::new()
+                        .with_type(event.kind)
+                        .id1::<crate::feedback::Events>(event.text.clone())
+                        .autohide(!matches!(
+                            event.kind,
+                            gpui_component::notification::NotificationType::Error
+                        ))
+                        .message(event.text.clone()),
+                    cx,
+                );
+            },
+        );
         let dock = cx.new(|cx| DockArea::new("workbench", Some(2), window, cx));
         let weak = dock.downgrade();
         let notebook = cx.new(|cx| WorkbenchPanel::notebook(window, cx));
@@ -175,8 +196,8 @@ impl Workspace {
                         return;
                     }
                     let mut names = std::mem::take(&mut this.pending_close);
-                    if !names.contains(&"settings") {
-                        names.push("settings");
+                    if !names.contains(&"settings".into()) {
+                        names.push("settings".into());
                     }
                     this.close_names(&names, window, cx);
                 }
@@ -228,7 +249,7 @@ impl Workspace {
                 }
                 if !active {
                     this.center_order.retain(|name| *name != "database-manager");
-                    this.center_order.push("database-manager");
+                    this.center_order.push("database-manager".into());
                 }
                 this.database_open = true;
                 cx.notify();
@@ -257,20 +278,54 @@ impl Workspace {
                 }
                 cx.notify();
             });
+        let table_subscription = cx.subscribe_in(
+            &database,
+            window,
+            |this, source, event: &crate::database::OpenTable, window, cx| {
+                let key = format!(
+                    "data:{}:{}:{}:{}:{:?}:{}",
+                    event.connection,
+                    event.database,
+                    event.object.schema,
+                    event.object.name,
+                    event.mode,
+                    event.generation
+                );
+                let panel = this
+                    .table_panels
+                    .entry(key.clone())
+                    .or_insert_with(|| {
+                        cx.new(|cx| {
+                            crate::table_view::TableView::new(
+                                key.clone(),
+                                source.downgrade(),
+                                event.clone(),
+                                window,
+                                cx,
+                            )
+                        })
+                    })
+                    .clone();
+                this.leave_focus(window, cx);
+                this.center_tabs.update(cx, |tabs, cx| {
+                    let panel = Arc::new(panel);
+                    tabs.remove_panel(panel.clone(), window, cx);
+                    tabs.add_panel(panel, window, cx);
+                });
+                this.center_order.retain(|n| n != &key);
+                this.center_order.push(key);
+                cx.notify();
+            },
+        );
         let router = cx.global::<TabRouter>().0.clone();
         let tab_subscription =
             cx.subscribe_in(&router, window, |this, _, event: &CloseTabs, window, cx| {
-                if crate::tabs::is_fixed(event.name) {
+                if crate::tabs::is_fixed(&event.name) {
                     return;
                 }
-                if event.name == "navigation" || event.name == "ai-output" {
+                if event.name == "ai-output" {
                     if matches!(event.mode, CloseMode::Current) {
-                        let region = if event.name == "navigation" {
-                            DockPlacement::Left
-                        } else {
-                            DockPlacement::Bottom
-                        };
-                        this.toggle_region(region, window, cx);
+                        this.toggle_region(DockPlacement::Bottom, window, cx);
                     }
                     return;
                 }
@@ -279,8 +334,8 @@ impl Workspace {
                 } else {
                     &this.right_order
                 };
-                let names = crate::tabs::targets(order, event.name, event.mode);
-                if names.contains(&"settings") {
+                let names = crate::tabs::targets(order, &event.name, event.mode);
+                if names.contains(&"settings".into()) {
                     if this.ai.read(cx).settings_saving() {
                         return;
                     }
@@ -294,16 +349,19 @@ impl Workspace {
         let status_observe = cx.observe(&ai, |_, _, cx| cx.notify());
         Self {
             schema,
+            table_panels: std::collections::HashMap::new(),
+            _table_subscription: table_subscription,
             _objects_subscription: objects_subscription,
             database,
             database_open: false,
             _database_subscription: db_subscription,
             _database_observe: db_observe,
             panels,
-            center_order: vec!["notebook"],
-            right_order: vec!["ai-chat", "properties", "schema"],
+            center_order: vec!["notebook".into()],
+            right_order: vec!["ai-chat".into(), "properties".into(), "schema".into()],
             pending_close: vec![],
             _tab_subscription: tab_subscription,
+            _feedback_subscription: feedback_subscription,
             update_status: cx
                 .global::<crate::preferences::Preferences>()
                 .load_error
@@ -361,7 +419,7 @@ impl Workspace {
         }
         if !active {
             self.center_order.retain(|name| *name != "settings");
-            self.center_order.push("settings");
+            self.center_order.push("settings".into());
         }
         self.settings_open = true;
         window.focus(&self.settings.read(cx).focus_handle(cx));
@@ -388,10 +446,15 @@ impl Workspace {
         let panels = order
             .iter()
             .filter_map(|name| {
-                self.panels
-                    .iter()
-                    .find(|p| p.panel_name(cx) == *name)
-                    .cloned()
+                self.table_panels
+                    .get(name)
+                    .map(|p| Arc::new(p.clone()) as Arc<dyn PanelView>)
+                    .or_else(|| {
+                        self.panels
+                            .iter()
+                            .find(|p| p.panel_name(cx) == name.as_str())
+                            .cloned()
+                    })
             })
             .collect();
         let item = DockItem::tabs(panels, &self.dock.downgrade(), window, cx);
@@ -423,7 +486,7 @@ impl Workspace {
             }
         });
     }
-    fn close_names(&mut self, names: &[&'static str], window: &mut Window, cx: &mut Context<Self>) {
+    fn close_names(&mut self, names: &[String], window: &mut Window, cx: &mut Context<Self>) {
         self.leave_focus(window, cx);
         self.dock
             .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
@@ -433,10 +496,15 @@ impl Workspace {
                 continue;
             }
             let Some(panel) = self
-                .panels
-                .iter()
-                .find(|p| p.panel_name(cx) == *name)
-                .cloned()
+                .table_panels
+                .get(name)
+                .map(|p| Arc::new(p.clone()) as Arc<dyn PanelView>)
+                .or_else(|| {
+                    self.panels
+                        .iter()
+                        .find(|p| p.panel_name(cx) == name.as_str())
+                        .cloned()
+                })
             else {
                 continue;
             };
@@ -451,9 +519,9 @@ impl Workspace {
         self.center_order.retain(|n| !names.contains(n));
         self.right_order
             .retain(|n| crate::tabs::is_fixed(n) || !names.contains(n));
-        self.settings_open = self.center_order.contains(&"settings");
-        self.database_open = self.center_order.contains(&"database-manager");
-        if names.contains(&"settings")
+        self.settings_open = self.center_order.contains(&"settings".into());
+        self.database_open = self.center_order.contains(&"database-manager".into());
+        if names.contains(&"settings".into())
             && let Some(states) = self.settings_layout.take()
         {
             self.restore_visibility(states, window, cx);
@@ -467,11 +535,11 @@ impl Workspace {
         cx.notify();
     }
     fn restore_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.center_order.contains(&"notebook") {
-            self.center_order.push("notebook");
+        if !self.center_order.contains(&"notebook".into()) {
+            self.center_order.push("notebook".into());
             self.rebuild_tabs(true, window, cx);
         }
-        self.right_order = vec!["ai-chat", "properties", "schema"];
+        self.right_order = vec!["ai-chat".into(), "properties".into(), "schema".into()];
         self.rebuild_tabs(false, window, cx);
         cx.notify();
     }
@@ -590,7 +658,8 @@ impl Workspace {
                     .child(crate::locale::t(cx, "help.layout.description"))
                     .child(crate::locale::t(cx, "help.focus.description"))
                     .child(crate::locale::t(cx, "help.theme.description"))
-                    .child(crate::locale::t(cx, "help.memory.description")),
+                    .child(crate::locale::t(cx, "help.memory.description"))
+                    .child(crate::feedback::actions().child(crate::feedback::close_button(cx))),
             )
         });
     }
@@ -599,6 +668,7 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dialogs = Root::render_dialog_layer(window, cx);
+        let notifications = Root::render_notification_layer(window, cx);
         let [left, bottom, right] = self.visibility(cx);
         let focused = self.focus_snapshot.is_some();
         let dark = cx.theme().mode.is_dark();
@@ -818,5 +888,14 @@ impl Render for Workspace {
                 ),
             )
             .children(dialogs)
+            .child(
+                div()
+                    .absolute()
+                    .top(px(40.))
+                    .left_0()
+                    .right_0()
+                    .bottom_0()
+                    .children(notifications),
+            )
     }
 }

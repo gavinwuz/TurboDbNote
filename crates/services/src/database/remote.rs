@@ -140,6 +140,15 @@ impl HttpDatabase {
     }
     pub async fn operation(&self, p: &Profile, op: &Operation) -> Result<OperationResult, String> {
         match &op.kind {
+            OperationKind::Workbench(r) => {
+                let mut access = HttpAccess {
+                    client: self,
+                    database: &r.database,
+                };
+                super::workbench::run(&mut access, p.kind, "", r)
+                    .await
+                    .map(|r| OperationResult::Workbench(Box::new(r)))
+            }
             OperationKind::Databases => Ok(OperationResult::Databases(if p.database.is_empty() {
                 self.databases().await?
             } else {
@@ -347,6 +356,7 @@ impl RedisDatabase {
         op: &Operation,
     ) -> Result<OperationResult, String> {
         match &op.kind {
+            OperationKind::Workbench(_) => Err("Redis 使用 Key 浏览器，不支持关系表 SQL".into()),
             OperationKind::Databases => Ok(OperationResult::Databases(if !p.database.is_empty() {
                 vec![p.database.clone()]
             } else {
@@ -428,5 +438,48 @@ impl RedisDatabase {
                 Ok(OperationResult::Details(out))
             }
         }
+    }
+}
+
+struct HttpAccess<'a> {
+    client: &'a HttpDatabase,
+    database: &'a str,
+}
+impl super::workbench::Access for HttpAccess<'_> {
+    fn query<'a>(&'a mut self, sql: &'a str) -> super::workbench::Query<'a> {
+        Box::pin(async move {
+            let read = sql.trim_start().to_ascii_uppercase();
+            let sql = if read.starts_with("SELECT") || read.starts_with("SHOW") {
+                format!("{sql} FORMAT JSONCompactEachRow")
+            } else {
+                sql.into()
+            };
+            let rows = self.client.query(&sql, self.database, &[]).await?;
+            Ok(super::workbench::Rows {
+                columns: Vec::new(),
+                values: rows
+                    .into_iter()
+                    .map(|r| {
+                        r.as_array()
+                            .map(|r| {
+                                r.iter()
+                                    .map(|v| {
+                                        if v.is_null() {
+                                            None
+                                        } else {
+                                            Some(
+                                                v.as_str()
+                                                    .map(String::from)
+                                                    .unwrap_or_else(|| v.to_string()),
+                                            )
+                                        }
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+            })
+        })
     }
 }

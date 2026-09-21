@@ -108,10 +108,9 @@ pub fn open(window: &mut Window, cx: &mut App) {
                         )),
                 )
                 .child(
-                    div()
-                        .h_flex()
-                        .gap_2()
+                    crate::feedback::actions()
                         .flex_wrap()
+                        .child(crate::feedback::close_button(cx))
                         .child(
                             Button::new("about-github")
                                 .icon(IconName::GitHub)

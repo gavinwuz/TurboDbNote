@@ -297,16 +297,32 @@ impl Render for SettingsView {
                                         .icon(IconName::Delete)
                                         .label(t(cx, "common.action.discard"))
                                         .disabled(saving)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.configuration
-                                                .update(cx, |form, cx| form.discard(window, cx));
-                                            this.chat.update(cx, |chat, cx| {
-                                                chat.discard_settings(window, cx)
-                                            });
-                                            this.close_prompt = false;
-                                            this.chat.update(cx, |_, cx| {
-                                                cx.emit(SettingsRequest::Close)
-                                            });
+                                        .on_click(cx.listener(|_, _, window, cx| {
+                                            let view = cx.entity().downgrade();
+                                            crate::feedback::confirm(
+                                                t(cx, "feedback.settings.discard"),
+                                                t(cx, "feedback.settings.discard.body"),
+                                                window,
+                                                cx,
+                                                move |window, cx| {
+                                                    let _ = view.update(cx, |this, cx| {
+                                                        if this.chat.read(cx).settings_saving() {
+                                                            return;
+                                                        }
+                                                        this.configuration
+                                                            .update(cx, |form, cx| {
+                                                                form.discard(window, cx)
+                                                            });
+                                                        this.chat.update(cx, |chat, cx| {
+                                                            chat.discard_settings(window, cx)
+                                                        });
+                                                        this.close_prompt = false;
+                                                        this.chat.update(cx, |_, cx| {
+                                                            cx.emit(SettingsRequest::Close)
+                                                        });
+                                                    });
+                                                },
+                                            );
                                         })),
                                 )
                                 .child(

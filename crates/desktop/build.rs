@@ -66,7 +66,7 @@ fn validate_locales() {
             // Direct t()/tr() lookups are still validated independently below.
             let file_literal = matches!(
                 key.as_str(),
-                "connections.json" | "database.db" | "settings.json"
+                "connections.json" | "connections.db" | "database.db" | "settings.json"
             );
             if !file_literal
                 && locale_catalog::semantic_key(&key)

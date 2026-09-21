@@ -8,7 +8,34 @@ use std::{
 #[serde(default)]
 pub(super) struct Navigation {
     pub order: Vec<String>,
+    pub environment_order: Vec<String>,
+    pub mode: GroupMode,
+    pub recent: Vec<Uuid>,
+    pub databases: HashMap<Uuid, String>,
+    pub created: HashMap<Uuid, String>,
+    pub categories: Vec<String>,
+    pub environments: Vec<String>,
+    pub top_height: f32,
+    pub top_ratio: f32,
     pub collapsed: std::collections::HashSet<String>,
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) enum GroupMode {
+    #[default]
+    Group,
+    Environment,
+    Date,
+    UsedDate,
+}
+impl GroupMode {
+    fn key(self) -> &'static str {
+        match self {
+            Self::Group => "dbwork.group",
+            Self::Environment => "dbwork.environment",
+            Self::Date => "dbwork.date",
+            Self::UsedDate => "feedback.group.used",
+        }
+    }
 }
 pub(super) fn load(path: &Path) -> Result<Navigation, String> {
     let file = match std::fs::File::open(path) {
@@ -99,16 +126,60 @@ fn type_icon(kind: DatabaseKind) -> gpui_component::Icon {
         })
 }
 impl DatabaseView {
-    fn persist_navigation(&self) {
+    pub(super) fn persist_navigation(&self) {
         let _ = self.nav_writer.force_send(self.navigation.clone());
     }
+    fn group_key(&self, p: &Profile) -> String {
+        match self.navigation.mode {
+            GroupMode::Group => group(p),
+            GroupMode::Environment => {
+                if p.environment.is_empty() {
+                    "未设置环境".into()
+                } else {
+                    p.environment.clone()
+                }
+            }
+            GroupMode::Date => connection_store::day(
+                self.history
+                    .get(&p.id)
+                    .and_then(|h| h.created_at.as_deref()),
+            )
+            .unwrap_or_else(|| "日期未知".into()),
+            GroupMode::UsedDate => connection_store::day(
+                self.history
+                    .get(&p.id)
+                    .and_then(|h| h.last_used_at.as_deref()),
+            )
+            .unwrap_or_else(|| "日期未知".into()),
+        }
+    }
     fn ordered_groups(&self) -> Vec<String> {
-        let mut names = self.profiles.iter().map(group).collect::<Vec<_>>();
+        let mut names = self
+            .profiles
+            .iter()
+            .map(|p| self.group_key(p))
+            .collect::<Vec<_>>();
+        match self.navigation.mode {
+            GroupMode::Group => names.extend(self.navigation.categories.clone()),
+            GroupMode::Environment => names.extend(self.navigation.environments.clone()),
+            _ => {}
+        }
         names.sort();
         names.dedup();
-        let mut ordered = self
-            .navigation
-            .order
+        if matches!(self.navigation.mode, GroupMode::Date | GroupMode::UsedDate) {
+            names.reverse();
+            if let Some(index) = names.iter().position(|n| n == "日期未知") {
+                let unknown = names.remove(index);
+                names.push(unknown);
+            }
+            return names;
+        }
+        let order = if self.navigation.mode == GroupMode::Environment {
+            &self.navigation.environment_order
+        } else {
+            &self.navigation.order
+        };
+        let mut ordered = order
             .iter()
             .filter(|n| names.contains(n))
             .cloned()
@@ -120,6 +191,140 @@ impl DatabaseView {
         }
         ordered
     }
+    pub(super) fn remember_connection(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.profiles.iter().any(|p| p.id == id) {
+            let at = connection_store::timestamp();
+            let history = self.history.entry(id).or_default();
+            if history.last_used_at.as_ref().is_none_or(|old| old < &at) {
+                history.last_used_at = Some(at.clone());
+            }
+            let path = self.file.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { connection_store::mark_used(&path, id, &at) });
+            cx.spawn(async move |view, cx| {
+                if let Err(error) = task.await {
+                    let _ = view.update(cx, |_, cx| feedback::error(error, cx));
+                }
+            })
+            .detach();
+        }
+        self.navigation.recent.retain(|old| *old != id);
+        self.navigation.recent.insert(0, id);
+        self.navigation.recent.truncate(5);
+        self.persist_navigation();
+    }
+    pub fn navigation_menu(
+        &self,
+        menu: gpui_component::menu::PopupMenu,
+        cx: &Context<Self>,
+    ) -> gpui_component::menu::PopupMenu {
+        let view = cx.entity().downgrade();
+        menu.item(
+            PopupMenuItem::new(crate::locale::t(cx, "dbwork.split.reset"))
+                .icon(IconName::Redo)
+                .on_click(move |_, _, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        this.navigation.top_height = 340.;
+                        this.navigation.top_ratio = 0.;
+                        this.sidebar_split =
+                            cx.new(|_| gpui_component::resizable::ResizableState::default());
+                        this.persist_navigation();
+                        cx.notify();
+                    });
+                }),
+        )
+    }
+    pub fn navigation_tools(&self, cx: &Context<Self>) -> AnyElement {
+        let view = cx.entity().downgrade();
+        let can_add = !matches!(self.navigation.mode, GroupMode::Date | GroupMode::UsedDate);
+        Button::new("connection-grouping")
+            .ghost()
+            .icon(IconName::SortAscending)
+            .tooltip(crate::locale::t(cx, self.navigation.mode.key()))
+            .dropdown_menu(move |mut menu, _, cx| {
+                for mode in [
+                    GroupMode::Group,
+                    GroupMode::Environment,
+                    GroupMode::Date,
+                    GroupMode::UsedDate,
+                ] {
+                    let v = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(crate::locale::t(cx, mode.key())).on_click(
+                            move |_, _, cx| {
+                                let _ = v.update(cx, |this, cx| {
+                                    this.navigation.mode = mode;
+                                    this.persist_navigation();
+                                    cx.notify();
+                                });
+                            },
+                        ),
+                    );
+                }
+                if !can_add {
+                    return menu;
+                }
+                let v = view.clone();
+                menu.item(
+                    PopupMenuItem::new(crate::locale::t(cx, "dbwork.category.add")).on_click(
+                        move |_, window, cx| {
+                            let _ = v.update(cx, |this, cx| this.add_category(window, cx));
+                        },
+                    ),
+                )
+            })
+            .into_any_element()
+    }
+    fn add_category(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::WindowExt;
+        let mode = self.navigation.mode;
+        if matches!(mode, GroupMode::Date | GroupMode::UsedDate) {
+            return;
+        }
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(crate::locale::t(cx, mode.key())));
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let input = input.clone();
+            let field = input.clone();
+            let view = view.clone();
+            dialog
+                .title(crate::locale::t(cx, "dbwork.category.add"))
+                .child(Input::new(&input))
+                .child(
+                    feedback::actions().child(feedback::close_button(cx)).child(
+                        Button::new("save-category")
+                            .icon(IconName::Check)
+                            .primary()
+                            .label(crate::locale::t(cx, "dbwork.save"))
+                            .on_click(move |_, window, cx| {
+                                let name = field.read(cx).value().trim().to_string();
+                                if name.is_empty() || name.chars().count() > 80 {
+                                    return;
+                                }
+                                let _ = view.update(cx, |this, cx| {
+                                    let list = if mode == GroupMode::Group {
+                                        &mut this.navigation.categories
+                                    } else {
+                                        &mut this.navigation.environments
+                                    };
+                                    if !list.contains(&name) {
+                                        list.push(name.clone());
+                                    }
+                                    this.persist_navigation();
+                                    cx.notify();
+                                });
+                                window.close_dialog(cx);
+                                feedback::success(
+                                    crate::locale::t(cx, "feedback.category.saved"),
+                                    cx,
+                                );
+                            }),
+                    ),
+                )
+        });
+    }
     fn move_group(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let mut names = self.ordered_groups();
         if let (Some(a), Some(b)) = (
@@ -128,7 +333,11 @@ impl DatabaseView {
         ) {
             let item = names.remove(a);
             names.insert(b, item);
-            self.navigation.order = names;
+            if self.navigation.mode == GroupMode::Environment {
+                self.navigation.environment_order = names;
+            } else {
+                self.navigation.order = names;
+            }
             self.persist_navigation();
             cx.notify();
         }
@@ -152,7 +361,7 @@ impl DatabaseView {
             .into_any_element()
     }
     fn choose_type(&mut self, kind: DatabaseKind, window: &mut Window, cx: &mut Context<Self>) {
-        if let Ok(profile) = self.draft(cx) {
+        if let Ok(profile) = self.raw_draft(cx) {
             let password = self.fields["password"].read(cx).value().to_string();
             self.typed_drafts.insert(profile.kind, (profile, password));
         }
@@ -161,18 +370,16 @@ impl DatabaseView {
             .typed_drafts
             .get(&kind)
             .cloned()
-            .unwrap_or((turbodbn_services::database::defaults(kind), String::new()));
+            .unwrap_or((Self::empty_profile(kind), String::new()));
         profile.group = self.text("group", cx);
         profile.environment = self.text("environment", cx);
         let name = self.text("name", cx);
-        if !name.starts_with("新建 ") {
-            profile.name = name;
-        }
+        profile.name = name;
         if common.kind == kind {
             profile.id = common.id;
         }
         self.fill(profile, window, cx);
-        self.baseline = turbodbn_services::database::defaults(kind);
+        self.baseline = Self::empty_profile(kind);
         self.baseline.id = self.editing.id;
         self.fields["password"].update(cx, |input, cx| input.set_value(password, window, cx));
         self.tab = 0;
@@ -239,379 +446,57 @@ impl DatabaseView {
             .detach();
         }
     }
+
     pub fn navigation(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        use gpui_component::resizable::{resizable_panel, v_resizable};
         let search = self.search.read(cx).value().trim().to_lowercase();
-        let groups = self.ordered_groups();
-        let mut rows = Vec::new();
-        for (index, name) in groups.iter().enumerate() {
+        let mut sections = Vec::new();
+        if !matches!(self.navigation.mode, GroupMode::Date | GroupMode::UsedDate)
+            && !self.navigation.recent.is_empty()
+        {
+            let recent = self
+                .navigation
+                .recent
+                .iter()
+                .filter_map(|id| self.profiles.iter().find(|p| p.id == *id))
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>();
+            sections.push(self.connection_section(
+                "__recent",
+                crate::locale::t(cx, "dbwork.recent").to_string(),
+                recent,
+                true,
+                &search,
+                cx,
+            ));
+        }
+        for name in self.ordered_groups() {
             let members = self
                 .profiles
                 .iter()
-                .filter(|p| group(p) == *name)
+                .filter(|p| self.group_key(p) == name)
                 .cloned()
-                .collect::<Vec<_>>();
-            let matches = members.iter().any(|p| {
-                format!(
-                    "{} {} {} {} {}",
-                    p.name,
-                    p.host,
-                    p.database,
-                    p.kind.label(),
-                    self.catalog(p).join(" ")
-                )
-                .to_lowercase()
-                .contains(&search)
-            });
-            if !search.is_empty() && !name.to_lowercase().contains(&search) && !matches {
-                continue;
-            }
-            let collapsed = self.navigation.collapsed.contains(name) && search.is_empty();
-            let toggle = name.clone();
-            let target = name.clone();
-            let drag = name.clone();
-            let view = cx.entity().downgrade();
-            let menu_name = name.clone();
-            let order = groups.clone();
-            let header = div()
-                .id(SharedString::from(format!("group-{name}")))
-                .h_flex()
-                .gap_1()
-                .on_drag(GroupDrag(drag.clone()), |drag, _, _, cx| {
-                    cx.new(|_| drag.clone())
-                })
-                .on_drop(cx.listener(move |this, source: &GroupDrag, _, cx| {
-                    this.move_group(&source.0, &target, cx)
-                }))
-                .child(
-                    div()
-                        .id(SharedString::from(format!("grip-{name}")))
-                        .w(px(16.))
-                        .h(px(32.))
-                        .h_flex()
-                        .cursor_grab()
-                        .child(gpui_component::Icon::new(IconName::Menu))
-                        .on_drag(GroupDrag(drag), |drag, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.new(|_| drag.clone())
-                        }),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("toggle-{name}")))
-                        .ghost()
-                        .icon(if collapsed {
-                            IconName::ChevronRight
-                        } else {
-                            IconName::ChevronDown
-                        })
-                        .label(name.clone())
-                        .justify_start()
-                        .flex_1()
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if !this.navigation.collapsed.remove(&toggle) {
-                                this.navigation.collapsed.insert(toggle.clone());
-                            }
-                            this.persist_navigation();
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("menu-{name}")))
-                        .ghost()
-                        .icon(IconName::Ellipsis)
-                        .tooltip("调整分组顺序")
-                        .dropdown_menu(move |menu, _, _| {
-                            let up = view.clone();
-                            let down = view.clone();
-                            let name_up = menu_name.clone();
-                            let name_down = menu_name.clone();
-                            let previous = order.get(index.wrapping_sub(1)).cloned();
-                            let next = order.get(index + 1).cloned();
-                            menu.item(
-                                PopupMenuItem::new("上移")
-                                    .disabled(previous.is_none())
-                                    .on_click(move |_, _, cx| {
-                                        if let Some(to) = &previous {
-                                            let _ = up.update(cx, |this, cx| {
-                                                this.move_group(&name_up, to, cx)
-                                            });
-                                        }
-                                    }),
-                            )
-                            .item(
-                                PopupMenuItem::new("下移")
-                                    .disabled(next.is_none())
-                                    .on_click(move |_, _, cx| {
-                                        if let Some(to) = &next {
-                                            let _ = down.update(cx, |this, cx| {
-                                                this.move_group(&name_down, to, cx)
-                                            });
-                                        }
-                                    }),
-                            )
-                        }),
-                );
-            let mut block = div().v_flex().gap_2().child(header);
-            if !collapsed {
-                for profile in members {
-                    let id = profile.id;
-                    let state = self.states.get(&id).cloned().unwrap_or("未连接".into());
-                    let connected = state == "已连接";
-                    let mut names = if !profile.database.is_empty() {
-                        vec![profile.database.clone()]
-                    } else {
-                        self.catalog(&profile)
-                    };
-                    if !search.is_empty()
-                        && !format!(
-                            "{} {} {} {}",
-                            name,
-                            profile.name,
-                            profile.host,
-                            profile.kind.label()
-                        )
-                        .to_lowercase()
-                        .contains(&search)
-                    {
-                        names.retain(|n| n.to_lowercase().contains(&search));
-                        if names.is_empty() {
-                            continue;
-                        }
-                    }
-                    let expanded = !self.collapsed.contains(&id);
-                    let status_icon = if connected {
-                        IconName::CircleCheck
-                    } else if state.ends_with("中…") {
-                        IconName::LoaderCircle
-                    } else if state.contains("失败") {
-                        IconName::CircleX
-                    } else {
-                        IconName::Dash
-                    };
-                    let environment = profile.environment.clone();
-                    let mut item = div()
-                        .v_flex()
-                        .gap_1()
-                        .pl_2()
-                        .child(
-                            div()
-                                .h_flex()
-                                .gap_1()
-                                .child(
-                                    Button::new(SharedString::from(format!("connection-{id}")))
-                                        .ghost()
-                                        .icon(type_icon(profile.kind))
-                                        .label(profile.name.clone())
-                                        .justify_start()
-                                        .tooltip(format!(
-                                            "{} · {}",
-                                            profile.kind.label(),
-                                            profile.name
-                                        ))
-                                        .flex_1()
-                                        .min_w_0()
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.select(id, window, cx)
-                                        })),
-                                )
-                                .child(
-                                    div()
-                                        .px_1()
-                                        .rounded_sm()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .h_flex()
-                                        .gap_1()
-                                        .child(
-                                            div()
-                                                .w(px(6.))
-                                                .h(px(6.))
-                                                .rounded_full()
-                                                .bg(environment_color(&environment)),
-                                        )
-                                        .child(environment),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!("state-{id}")))
-                                        .ghost()
-                                        .icon(status_icon)
-                                        .tooltip(state.clone()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(if profile.kind == DatabaseKind::Sqlite {
-                                    format!(
-                                        "{} · {state}",
-                                        Path::new(&profile.sqlite_path)
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                    )
-                                } else {
-                                    format!("{}:{} · {state}", profile.host, profile.port)
-                                }),
-                        )
-                        .child(
-                            div()
-                                .h_flex()
-                                .gap_1()
-                                .child(
-                                    Button::new(SharedString::from(format!("expand-{id}")))
-                                        .ghost()
-                                        .icon(if expanded {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        })
-                                        .label(format!("数据库 · {}", names.len()))
-                                        .flex_1()
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            if !this.collapsed.remove(&id) {
-                                                this.collapsed.insert(id);
-                                            }
-                                            cx.notify();
-                                        })),
-                                )
-                                .child(
-                                    Button::new(SharedString::from(format!("refresh-{id}")))
-                                        .ghost()
-                                        .icon(IconName::Redo)
-                                        .tooltip("刷新数据库")
-                                        .disabled(!connected || self.active_operation.is_some())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.request_operation(
-                                                id,
-                                                OperationKind::Databases,
-                                                cx,
-                                            );
-                                        })),
-                                )
-                                .when(profile.kind.can_create_database(), |el| {
-                                    el.child(
-                                        Button::new(SharedString::from(format!("create-{id}")))
-                                            .ghost()
-                                            .icon(IconName::Plus)
-                                            .tooltip("创建数据库")
-                                            .disabled(!connected || self.active_operation.is_some())
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.create_database_dialog(id, window, cx)
-                                            })),
-                                    )
-                                }),
-                        );
-                    if expanded {
-                        if names.len() > 20 {
-                            if let std::collections::hash_map::Entry::Vacant(entry) =
-                                self.db_filters.entry(id)
-                            {
-                                let filter = cx.new(|cx| {
-                                    InputState::new(window, cx).placeholder("筛选数据库")
-                                });
-                                let sub = cx.observe(&filter, |_, _, cx| cx.notify());
-                                entry.insert(filter);
-                                self.db_filter_subscriptions.insert(id, sub);
-                            }
-                            let filter = self.db_filters[&id].clone();
-                            let query = filter.read(cx).value().trim().to_lowercase();
-                            names.retain(|n| n.to_lowercase().contains(&query));
-                            item = item.child(Input::new(&filter));
-                        }
-                        let total = names.len();
-                        let limit = *self.db_limits.entry(id).or_insert(20);
-                        names.truncate(limit);
-                        let count = names.len();
-                        let kind = profile.kind;
-                        let scroll = self.db_scrolls.entry(id).or_default().clone();
-                        if count > 0 {
-                            item = item.child(
-                                uniform_list(
-                                    SharedString::from(format!("database-list-{id}")),
-                                    count,
-                                    cx.processor(
-                                        move |this, range: std::ops::Range<usize>, _, cx| {
-                                            range
-                                                .map(|ix| {
-                                                    let database = names[ix].clone();
-                                                    let selected = this.selected_database.as_ref()
-                                                        == Some(&(id, database.clone()));
-                                                    Button::new(("database-row", ix))
-                                                        .ghost()
-                                                        .icon(
-                                                            gpui_component::Icon::default()
-                                                                .path("icons/database.svg"),
-                                                        )
-                                                        .label(if kind == DatabaseKind::Redis {
-                                                            format!("DB {database}")
-                                                        } else {
-                                                            database.clone()
-                                                        })
-                                                        .selected(selected)
-                                                        .justify_start()
-                                                        .tooltip(database.clone())
-                                                        .disabled(
-                                                            !connected
-                                                                || this.active_operation.is_some(),
-                                                        )
-                                                        .w_full()
-                                                        .h(px(28.))
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.select_database(
-                                                                    id,
-                                                                    database.clone(),
-                                                                    cx,
-                                                                )
-                                                            },
-                                                        ))
-                                                        .into_any_element()
-                                                })
-                                                .collect::<Vec<_>>()
-                                        },
-                                    ),
-                                )
-                                .track_scroll(scroll)
-                                .w_full()
-                                .h(px((count.min(8) * 28) as f32)),
-                            );
-                        } else {
-                            item = item.child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(if connected {
-                                        "无匹配数据库"
-                                    } else {
-                                        "连接后加载；搜索不会自动连接"
-                                    }),
-                            );
-                        }
-                        if total > limit {
-                            item = item.child(
-                                Button::new(SharedString::from(format!("more-databases-{id}")))
-                                    .ghost()
-                                    .label(format!("查看更多（剩余 {}）", total - limit))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        *this.db_limits.entry(id).or_insert(20) += 50;
-                                        cx.notify();
-                                    })),
-                            );
-                        }
-                    }
-                    block = block.child(item);
-                }
-            }
-            rows.push(block);
+                .collect();
+            sections.push(self.connection_section(
+                &name,
+                name.clone(),
+                members,
+                false,
+                &search,
+                cx,
+            ));
         }
-        div()
+        let top = div()
             .v_flex()
-            .gap_3()
-            .w_full()
+            .size_full()
+            .min_h_0()
+            .p_2()
+            .gap_2()
             .child(
                 Button::new("new-connection")
                     .icon(IconName::Plus)
-                    .label("新建连接")
+                    .label(crate::locale::t(cx, "dbwork.connection.new"))
                     .disabled(self.saving)
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.dirty(cx) {
@@ -621,14 +506,337 @@ impl DatabaseView {
                             return;
                         }
                         this.typed_drafts.clear();
-                        this.fill(Profile::default(), window, cx);
+                        this.fill(Self::empty_profile(DatabaseKind::MySql), window, cx);
                         this.choosing_type = true;
                         cx.emit(OpenDatabase);
                         cx.notify();
                     })),
             )
             .child(Input::new(&self.search))
-            .children(rows)
+            .child(
+                div()
+                    .id("connection-sections")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .children(sections),
+            );
+        let bottom = self.render_object_tree(window, cx);
+        let source = cx.entity().downgrade();
+        v_resizable("database-vertical-split")
+            .with_state(&self.sidebar_split)
+            .on_resize(move |state, _, cx| {
+                let sizes = state.read(cx).sizes();
+                let total = sizes.iter().map(|p| f32::from(*p)).sum::<f32>();
+                let height = sizes.first().copied().map(f32::from);
+                if let Some(h) = height {
+                    let _ = source.update(cx, |this, _| {
+                        this.navigation.top_height = h;
+                        if total > 0. {
+                            this.navigation.top_ratio = (h / total).clamp(0.15, 0.85);
+                        }
+                        this.persist_navigation();
+                    });
+                }
+            })
+            .child(
+                resizable_panel()
+                    .size(px(if self.navigation.top_ratio > 0. {
+                        (f32::from(window.viewport_size().height) - 100.)
+                            * self.navigation.top_ratio.clamp(0.15, 0.85)
+                    } else if self.navigation.top_height > 0. {
+                        self.navigation.top_height
+                    } else {
+                        340.
+                    }))
+                    .size_range(px(150.)..px(2000.))
+                    .child(top),
+            )
+            .child(
+                resizable_panel()
+                    .size_range(px(180.)..px(4000.))
+                    .child(bottom),
+            )
             .into_any_element()
     }
+    fn connection_section(
+        &self,
+        key: &str,
+        label: String,
+        profiles: Vec<Profile>,
+        recent: bool,
+        search: &str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let label = match label.as_str() {
+            "未分组" => crate::locale::t(cx, "dbwork.ungrouped").to_string(),
+            "未设置环境" => crate::locale::t(cx, "dbwork.environment.unset").to_string(),
+            "日期未知" => crate::locale::t(cx, "dbwork.date.unknown").to_string(),
+            _ => label,
+        };
+        let stored_key = if self.navigation.mode == GroupMode::Environment {
+            format!("environment:{key}")
+        } else {
+            key.to_string()
+        };
+        let collapsed = self.navigation.collapsed.contains(&stored_key) && search.is_empty();
+        let toggle = stored_key;
+        let drag = key.to_string();
+        let target = key.to_string();
+        let mut header = div()
+            .h_flex()
+            .h(px(30.))
+            .gap_1()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(label),
+            )
+            .child(
+                Button::new(SharedString::from(format!("fold-{key}")))
+                    .ghost()
+                    .icon(if collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.navigation.collapsed.remove(&toggle) {
+                            this.navigation.collapsed.insert(toggle.clone());
+                        }
+                        this.persist_navigation();
+                        cx.notify();
+                    })),
+            );
+        if !recent && !matches!(self.navigation.mode, GroupMode::Date | GroupMode::UsedDate) {
+            header = header
+                .child(
+                    div()
+                        .id(SharedString::from(format!("grip-{key}")))
+                        .w(px(24.))
+                        .h(px(28.))
+                        .flex_shrink_0()
+                        .h_flex()
+                        .justify_center()
+                        .cursor_grab()
+                        .child(gpui_component::Icon::new(IconName::Menu))
+                        .on_drag(GroupDrag(drag), |drag, _, _, cx| {
+                            cx.stop_propagation();
+                            cx.new(|_| drag.clone())
+                        }),
+                )
+                .child(
+                    Button::new(SharedString::from(format!("add-category-{key}")))
+                        .ghost()
+                        .icon(IconName::Plus)
+                        .tooltip(crate::locale::t(cx, "dbwork.category.add"))
+                        .on_click(cx.listener(|this, _, window, cx| this.add_category(window, cx))),
+                );
+        }
+        let mut block = div()
+            .id(SharedString::from(format!("connection-section-{key}")))
+            .v_flex()
+            .on_drop(cx.listener(move |this, source: &GroupDrag, _, cx| {
+                if !recent {
+                    this.move_group(&source.0, &target, cx)
+                }
+            }))
+            .child(header);
+        if !collapsed {
+            for p in profiles {
+                let haystack = format!(
+                    "{} {} {} {} {} {} {}",
+                    p.name,
+                    p.host,
+                    p.database,
+                    p.environment,
+                    p.kind.label(),
+                    p.group,
+                    self.catalog(&p).join(" ")
+                )
+                .to_lowercase();
+                if !search.is_empty() && !haystack.contains(search) {
+                    continue;
+                }
+                let id = p.id;
+                let connected = self.states.get(&id).is_some_and(|s| s == "已连接");
+                let state = self
+                    .states
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "未连接".into());
+                let label = if p.name.trim().is_empty() {
+                    crate::locale::t(cx, "dbwork.connection.name.required").to_string()
+                } else {
+                    p.name.clone()
+                };
+                let address = connection_address(&p);
+                let pending = state.ends_with("中…");
+                let failed = state.contains("失败") || state.contains("错误");
+                let selected = self
+                    .selected_database
+                    .as_ref()
+                    .is_some_and(|(current, _)| *current == id);
+                let scope = key.to_string();
+                let menu_view = cx.entity().downgrade();
+                block = block.child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .h(px(32.))
+                        .flex_shrink_0()
+                        .gap_1()
+                        .child(
+                            div()
+                                .w(px(4.))
+                                .h(px(18.))
+                                .rounded_sm()
+                                .bg(environment_color(&p.environment)),
+                        )
+                        .child(
+                            div().flex_1().min_w_0().child(crate::context_menu::scoped(
+                                SharedString::from(format!("connection-menu-{scope}-{id}")),
+                                Button::new(SharedString::from(format!("connection-{scope}-{id}")))
+                                    .ghost()
+                                    .icon(type_icon(p.kind))
+                                    .child(
+                                        div()
+                                            .max_w(relative(0.55))
+                                            .flex_shrink_0()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(label.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .overflow_hidden()
+                                            .text_ellipsis()
+                                            .whitespace_nowrap()
+                                            .child(address.clone()),
+                                    )
+                                    .overflow_hidden()
+                                    .tooltip(format!(
+                                        "{label} · {address} · {} · {}",
+                                        p.environment,
+                                        p.kind.label()
+                                    ))
+                                    .justify_start()
+                                    .selected(selected)
+                                    .w_full()
+                                    .min_w_0()
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, window, cx| {
+                                            if event.click_count() == 2
+                                                && this
+                                                    .states
+                                                    .get(&id)
+                                                    .is_none_or(|s| s != "已连接")
+                                            {
+                                                this.connect_saved(id, window, cx);
+                                            } else {
+                                                this.select(id, window, cx);
+                                            }
+                                        },
+                                    )),
+                                move |menu, _, cx| {
+                                    if let Some(view) = menu_view.upgrade() {
+                                        view.update(cx, |this, cx| {
+                                            this.connection_menu(menu, id, false, cx)
+                                        })
+                                    } else {
+                                        menu
+                                    }
+                                },
+                            )),
+                        )
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("status-dot-{scope}-{id}")))
+                                .w(px(20.))
+                                .h(px(32.))
+                                .h_flex()
+                                .justify_center()
+                                .child(if pending {
+                                    gpui_component::Icon::new(IconName::LoaderCircle)
+                                        .into_any_element()
+                                } else {
+                                    div()
+                                        .w(px(7.))
+                                        .h(px(7.))
+                                        .rounded_full()
+                                        .bg(if connected {
+                                            hsla(0.4, 0.65, 0.48, 1.)
+                                        } else if failed {
+                                            cx.theme().danger
+                                        } else {
+                                            cx.theme().muted_foreground
+                                        })
+                                        .into_any_element()
+                                })
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(state.clone())
+                                        .build(window, cx)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .w(px(28.))
+                                .flex_shrink_0()
+                                .when(connected || pending, |el| {
+                                    el.child(
+                                        Button::new(SharedString::from(format!(
+                                            "disconnect-{scope}-{id}"
+                                        )))
+                                        .ghost()
+                                        .icon(IconName::Close)
+                                        .tooltip(crate::locale::t(
+                                            cx,
+                                            if pending {
+                                                "dbwork.connection.cancel"
+                                            } else {
+                                                "dbwork.connection.disconnect"
+                                            },
+                                        ))
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.disconnect(id, cx);
+                                                feedback::success(
+                                                    crate::locale::t(
+                                                        cx,
+                                                        "feedback.connection.disconnected",
+                                                    ),
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    )
+                                }),
+                        ),
+                );
+            }
+        }
+        block.into_any_element()
+    }
+}
+fn connection_address(p: &Profile) -> String {
+    if p.kind == DatabaseKind::Sqlite {
+        return Path::new(&p.sqlite_path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+    }
+    format!("{}:{}/{}", p.host, p.port, p.database)
 }

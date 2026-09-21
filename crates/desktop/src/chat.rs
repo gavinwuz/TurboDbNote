@@ -108,9 +108,24 @@ impl Panel for AiLog {
                 .p_0()
                 .tooltip(crate::locale::t(cx, "output.action.clear"))
                 .disabled(self.lines.is_empty())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.lines.clear();
-                    cx.notify();
+                .on_click(cx.listener(|_, _, window, cx| {
+                    let view = cx.entity().downgrade();
+                    crate::feedback::confirm(
+                        crate::locale::t(cx, "feedback.log.clear"),
+                        crate::locale::t(cx, "feedback.log.clear.body"),
+                        window,
+                        cx,
+                        move |_, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                this.lines.clear();
+                                crate::feedback::success(
+                                    crate::locale::t(cx, "feedback.log.cleared"),
+                                    cx,
+                                );
+                                cx.notify();
+                            });
+                        },
+                    );
                 })),
             Button::new("close-output")
                 .ghost()
@@ -123,7 +138,7 @@ impl Panel for AiLog {
                     let events = cx.global::<crate::tabs::TabRouter>().0.clone();
                     events.update(cx, |_, cx| {
                         cx.emit(crate::tabs::CloseTabs {
-                            name: "ai-output",
+                            name: "ai-output".into(),
                             mode: crate::tabs::CloseMode::Current,
                         })
                     });

@@ -8,14 +8,19 @@ mod cell;
 mod chat;
 mod chat_history;
 mod configuration;
+mod connection_secret;
+mod connection_store;
+mod context_menu;
 mod database;
 mod diagnostics;
 mod drivers;
+mod feedback;
 mod locale;
 mod locale_catalog;
 mod panels;
 mod preferences;
 mod settings;
+mod table_view;
 mod tabs;
 mod typography;
 #[cfg(target_os = "windows")]
@@ -52,6 +57,7 @@ fn main() {
         let events = cx.new(|_| tabs::TabEvents);
         cx.set_global(tabs::TabRouter(events));
         cx.set_global(preferences);
+        feedback::init(cx);
         crate::locale::apply_font(cx);
         // Theme reloads can reset typography. User font settings take precedence.
         cx.observe_global::<gpui_component::Theme>(|cx| {

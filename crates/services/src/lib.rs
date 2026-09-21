@@ -8,6 +8,7 @@ pub mod database;
 pub mod mysql;
 pub mod mysql_drivers;
 pub mod mysql_legacy;
+pub mod password_protection;
 use std::{future::Future, pin::Pin, sync::Arc};
 use turbodbn_core::QueryToken;
 use uuid::Uuid;

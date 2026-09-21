@@ -16,7 +16,7 @@ pub enum CloseMode {
 }
 #[derive(Clone)]
 pub struct CloseTabs {
-    pub name: &'static str,
+    pub name: String,
     pub mode: CloseMode,
 }
 pub struct TabEvents;
@@ -24,13 +24,13 @@ impl EventEmitter<CloseTabs> for TabEvents {}
 pub struct TabRouter(pub Entity<TabEvents>);
 impl Global for TabRouter {}
 pub fn is_fixed(name: &str) -> bool {
-    matches!(name, "ai-chat" | "properties" | "schema")
+    matches!(name, "navigation" | "ai-chat" | "properties" | "schema")
 }
-pub fn targets(names: &[&'static str], name: &str, mode: CloseMode) -> Vec<&'static str> {
+pub fn targets<T: AsRef<str> + Clone>(names: &[T], name: &str, mode: CloseMode) -> Vec<T> {
     if is_fixed(name) {
         return vec![];
     }
-    let Some(index) = names.iter().position(|item| *item == name) else {
+    let Some(index) = names.iter().position(|item| item.as_ref() == name) else {
         return vec![];
     };
     names
@@ -44,11 +44,11 @@ pub fn targets(names: &[&'static str], name: &str, mode: CloseMode) -> Vec<&'sta
                 CloseMode::Left => i < index,
                 CloseMode::All => true,
             };
-            (keep && !is_fixed(name)).then_some(*name)
+            (keep && !is_fixed(name.as_ref())).then_some(name.clone())
         })
         .collect()
 }
-fn send(name: &'static str, mode: CloseMode, cx: &mut App) {
+fn send(name: String, mode: CloseMode, cx: &mut App) {
     let events = cx.global::<TabRouter>().0.clone();
     events.update(cx, |_, cx| cx.emit(CloseTabs { name, mode }));
 }
@@ -56,22 +56,24 @@ pub fn editor_menu(menu: PopupMenu, name: &'static str, cx: &App) -> PopupMenu {
     menu.item(
         PopupMenuItem::new(t(cx, "tabs.close.all"))
             .icon(IconName::Delete)
-            .on_click(move |_, _, cx| send(name, CloseMode::All, cx)),
+            .on_click(move |_, _, cx| send(name.into(), CloseMode::All, cx)),
     )
 }
 pub fn title(
-    name: &'static str,
+    name: impl Into<String>,
     icon: IconName,
     label: impl Into<SharedString>,
     cx: &App,
 ) -> AnyElement {
+    let name = name.into();
+    let close_name = name.clone();
     let title = div()
         .id(SharedString::from(format!("tab-title-{name}")))
         .h_flex()
         .gap_2()
         .child(Icon::new(icon))
         .child(label.into());
-    if is_fixed(name) {
+    if is_fixed(&name) {
         return title.into_any_element();
     }
     title
@@ -82,7 +84,7 @@ pub fn title(
                 .tooltip(t(cx, "common.action.close"))
                 .on_click(move |_, _, cx| {
                     cx.stop_propagation();
-                    send(name, CloseMode::Current, cx);
+                    send(close_name.clone(), CloseMode::Current, cx);
                 }),
         )
         .context_menu(move |mut menu, _, cx| {
@@ -93,10 +95,11 @@ pub fn title(
                 ("tabs.close.left", IconName::ArrowLeft, CloseMode::Left),
                 ("tabs.close.all", IconName::Delete, CloseMode::All),
             ] {
+                let name = name.clone();
                 menu = menu.item(
                     PopupMenuItem::new(t(cx, label))
                         .icon(icon)
-                        .on_click(move |_, _, cx| send(name, mode, cx)),
+                        .on_click(move |_, _, cx| send(name.clone(), mode, cx)),
                 );
             }
             menu
@@ -119,12 +122,20 @@ mod tests {
     }
     #[::core::prelude::v1::test]
     fn fixed_tools_never_close_even_in_bulk_requests() {
-        let names = ["notebook", "settings", "ai-chat", "properties", "schema"];
+        let names = [
+            "navigation",
+            "notebook",
+            "settings",
+            "ai-chat",
+            "properties",
+            "schema",
+        ];
         assert_eq!(
             targets(&names, "notebook", CloseMode::All),
             vec!["notebook", "settings"]
         );
         assert!(targets(&names, "ai-chat", CloseMode::All).is_empty());
-        assert!(targets(&[], "notebook", CloseMode::All).is_empty());
+        assert!(targets(&names, "navigation", CloseMode::Current).is_empty());
+        assert!(targets::<&str>(&[], "notebook", CloseMode::All).is_empty());
     }
 }

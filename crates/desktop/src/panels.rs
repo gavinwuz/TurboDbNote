@@ -122,8 +122,24 @@ impl Panel for WorkbenchPanel {
     ) -> gpui_component::menu::PopupMenu {
         if self.name == "notebook" {
             crate::tabs::editor_menu(menu, self.name, cx)
+        } else if let PanelContent::Databases(view) = &self.content {
+            view.update(cx, |this, cx| this.navigation_menu(menu, cx))
         } else {
             menu
+        }
+    }
+    fn zoomable(&self, _: &App) -> Option<gpui_component::dock::PanelControl> {
+        if self.name == "navigation" {
+            None
+        } else {
+            Some(gpui_component::dock::PanelControl::Menu)
+        }
+    }
+    fn title_suffix(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if let PanelContent::Databases(view) = &self.content {
+            Some(view.update(cx, |v, cx| v.navigation_tools(cx)))
+        } else {
+            None
         }
     }
     fn closable(&self, _: &App) -> bool {
@@ -144,9 +160,13 @@ impl Render for WorkbenchPanel {
             .text_color(cx.theme().foreground)
             .bg(cx.theme().background);
         match &self.content {
-            PanelContent::Databases(view) => {
-                content.child(view.update(cx, |view, cx| view.navigation(window, cx)))
-            }
+            PanelContent::Databases(view) => div()
+                .id("database-sidebar-split")
+                .size_full()
+                .min_h_0()
+                .text_color(cx.theme().foreground)
+                .bg(cx.theme().background)
+                .child(view.update(cx, |view, cx| view.navigation(window, cx))),
             PanelContent::DatabaseObjects(view) => {
                 content.child(view.update(cx, |view, cx| view.render_objects(window, cx)))
             }

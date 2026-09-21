@@ -625,6 +625,18 @@ unsafe fn legacy_operation(
         let result = (|| {
             use crate::database::{objects, quote_mysql, validate_name};
             match &op.kind {
+                OperationKind::Workbench(r) => {
+                    use futures_util::FutureExt;
+                    let mut access = LegacyAccess {
+                        raw,
+                        library,
+                        charset: encoding,
+                    };
+                    crate::database::workbench::run(&mut access, p.kind, version, r)
+                        .now_or_never()
+                        .ok_or("兼容驱动意外等待异步操作")?
+                        .map(|r| OperationResult::Workbench(Box::new(r)))
+                }
                 OperationKind::Databases => {
                     Ok(OperationResult::Databases(if p.database.is_empty() {
                         legacy_rows(raw, library, "SHOW DATABASES", encoding)?
@@ -744,6 +756,98 @@ fn decode_name(bytes: &[u8], charset: &str) -> Result<String, String> {
         Err("数据库名称编码无效，未使用乱码名称".into())
     } else {
         Ok(value.into_owned())
+    }
+}
+
+struct LegacyAccess<'a> {
+    raw: *mut c_void,
+    library: &'a libloading::Library,
+    charset: &'a str,
+}
+impl crate::database::workbench::Access for LegacyAccess<'_> {
+    fn query<'a>(&'a mut self, sql: &'a str) -> crate::database::workbench::Query<'a> {
+        Box::pin(async move {
+            unsafe { legacy_workbench_rows(self.raw, self.library, sql, self.charset) }
+        })
+    }
+}
+unsafe fn legacy_workbench_rows(
+    raw: *mut c_void,
+    library: &libloading::Library,
+    sql: &str,
+    charset: &str,
+) -> Result<crate::database::workbench::Rows, String> {
+    unsafe {
+        let query = *library
+            .get::<Query>(b"mysql_query\0")
+            .map_err(|_| "缺少查询接口")?;
+        let sql = CString::new(encode_name(sql, charset)?).map_err(|_| "SQL 包含空字符")?;
+        if query(raw, sql.as_ptr()) != 0 {
+            let errno = *library
+                .get::<Number>(b"mysql_errno\0")
+                .map_err(|_| "缺少错误接口")?;
+            return Err(database_error(errno(raw)));
+        }
+        let result = (*library
+            .get::<Store>(b"mysql_use_result\0")
+            .map_err(|_| "缺少读取接口")?)(raw);
+        let mut out = crate::database::workbench::Rows::default();
+        if result.is_null() {
+            return Ok(out);
+        }
+        let free = *library
+            .get::<Close>(b"mysql_free_result\0")
+            .map_err(|_| "缺少释放接口")?;
+        let _guard = Handle {
+            raw: result,
+            close: free,
+        };
+        let count = (*library
+            .get::<Number>(b"mysql_num_fields\0")
+            .map_err(|_| "缺少列接口")?)(result) as usize;
+        if count > 512 {
+            return Err("列数超过 512".into());
+        }
+        let fetch = *library
+            .get::<Fetch>(b"mysql_fetch_row\0")
+            .map_err(|_| "缺少行接口")?;
+        type Lengths = unsafe extern "C" fn(*mut c_void) -> *mut std::ffi::c_ulong;
+        let lengths = *library
+            .get::<Lengths>(b"mysql_fetch_lengths\0")
+            .map_err(|_| "缺少长度接口")?;
+        let mut bytes = 0;
+        loop {
+            let row = fetch(result);
+            if row.is_null() {
+                break;
+            }
+            let lens = lengths(result);
+            if lens.is_null() {
+                return Err("读取字段长度失败".into());
+            }
+            let mut values = Vec::new();
+            for i in 0..count {
+                let v = *row.add(i);
+                let value = if v.is_null() {
+                    None
+                } else {
+                    let b = std::slice::from_raw_parts(v as *const u8, *lens.add(i) as usize);
+                    Some(decode_name(b, charset).unwrap_or_else(|_| {
+                        format!(
+                            "0x{}",
+                            b.iter().map(|v| format!("{v:02x}")).collect::<String>()
+                        )
+                    }))
+                };
+                bytes += value.as_ref().map_or(0, |s| s.len());
+                values.push(value);
+            }
+            if bytes > crate::database::workbench::MAX_BYTES || out.values.len() >= 2000 {
+                return Err("结果超过预览上限（768 KiB）".into());
+            }
+            out.values.push(values);
+        }
+        Ok(out)
     }
 }
 

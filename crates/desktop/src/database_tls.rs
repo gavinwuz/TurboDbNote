@@ -1,7 +1,6 @@
 use super::*;
 use gpui_component::WindowExt;
 use mysql::TlsIssue;
-use std::{cell::Cell, rc::Rc};
 
 #[derive(Clone)]
 pub(super) enum TlsPrompt {
@@ -9,6 +8,7 @@ pub(super) enum TlsPrompt {
         profile: Profile,
         mode: TlsMode,
         issue: TlsIssue,
+        discover: bool,
     },
     Success {
         profile: Profile,
@@ -31,7 +31,7 @@ pub(super) fn is_local_host(host: &str) -> bool {
 }
 impl DatabaseView {
     fn tls_snapshot_matches(&self, profile: &Profile, cx: &App) -> bool {
-        self.draft(cx).ok().as_ref() == Some(profile)
+        self.raw_draft(cx).ok().as_ref() == Some(profile)
     }
     pub(super) fn show_tls_prompt(
         &mut self,
@@ -42,7 +42,7 @@ impl DatabaseView {
         let profile = match &prompt {
             TlsPrompt::Failure { profile, .. } | TlsPrompt::Success { profile, .. } => profile,
         };
-        if !self.tls_snapshot_matches(profile, cx) {
+        if !self.tls_snapshot_matches(profile, cx) || self.saving {
             return;
         }
         match prompt {
@@ -50,131 +50,127 @@ impl DatabaseView {
                 profile,
                 mode,
                 issue,
+                discover,
             } => {
-                let view = cx.entity().downgrade();
-                let remember = Rc::new(Cell::new(false));
-                window.open_dialog(cx,move |dialog,_,cx| {
-                    let configure=view.clone();let config_profile=profile.clone();let checkbox=remember.clone();
-                    let mut actions=div().h_flex().gap_2().flex_wrap()
-                        .child(Button::new("tls-configure").primary().icon(IconName::Settings).label("配置 TLS / 证书")
-                            .on_click(move |_,window,cx|{
-                                window.close_dialog(cx);
-                                let _=configure.update(cx,|this,cx|{if this.tls_snapshot_matches(&config_profile,cx){this.tab=1;cx.notify();}});
-                            }));
-                    if issue==TlsIssue::Certificate && mode==TlsMode::VerifyIdentity {
-                        actions=actions.child(retry_button("tls-encrypted-test","仅加密测试",TlsMode::Required,view.clone(),profile.clone(),remember.clone()));
-                    }
-                    if issue!=TlsIssue::Required {
-                        actions=actions.child(retry_button("tls-plaintext-test","不加密测试",TlsMode::Disabled,view.clone(),profile.clone(),remember.clone()));
-                    }
-                    actions=actions.child(Button::new("tls-cancel").label("取消").on_click(|_,window,cx|window.close_dialog(cx)));
-                    dialog.title("连接加密设置需要处理").w(px(560.)).overlay_closable(false)
-                        .child(div().v_flex().gap_3()
-                            .child(format!("{} · {}:{}",profile.name,profile.host,profile.port))
-                            .child(format!("当前尝试：{}",mode_label(mode)))
-                            .child(issue.message())
-                            .child("仅加密保留传输加密，但不验证服务器身份；不加密测试将建立未加密连接。")
-                            .child(Switch::new("remember-tls-mode").label("测试成功后保存当前连接及此模式")
-                                .checked(remember.get()).on_click(move |checked,_,cx|{checkbox.set(*checked);cx.refresh_windows();}))
-                            .child(div().text_sm().text_color(cx.theme().muted_foreground).child("未勾选时只用于本次测试，已保存配置保持不变。"))
-                            .child(actions))
-                });
-            }
-            TlsPrompt::Success {
-                mut profile,
-                mode,
-                remember,
-            } => {
-                if remember {
-                    self.editing.tls = mode;
-                    profile.tls = mode;
-                    self.save(window, cx);
+                if mode == TlsMode::Disabled {
+                    return;
                 }
                 let view = cx.entity().downgrade();
                 window.open_dialog(cx, move |dialog, _, cx| {
-                    let connect = view.clone();
+                    let view = view.clone();
                     let snapshot = profile.clone();
-                    let (saving, saved, status) = view
-                        .upgrade()
-                        .map(|view| {
-                            let this = view.read(cx);
-                            (
-                                this.saving,
-                                this.profiles.iter().any(|p| p == &profile),
-                                this.status.clone(),
-                            )
-                        })
-                        .unwrap_or((true, false, String::new()));
                     dialog
-                        .title("连接测试成功")
+                        .title(crate::locale::t(cx, "db.tls.retry.title"))
                         .w(px(520.))
                         .overlay_closable(false)
                         .child(
-                            div()
-                                .v_flex()
-                                .gap_3()
-                                .child(format!("{} · {}", profile.name, mode_label(mode)))
-                                .child(if !remember {
-                                    "本次测试未修改已保存的 TLS 设置。"
-                                } else if saving {
-                                    "正在保存连接…"
-                                } else if saved {
-                                    "连接及 TLS 模式已保存。"
-                                } else {
-                                    "保存未完成，请查看下方原因。"
-                                })
-                                .when(remember && !saving && !saved, |el| el.child(status))
-                                .child(
-                                    div()
-                                        .h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Button::new("tls-connect-confirmed")
-                                                .primary()
-                                                .icon(IconName::ArrowRight)
-                                                .label("使用此模式连接")
-                                                .disabled(saving)
-                                                .on_click(move |_, window, cx| {
-                                                    window.close_dialog(cx);
-                                                    let _ = connect.update(cx, |this, cx| {
-                                                        if this.tls_snapshot_matches(&snapshot, cx)
-                                                        {
-                                                            this.start_attempt(
-                                                                false,
-                                                                false,
-                                                                Some((mode, false)),
-                                                                cx,
-                                                            );
-                                                        }
-                                                    });
-                                                }),
-                                        )
-                                        .child(
-                                            Button::new("tls-done")
-                                                .label("完成")
-                                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                            div().w(px(470.)).v_flex().gap_3().child(
+                                div()
+                                    .h_flex()
+                                    .gap_2()
+                                    .child(gpui_component::Icon::new(IconName::TriangleAlert))
+                                    .child(div().flex_1().min_w_0().whitespace_normal().child(
+                                        crate::locale::t(
+                                            cx,
+                                            if issue == TlsIssue::Required {
+                                                "db.tls.required"
+                                            } else {
+                                                "db.tls.retry.body"
+                                            },
                                         ),
-                                ),
+                                    )),
+                            ),
                         )
+                        .footer(move |_, _, _, cx| {
+                            let view = view.clone();
+                            let snapshot = snapshot.clone();
+                            vec![
+                                feedback::footer_actions()
+                                    .child(feedback::close_button(cx))
+                                    .child(
+                                        Button::new("tls-disable-retry")
+                                            .primary()
+                                            .icon(IconName::Redo)
+                                            .label(crate::locale::t(cx, "db.tls.retry.action"))
+                                            .disabled(issue == TlsIssue::Required)
+                                            .on_click(move |_, window, cx| {
+                                                window.close_dialog(cx);
+                                                let _ = view.update(cx, |this, cx| {
+                                                    if this.tls_snapshot_matches(&snapshot, cx)
+                                                        && !this.saving
+                                                    {
+                                                        this.start_attempt(
+                                                            true,
+                                                            discover,
+                                                            Some((TlsMode::Disabled, true)),
+                                                            cx,
+                                                        );
+                                                    }
+                                                });
+                                            }),
+                                    )
+                                    .into_any_element(),
+                            ]
+                        })
                 });
+            }
+            TlsPrompt::Success {
+                profile,
+                mode,
+                remember,
+            } => {
+                if !remember {
+                    return;
+                }
+                self.editing.tls = mode;
+                if let Some(source) = self.catalog_source.get_mut(&profile.id) {
+                    source.tls = mode;
+                }
+                // Save only TLS, and only for the exact saved configuration that was tested.
+                // Incomplete or modified drafts stay drafts until the user explicitly saves.
+                if self.profiles.iter().find(|p| p.id == profile.id) != Some(&profile) {
+                    feedback::success(crate::locale::t(cx, "db.tls.retry.draft"), cx);
+                    cx.notify();
+                    return;
+                }
+                let mut updated = profile.clone();
+                updated.tls = mode;
+                let payload = updated.clone();
+                let credential = self.history.get(&profile.id).and_then(|h| h.credential_id);
+                let path = self.file.clone();
+                self.saving = true;
+                let work = cx
+                    .background_executor()
+                    .spawn(async move { connection_store::save(&path, &payload, credential) });
+                self.save_task = Some(cx.spawn_in(window, async move |view, cx| {
+                    let result = work.await;
+                    let _ = view.update(cx, |this, cx| {
+                        this.saving = false;
+                        match result {
+                            Ok(mut history) => {
+                                if let Some(previous) = this.history.get(&profile.id)
+                                    && previous.last_used_at > history.last_used_at
+                                {
+                                    history.last_used_at = previous.last_used_at.clone();
+                                }
+                                this.history.insert(profile.id, history);
+                                if let Some(saved) =
+                                    this.profiles.iter_mut().find(|p| p.id == profile.id)
+                                {
+                                    *saved = updated;
+                                }
+                                if this.baseline == profile {
+                                    this.baseline.tls = mode;
+                                }
+                                feedback::success(crate::locale::t(cx, "db.tls.retry.saved"), cx);
+                            }
+                            Err(error) => feedback::error(error, cx),
+                        }
+                        cx.notify();
+                    });
+                }));
+                cx.notify();
             }
         }
     }
-}
-fn retry_button(
-    id: &'static str,
-    label: &'static str,
-    mode: TlsMode,
-    view: WeakEntity<DatabaseView>,
-    profile: Profile,
-    remember: Rc<Cell<bool>>,
-) -> Button {
-    Button::new(id).label(label).on_click(move |_, window, cx| {
-        window.close_dialog(cx);
-        let _ = view.update(cx, |this, cx| {
-            if this.tls_snapshot_matches(&profile, cx) {
-                this.start_attempt(true, false, Some((mode, remember.get())), cx);
-            }
-        });
-    })
 }

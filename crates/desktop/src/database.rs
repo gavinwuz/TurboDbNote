@@ -2,17 +2,23 @@
 mod navigation;
 #[path = "database_objects.rs"]
 mod objects_ui;
+#[path = "database_workbench.rs"]
+mod workbench_ui;
+use crate::{connection_secret, connection_store, feedback};
+use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use navigation::Navigation;
+use turbodbn_services::database::workbench::{self, Action, Object, Reply, Schema};
 use turbodbn_services::{
     DatabaseKind,
     database::{ObjectItem, Operation, OperationKind, OperationResult},
 };
+pub use workbench_ui::OpenTable;
 #[path = "database_tls.rs"]
 mod tls_ui;
 use crate::preferences::Preferences;
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, Selectable, StyledExt,
+    ActiveTheme, Disableable, IconName, Selectable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
     dock::{Panel, PanelEvent},
     input::{Input, InputState},
@@ -24,24 +30,41 @@ use std::{
     path::PathBuf,
 };
 use tls_ui::TlsPrompt;
-use turbodbn_services::{
-    credentials,
-    mysql::{self, Driver, Event, Profile, ServerInfo, Session, TlsMode},
-};
+use turbodbn_services::mysql::{self, Driver, Event, Profile, ServerInfo, Session, TlsMode};
 use uuid::Uuid;
+
+#[derive(Clone)]
+struct DatabaseChoice(String);
+impl SelectItem for DatabaseChoice {
+    type Value = String;
+    fn title(&self) -> SharedString {
+        self.0.clone().into()
+    }
+    fn value(&self) -> &String {
+        &self.0
+    }
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(div().into_any_element())
+    }
+}
 
 pub struct OpenDatabase;
 pub struct OpenObjects;
 pub struct DatabaseView {
     focus: FocusHandle,
+    sidebar_split: Entity<gpui_component::resizable::ResizableState>,
+    object_filter: Entity<InputState>,
+    _object_filter: Subscription,
+    catalog_objects: Vec<Object>,
+    schemas: HashMap<String, Schema>,
+    expanded_objects: std::collections::HashSet<String>,
+    pending_object_action: Option<(Object, String)>,
+    workbench_target: Option<WeakEntity<crate::table_view::TableView>>,
+
     choosing_type: bool,
     typed_drafts: HashMap<DatabaseKind, (Profile, String)>,
     navigation: Navigation,
     nav_writer: async_channel::Sender<Navigation>,
-    db_filters: HashMap<Uuid, Entity<InputState>>,
-    db_filter_subscriptions: HashMap<Uuid, Subscription>,
-    db_limits: HashMap<Uuid, usize>,
-    db_scrolls: HashMap<Uuid, UniformListScrollHandle>,
     selected_database: Option<(Uuid, String)>,
     object_items: Vec<ObjectItem>,
     object_cursor: Option<String>,
@@ -63,19 +86,26 @@ pub struct DatabaseView {
     baseline: Profile,
     fields: BTreeMap<&'static str, Entity<InputState>>,
     search: Entity<InputState>,
+    database_picker: Entity<SelectState<SearchableVec<DatabaseChoice>>>,
+    database_picker_items: Vec<String>,
+    _database_picker_subscription: Option<Subscription>,
     status: String,
     saving: bool,
-    confirm_delete: bool,
+    validation_requested: bool,
+    clear_password: bool,
+    loaded_password: String,
+    password_visible: bool,
+    password_load: Option<Task<()>>,
+    history: HashMap<Uuid, connection_store::History>,
     tasks: HashMap<Uuid, Task<()>>,
     sessions: HashMap<Uuid, Session>,
     states: HashMap<Uuid, String>,
     info: HashMap<Uuid, ServerInfo>,
     catalog_source: HashMap<Uuid, Profile>,
-    collapsed: std::collections::HashSet<Uuid>,
     generation: HashMap<Uuid, u64>,
     save_task: Option<Task<()>>,
     file: PathBuf,
-    temporary_passwords: HashMap<Uuid, String>,
+    temporary_passwords: HashMap<Uuid, connection_secret::Cached>,
     storage_error: bool,
     _search: Subscription,
     _inputs: Vec<Subscription>,
@@ -91,7 +121,7 @@ const FIELDS: [(&str, &str); 15] = [
     ("port", "端口"),
     ("user", "用户名"),
     ("password", "密码（可留空）"),
-    ("database", "默认数据库（可选）"),
+    ("database", "数据库 *"),
     ("timeout", "连接超时（秒）"),
     ("ca", "CA 证书路径"),
     ("cert", "客户端证书路径"),
@@ -139,24 +169,26 @@ impl DatabaseView {
     }
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let file = Preferences::path()
-            .unwrap_or_else(|_| PathBuf::from("connections.json"))
-            .with_file_name("connections.json");
-        let loaded = mysql::load_profiles(&file);
-        let storage_error = loaded.is_err();
-        let status = loaded
-            .as_ref()
-            .err()
-            .map(|e| format!("读取连接失败：{e}"))
-            .unwrap_or("新建连接后可测试、保存或连接".into());
-        let search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索连接 / 分组 / 数据库"));
+            .unwrap_or_else(|_| PathBuf::from("connections.db"))
+            .with_file_name("connections.db");
+        let status = crate::locale::t(cx, "feedback.storage.loading").to_string();
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::locale::t(cx, "dbwork.connections.filter"))
+        });
         let fields: BTreeMap<&'static str, Entity<InputState>> = FIELDS
             .iter()
             .map(|(key, label)| {
                 (
                     *key,
                     cx.new(|cx| {
-                        let input = InputState::new(window, cx).placeholder(*label);
+                        let input = InputState::new(window, cx).placeholder(match *key {
+                            "name" => crate::locale::t(cx, "dbwork.connection.name.required"),
+                            "database" => {
+                                crate::locale::t(cx, "dbwork.connection.database.required")
+                            }
+                            _ => SharedString::from(*label),
+                        });
                         if *key == "password" {
                             input.masked(true)
                         } else {
@@ -177,6 +209,7 @@ impl DatabaseView {
             while let Ok(error) = nav_errors.recv().await {
                 if view
                     .update(cx, |this, cx| {
+                        feedback::error(error.clone(), cx);
                         this.status = error;
                         cx.notify();
                     })
@@ -186,16 +219,23 @@ impl DatabaseView {
                 }
             }
         });
+        let object_filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::locale::t(cx, "dbwork.objects.filter"))
+        });
         let mut this = Self {
+            sidebar_split: cx.new(|_| gpui_component::resizable::ResizableState::default()),
+            _object_filter: cx.observe(&object_filter, |_, _, cx| cx.notify()),
+            object_filter,
+            catalog_objects: Vec::new(),
+            schemas: HashMap::new(),
+            expanded_objects: std::collections::HashSet::new(),
+            workbench_target: None,
+            pending_object_action: None,
             focus: cx.focus_handle(),
             choosing_type: false,
             typed_drafts: HashMap::new(),
             navigation,
             nav_writer,
-            db_filters: HashMap::new(),
-            db_filter_subscriptions: HashMap::new(),
-            db_limits: HashMap::new(),
-            db_scrolls: HashMap::new(),
             selected_database: None,
             object_items: Vec::new(),
             object_cursor: None,
@@ -212,29 +252,92 @@ impl DatabaseView {
             pending_tls: None,
             drivers: cx.new(crate::drivers::DriverManager::new),
             connect_after_save: false,
-            profiles: loaded.unwrap_or_default(),
+            profiles: Vec::new(),
             editing: Profile::default(),
             baseline: Profile::default(),
             fields,
             search: search.clone(),
+            database_picker: cx.new(|cx| {
+                SelectState::new(
+                    SearchableVec::new(Vec::<DatabaseChoice>::new()),
+                    None,
+                    window,
+                    cx,
+                )
+                .searchable(true)
+            }),
+            database_picker_items: Vec::new(),
+            _database_picker_subscription: None,
             status,
-            saving: false,
-            confirm_delete: false,
+            saving: true,
+            validation_requested: false,
+            clear_password: false,
+            loaded_password: String::new(),
+            password_visible: false,
+            password_load: None,
+            history: HashMap::new(),
             tasks: HashMap::new(),
             sessions: HashMap::new(),
             states: HashMap::new(),
             info: HashMap::new(),
             catalog_source: HashMap::new(),
-            collapsed: std::collections::HashSet::new(),
             generation: HashMap::new(),
             save_task: None,
             file,
             temporary_passwords: HashMap::new(),
-            storage_error,
+            storage_error: false,
             _search: cx.observe(&search, |_, _, cx| cx.notify()),
             _inputs: inputs,
         };
-        this.fill(Profile::default(), window, cx);
+        this.fill(Self::empty_profile(DatabaseKind::MySql), window, cx);
+        let path = this.file.clone();
+        let loading = cx.background_executor().spawn(async move {
+            let snapshot = connection_store::load(&path)?;
+            let cleanup_warning = connection_store::migrate_passwords(&path).err();
+            Ok::<_, String>((snapshot, cleanup_warning))
+        });
+        this.save_task = Some(cx.spawn(async move |view, cx| {
+            let result = loading.await;
+            let _ = view.update(cx, |this, cx| {
+                this.saving = false;
+                match result {
+                    Ok((snapshot, cleanup_warning)) => {
+                        if let Some(warning) = cleanup_warning {
+                            feedback::notify(
+                                gpui_component::notification::NotificationType::Warning,
+                                warning,
+                                cx,
+                            );
+                        }
+                        this.profiles = snapshot.profiles;
+                        this.history = snapshot.history;
+                        let mut used = this
+                            .history
+                            .iter()
+                            .filter_map(|(id, h)| {
+                                h.last_used_at.as_ref().map(|at| (*id, at.clone()))
+                            })
+                            .collect::<Vec<_>>();
+                        used.sort_by(|a, b| b.1.cmp(&a.1));
+                        let mut recent = used.into_iter().map(|(id, _)| id).collect::<Vec<_>>();
+                        for id in &this.navigation.recent {
+                            if !recent.contains(id) && this.profiles.iter().any(|p| p.id == *id) {
+                                recent.push(*id);
+                            }
+                        }
+                        recent.truncate(5);
+                        this.navigation.recent = recent;
+                        this.status = crate::locale::t(cx, "feedback.storage.ready").to_string();
+                    }
+                    Err(error) => {
+                        this.storage_error = true;
+                        this.status = error.clone();
+                        feedback::error(error, cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
         this
     }
     fn text(&self, key: &str, cx: &App) -> String {
@@ -242,6 +345,7 @@ impl DatabaseView {
     }
     fn fill(&mut self, profile: Profile, window: &mut Window, cx: &mut Context<Self>) {
         self.choosing_type = false;
+        self.validation_requested = false;
         if !self.storage_error {
             self.status = self
                 .states
@@ -257,7 +361,8 @@ impl DatabaseView {
         }
         self.editing = profile.clone();
         self.baseline = profile.clone();
-        self.confirm_delete = false;
+        self.clear_password = false;
+        self.load_password(&profile, window, cx);
         let data = [
             ("sqlite_path", profile.sqlite_path),
             ("charset", profile.charset),
@@ -268,7 +373,7 @@ impl DatabaseView {
             ("host", profile.host),
             ("port", profile.port.to_string()),
             ("user", profile.user),
-            ("password", String::new()),
+            ("password", self.loaded_password.clone()),
             ("database", profile.database),
             ("timeout", profile.timeout_seconds.to_string()),
             ("ca", profile.ca),
@@ -280,7 +385,7 @@ impl DatabaseView {
         }
         cx.notify();
     }
-    fn draft(&self, cx: &App) -> Result<Profile, String> {
+    fn raw_draft(&self, cx: &App) -> Result<Profile, String> {
         let profile = Profile {
             sqlite_path: self.text("sqlite_path", cx),
             charset: self.text("charset", cx).to_ascii_lowercase(),
@@ -304,12 +409,39 @@ impl DatabaseView {
             client_key: self.text("key", cx),
             ..self.editing.clone()
         };
-        profile.validate()?;
         Ok(profile)
     }
+    fn empty_profile(kind: DatabaseKind) -> Profile {
+        let mut p = turbodbn_services::database::defaults(kind);
+        p.name.clear();
+        p.remember_password = kind != DatabaseKind::Sqlite;
+        if kind == DatabaseKind::Redis {
+            p.database = "0".into();
+        }
+        p
+    }
+    fn draft_for(&self, discover: bool, cx: &App) -> Result<Profile, String> {
+        let mut p = self.raw_draft(cx)?;
+        if p.kind == DatabaseKind::Redis && p.redis_cluster {
+            p.database = "0".into();
+        }
+        if let Some(key) = required_connection_field(&p, discover) {
+            return Err(crate::locale::t(cx, key).to_string());
+        }
+        let mut validation = p.clone();
+        if discover && validation.name.is_empty() {
+            validation.name = "connection-test".into();
+        }
+        validation.validate()?;
+        Ok(p)
+    }
+    fn draft(&self, cx: &App) -> Result<Profile, String> {
+        self.draft_for(false, cx)
+    }
     fn dirty(&self, cx: &App) -> bool {
-        self.draft(cx).ok().as_ref() != Some(&self.baseline)
-            || !self.fields["password"].read(cx).value().is_empty()
+        self.clear_password
+            || self.raw_draft(cx).ok().as_ref() != Some(&self.baseline)
+            || self.fields["password"].read(cx).value().as_str() != self.loaded_password
     }
     fn select(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving {
@@ -319,9 +451,13 @@ impl DatabaseView {
             // Explicit discard confirmation is inline; selection changes never touch live sessions.
             if self.dirty(cx) {
                 self.status = "请先保存当前修改，或点击“取消修改”后选择其他连接".into();
+                feedback::error(self.status.clone(), cx);
                 // The tab may have been closed through the shared tab router; retain and reopen its draft.
                 cx.emit(OpenDatabase);
                 cx.notify();
+                return;
+            }
+            if !self.follow_connection(id, false, cx) {
                 return;
             }
             self.fill(profile, window, cx);
@@ -338,11 +474,95 @@ impl DatabaseView {
             .is_some_and(|(connection, _, _)| *connection == id)
         {
             self.active_operation = None;
+            self.cancel_table_request(cx);
             self.object_notice = "操作已取消；如正在建库，请重连确认结果".into();
         }
         self.states.insert(id, "未连接".into());
+        if self
+            .selected_database
+            .as_ref()
+            .is_some_and(|(selected, _)| *selected == id)
+        {
+            self.clear_object_view();
+            self.object_notice = crate::locale::t(cx, "dbwork.switch.disconnected").to_string();
+        }
         self.status = "已断开 / 取消".into();
         cx.notify();
+    }
+    fn entered_password(&self, cx: &App) -> String {
+        let value = self.fields["password"].read(cx).value();
+        if value.as_str() == self.loaded_password {
+            String::new()
+        } else {
+            value.to_string()
+        }
+    }
+    fn load_password(&mut self, profile: &Profile, window: &mut Window, cx: &mut Context<Self>) {
+        self.password_load = None;
+        self.password_visible = false;
+        self.fields["password"].update(cx, |input, cx| input.set_masked(true, window, cx));
+        self.loaded_password = self
+            .temporary_passwords
+            .get(&profile.id)
+            .filter(|_| !profile.remember_password)
+            .and_then(|secret| secret.value_for(profile))
+            .unwrap_or_default();
+        if !self.loaded_password.is_empty() || !profile.remember_password {
+            return;
+        }
+        let Some(key) = self.history.get(&profile.id).and_then(|h| h.credential_id) else {
+            return;
+        };
+        let profile = profile.clone();
+        let path = self.file.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { connection_store::read_password(&path, key) });
+        self.password_load = Some(cx.spawn_in(window, async move |view, cx| {
+            let result = work.await;
+            let _ = cx.update(|window, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.password_load = None;
+                    cx.notify();
+                    if this.editing.id != profile.id
+                        || this.clear_password
+                        || !this.fields["password"].read(cx).value().is_empty()
+                        || !this
+                            .raw_draft(cx)
+                            .is_ok_and(|draft| connection_secret::same_target(&draft, &profile))
+                    {
+                        return;
+                    }
+                    match result {
+                        Ok(Some(value)) => {
+                            this.loaded_password = value.clone();
+                            this.fields["password"]
+                                .update(cx, |input, cx| input.set_value(value, window, cx));
+                            cx.notify();
+                        }
+                        Ok(None) => {}
+                        Err(_) => feedback::error(
+                            crate::locale::t(cx, "feedback.password.load_failed"),
+                            cx,
+                        ),
+                    }
+                });
+            });
+        }));
+    }
+    fn password_input(
+        &self,
+        profile: &Profile,
+        cx: &App,
+    ) -> Result<connection_secret::Input, String> {
+        connection_secret::input(
+            profile,
+            self.profiles.iter().find(|p| p.id == profile.id),
+            self.temporary_passwords.get(&profile.id),
+            self.entered_password(cx),
+            self.clear_password && self.fields["password"].read(cx).value().is_empty(),
+        )
+        .map_err(|key| crate::locale::t(cx, key).to_string())
     }
     fn start(&mut self, test: bool, cx: &mut Context<Self>) {
         self.start_request(test, false, cx);
@@ -358,9 +578,11 @@ impl DatabaseView {
         cx: &mut Context<Self>,
     ) {
         self.pending_tls = None;
-        let mut profile = match self.draft(cx) {
+        self.validation_requested = !test;
+        let mut profile = match self.draft_for(test || discover, cx) {
             Ok(p) => p,
             Err(e) => {
+                feedback::error(e.clone(), cx);
                 self.status = e;
                 cx.notify();
                 return;
@@ -375,7 +597,10 @@ impl DatabaseView {
             return;
         }
         let snapshot = profile.clone();
-        let mut catalog_source = profile.clone();
+        if test && profile.name.is_empty() {
+            profile.name = "connection-test".into();
+        }
+        let mut catalog_source = snapshot.clone();
         if let Some((mode, _)) = trial {
             profile.tls = mode;
         }
@@ -399,6 +624,7 @@ impl DatabaseView {
                     profile: snapshot,
                     mode: attempted_mode,
                     issue: mysql::TlsIssue::LegacyUnsupported,
+                    discover,
                 });
             }
             self.status = e;
@@ -411,31 +637,35 @@ impl DatabaseView {
             return;
         }
         let id = profile.id;
+        if !test && !self.follow_connection(id, false, cx) {
+            return;
+        }
         self.disconnect(id, cx);
         self.catalog_source.insert(id, catalog_source);
         self.info.remove(&id);
         let generation = self.generation[&id];
-        let entered = self.fields["password"].read(cx).value().to_string();
-        let password = if entered.is_empty() {
-            self.temporary_passwords
-                .get(&id)
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            entered
+        let password = match self.password_input(&snapshot, cx) {
+            Ok(p) => p,
+            Err(error) => {
+                self.status = error.clone();
+                feedback::error(error, cx);
+                cx.notify();
+                return;
+            }
         };
-        let stored = self
-            .profiles
-            .iter()
-            .any(|p| p.id == id && p.remember_password);
         self.states
             .insert(id, if test { "测试中…" } else { "连接中…" }.into());
         self.status = "正在后台连接…".into();
+        let credential_id = self.history.get(&id).and_then(|h| h.credential_id);
+        let secret_path = self.file.clone();
         let secret = cx.background_executor().spawn(async move {
-            if password.is_empty() && stored {
-                credentials::read(id)?.ok_or("已保存的凭据不存在，请重新填写密码".into())
-            } else {
-                Ok(password)
+            match password {
+                connection_secret::Input::Value(value) => Ok(value),
+                connection_secret::Input::Stored => connection_store::read_password(
+                    &secret_path,
+                    credential_id.ok_or("保存的密码引用缺失，请重新保存密码")?,
+                )?
+                .ok_or_else(|| "已保存的凭据不存在，请重新填写密码".to_string()),
             }
         });
         self.tasks.insert(
@@ -446,6 +676,7 @@ impl DatabaseView {
                     Err(error) => {
                         let _ = view.update(cx, |this, cx| {
                             if this.generation.get(&id) == Some(&generation) {
+                                feedback::error(error.clone(), cx);
                                 this.status = error;
                                 this.states.insert(id, "凭据错误".into());
                                 cx.notify();
@@ -454,6 +685,7 @@ impl DatabaseView {
                         return;
                     }
                 };
+                let cached = connection_secret::Cached::new(&snapshot, password.clone());
                 let (session, events) = Session::start(profile, password, test);
                 let accepted = view
                     .update(cx, |this, _| {
@@ -468,113 +700,141 @@ impl DatabaseView {
                     return;
                 }
                 while let Ok(event) = events.recv().await {
-                    let result = view.update(cx, |this, cx| {
-                        if this.generation.get(&id) != Some(&generation) {
-                            return;
-                        }
-                        let previous_status = this.status.clone();
-                        match event {
-                            Event::Connected(info) => {
-                                this.status = format!(
-                                    "连接成功 · {} {} · {} ms",
-                                    snapshot.kind.label(),
-                                    info.version,
-                                    info.elapsed_ms
-                                );
-                                if trial.is_some() {
-                                    this.status.push_str(&format!(
-                                        " · 本次模式：{}",
-                                        tls_ui::mode_label(attempted_mode)
-                                    ));
-                                }
-                                this.states.insert(id, "已连接".into());
-                                this.info.insert(id, info);
+                    let result =
+                        view.update(cx, |this, cx| {
+                            if this.generation.get(&id) != Some(&generation) {
+                                return;
                             }
-                            Event::Tested(info) => {
-                                this.status = format!(
-                                    "测试成功 · {} {} · {} ms（测试连接已释放）",
-                                    snapshot.kind.label(),
-                                    info.version,
-                                    info.elapsed_ms
-                                );
-                                if discover {
-                                    this.status = format!(
-                                        "检测到 {} 个数据库，可在数据库下拉中选择",
-                                        info.databases.len()
-                                    );
-                                }
-                                if let Some(error) = &info.database_list_error {
-                                    this.status.push_str(&format!(" · {error}"));
-                                }
-                                this.states.insert(
-                                    id,
-                                    if discover {
-                                        "已检测"
-                                    } else {
-                                        "测试通过"
+                            let previous_status = this.status.clone();
+                            match event {
+                                Event::Connected(info) => {
+                                    if this.profiles.iter().find(|p| p.id == id).is_none_or(
+                                        |saved| connection_secret::same_target(saved, &snapshot),
+                                    ) {
+                                        this.temporary_passwords.insert(id, cached.clone());
                                     }
-                                    .into(),
-                                );
-                                this.info.insert(id, info);
-                                this.sessions.remove(&id);
-                                if let Some((mode, remember)) = trial
-                                    && this.draft(cx).ok().as_ref() == Some(&snapshot)
-                                {
-                                    this.pending_tls = Some(TlsPrompt::Success {
-                                        profile: snapshot.clone(),
-                                        mode,
-                                        remember,
-                                    });
+                                    this.remember_connection(id, cx);
+                                    this.status = format!(
+                                        "连接成功 · {} {} · {} ms",
+                                        snapshot.kind.label(),
+                                        info.version,
+                                        info.elapsed_ms
+                                    );
+                                    if trial.is_some() {
+                                        this.status.push_str(&format!(
+                                            " · 本次模式：{}",
+                                            tls_ui::mode_label(attempted_mode)
+                                        ));
+                                    }
+                                    feedback::success(this.status.clone(), cx);
+                                    this.states.insert(id, "已连接".into());
+                                    this.info.insert(id, info);
+                                    if this
+                                        .selected_database
+                                        .as_ref()
+                                        .is_some_and(|(selected, _)| *selected == id)
+                                    {
+                                        this.follow_connection(id, true, cx);
+                                    }
+                                }
+                                Event::Tested(info) => {
+                                    if this.profiles.iter().find(|p| p.id == id).is_none_or(
+                                        |saved| connection_secret::same_target(saved, &snapshot),
+                                    ) {
+                                        this.temporary_passwords.insert(id, cached.clone());
+                                    }
+                                    this.status = format!(
+                                        "测试成功 · {} {} · {} ms（测试连接已释放）",
+                                        snapshot.kind.label(),
+                                        info.version,
+                                        info.elapsed_ms
+                                    );
+                                    if discover {
+                                        this.status = format!(
+                                            "检测到 {} 个数据库，可在数据库下拉中选择",
+                                            info.databases.len()
+                                        );
+                                    }
+                                    if let Some(error) = &info.database_list_error {
+                                        this.status.push_str(&format!(" · {error}"));
+                                    }
+                                    this.states.insert(
+                                        id,
+                                        if discover {
+                                            "已检测"
+                                        } else {
+                                            "测试通过"
+                                        }
+                                        .into(),
+                                    );
+                                    feedback::success(this.status.clone(), cx);
+                                    this.info.insert(id, info);
+                                    this.sessions.remove(&id);
+                                    if let Some((mode, remember)) = trial
+                                        && this.raw_draft(cx).ok().as_ref() == Some(&snapshot)
+                                    {
+                                        this.pending_tls = Some(TlsPrompt::Success {
+                                            profile: snapshot.clone(),
+                                            mode,
+                                            remember,
+                                        });
+                                    }
+                                }
+                                Event::Failed(error) => {
+                                    if this
+                                        .active_operation
+                                        .as_ref()
+                                        .is_some_and(|(connection, _, _)| *connection == id)
+                                    {
+                                        this.active_operation = None;
+                                        this.cancel_table_request(cx);
+                                        this.object_notice = error.clone();
+                                    }
+                                    if let Some(issue) = mysql::TlsIssue::from_message(&error)
+                                        && attempted_mode != TlsMode::Disabled
+                                        && this.raw_draft(cx).ok().as_ref() == Some(&snapshot)
+                                    {
+                                        this.pending_tls = Some(TlsPrompt::Failure {
+                                            profile: snapshot.clone(),
+                                            mode: attempted_mode,
+                                            issue,
+                                            discover,
+                                        });
+                                    }
+                                    if this.pending_tls.is_none() {
+                                        feedback::error(error.clone(), cx);
+                                    }
+                                    this.status = error;
+                                    this.states.insert(id, "连接失败".into());
+                                    this.sessions.remove(&id);
+                                }
+                                Event::Operation {
+                                    id: request,
+                                    result,
+                                } => this.operation_result(id, request, result, cx),
+                                Event::Disconnected => {
+                                    if this
+                                        .active_operation
+                                        .as_ref()
+                                        .is_some_and(|(connection, _, _)| *connection == id)
+                                    {
+                                        this.active_operation = None;
+                                        this.cancel_table_request(cx);
+                                        this.object_notice =
+                                            "操作连接已断开；建库结果请重连确认".into();
+                                    }
+                                    if this.states.get(&id).is_none_or(|state| state != "连接失败")
+                                    {
+                                        this.states.insert(id, "未连接".into());
+                                    }
+                                    this.sessions.remove(&id);
                                 }
                             }
-                            Event::Failed(error) => {
-                                if this
-                                    .active_operation
-                                    .as_ref()
-                                    .is_some_and(|(connection, _, _)| *connection == id)
-                                {
-                                    this.active_operation = None;
-                                    this.object_notice = error.clone();
-                                }
-                                if let Some(issue) = mysql::TlsIssue::from_message(&error)
-                                    && this.draft(cx).ok().as_ref() == Some(&snapshot)
-                                {
-                                    this.pending_tls = Some(TlsPrompt::Failure {
-                                        profile: snapshot.clone(),
-                                        mode: attempted_mode,
-                                        issue,
-                                    });
-                                }
-                                this.status = error;
-                                this.states.insert(id, "连接失败".into());
-                                this.sessions.remove(&id);
+                            if this.editing.id != id {
+                                this.status = previous_status;
                             }
-                            Event::Operation {
-                                id: request,
-                                result,
-                            } => this.operation_result(id, request, result, cx),
-                            Event::Disconnected => {
-                                if this
-                                    .active_operation
-                                    .as_ref()
-                                    .is_some_and(|(connection, _, _)| *connection == id)
-                                {
-                                    this.active_operation = None;
-                                    this.object_notice =
-                                        "操作连接已断开；建库结果请重连确认".into();
-                                }
-                                if this.states.get(&id).is_none_or(|state| state != "连接失败")
-                                {
-                                    this.states.insert(id, "未连接".into());
-                                }
-                                this.sessions.remove(&id);
-                            }
-                        }
-                        if this.editing.id != id {
-                            this.status = previous_status;
-                        }
-                        cx.notify();
-                    });
+                            cx.notify();
+                        });
                     if result.is_err() {
                         break;
                     }
@@ -585,79 +845,54 @@ impl DatabaseView {
     }
     fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.storage_error {
-            self.status =
-                "连接配置读取失败，已阻止覆盖原文件；请备份并修复 connections.json 后重启".into();
+            self.status = "连接存储读取失败，已阻止覆盖原文件；请备份并修复存储后重启".into();
             cx.notify();
             return;
         }
         if self.saving {
             return;
         }
+        self.validation_requested = true;
         let profile = match self.draft(cx) {
             Ok(p) => p,
             Err(e) => {
+                feedback::error(e.clone(), cx);
                 self.status = e;
                 cx.notify();
                 return;
             }
         };
         let id = profile.id;
-        let entered = self.fields["password"].read(cx).value().to_string();
-        let password = if entered.is_empty() {
-            self.temporary_passwords
-                .get(&id)
-                .cloned()
-                .unwrap_or_default()
-        } else {
-            entered
-        };
-        let old_saved = self
-            .profiles
-            .iter()
-            .any(|p| p.id == id && p.remember_password);
-        let mut profiles = self.profiles.clone();
-        if let Some(old) = profiles.iter_mut().find(|p| p.id == id) {
-            *old = profile.clone();
-        } else {
-            profiles.push(profile.clone());
+        let mut profile = profile;
+        if self.clear_password && self.fields["password"].read(cx).value().is_empty() {
+            profile.remember_password = false;
         }
+        let input = match self.password_input(&profile, cx) {
+            Ok(p) => p,
+            Err(error) => {
+                self.status = error.clone();
+                feedback::error(error, cx);
+                cx.notify();
+                return;
+            }
+        };
+        let old_credential = self.history.get(&id).and_then(|h| h.credential_id);
         let file = self.file.clone();
-        let payload = profiles.clone();
-        let remember = profile.remember_password;
+        let payload = profile.clone();
         self.saving = true;
         self.status = "正在保存连接配置…".into();
         let work = cx.background_executor().spawn(async move {
-            let old = if old_saved {
-                credentials::read(id)?
-            } else {
-                None
+            let password = match input {
+                connection_secret::Input::Value(value) => value,
+                connection_secret::Input::Stored => connection_store::read_password(
+                    &file,
+                    old_credential.ok_or("保存的密码引用缺失，请重新填写密码")?,
+                )?
+                .ok_or("保存的密码已缺失，请重新填写密码")?,
             };
-            if remember && old_saved && password.is_empty() && old.is_none() {
-                return Err("系统凭据已缺失，请重新填写密码".into());
-            }
-            if remember && (!password.is_empty() || !old_saved) {
-                credentials::write(id, &password)?;
-            }
-            if let Err(error) = mysql::save_profiles(&file, payload) {
-                if remember {
-                    if let Some(old) = old {
-                        let _ = credentials::write(id, &old);
-                    } else {
-                        let _ = credentials::delete(id);
-                    }
-                }
-                return Err(error);
-            }
-            if !remember && old_saved {
-                credentials::delete(id)?;
-            }
-            Ok(if remember {
-                String::new()
-            } else if password.is_empty() && old_saved {
-                old.unwrap_or_default()
-            } else {
-                password
-            })
+            let history = connection_store::save_password(&file, &payload, &password)?;
+            let warning = connection_store::cleanup_credentials(&file).err();
+            Ok::<_, String>((password, history, warning))
         });
         self.save_task = Some(cx.spawn_in(window, async move |view, cx| {
             let result = work.await;
@@ -665,15 +900,31 @@ impl DatabaseView {
                 let _ = view.update(cx, |this, cx| {
                     this.saving = false;
                     match result {
-                        Ok(password) => {
-                            this.profiles = profiles;
-                            if profile.remember_password {
-                                this.temporary_passwords.remove(&id);
-                            } else {
-                                this.temporary_passwords.insert(id, password);
+                        Ok((password, mut history, warning)) => {
+                            if let Some(warning) = warning {
+                                feedback::notify(
+                                    gpui_component::notification::NotificationType::Warning,
+                                    warning,
+                                    cx,
+                                );
                             }
+                            if let Some(previous) = this.history.get(&id)
+                                && previous.last_used_at > history.last_used_at
+                            {
+                                history.last_used_at = previous.last_used_at.clone();
+                            }
+                            this.history.insert(id, history);
+                            if let Some(saved) = this.profiles.iter_mut().find(|p| p.id == id) {
+                                *saved = profile.clone();
+                            } else {
+                                this.profiles.push(profile.clone());
+                            }
+                            this.temporary_passwords
+                                .insert(id, connection_secret::Cached::new(&profile, password));
                             this.fill(profile, window, cx);
-                            this.status = "连接已保存；密码不写入配置文件".into();
+                            this.status =
+                                crate::locale::t(cx, "feedback.connection.saved").to_string();
+                            feedback::success(this.status.clone(), cx);
                             if this.connect_after_save {
                                 this.connect_after_save = false;
                                 this.start(false, cx);
@@ -682,6 +933,7 @@ impl DatabaseView {
                         Err(error) => {
                             this.connect_after_save = false;
                             this.status = format!("保存失败：{error}");
+                            feedback::error(this.status.clone(), cx);
                         }
                     };
                     cx.notify();
@@ -690,22 +942,16 @@ impl DatabaseView {
         }));
         cx.notify();
     }
-    fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.editing.id;
+    fn delete(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         self.disconnect(id, cx);
-        self.confirm_delete = false;
+        if self.editing.id == id {
+            self.clear_password = false;
+        }
         self.saving = true;
-        let profiles = self
-            .profiles
-            .iter()
-            .filter(|p| p.id != id)
-            .cloned()
-            .collect::<Vec<_>>();
-        let payload = profiles.clone();
         let path = self.file.clone();
         let work = cx.background_executor().spawn(async move {
-            mysql::save_profiles(&path, payload)?;
-            credentials::delete(id)
+            connection_store::delete(&path, id)?;
+            Ok::<_, String>(connection_store::cleanup_credentials(&path).err())
         });
         self.save_task = Some(cx.spawn_in(window, async move |view, cx| {
             let result = work.await;
@@ -713,13 +959,41 @@ impl DatabaseView {
                 let _ = view.update(cx, |this, cx| {
                     this.saving = false;
                     match result {
-                        Ok(()) => {
-                            this.profiles = profiles;
+                        Ok(warning) => {
+                            if let Some(warning) = warning {
+                                feedback::notify(
+                                    gpui_component::notification::NotificationType::Warning,
+                                    warning,
+                                    cx,
+                                );
+                            }
+                            this.profiles.retain(|p| p.id != id);
                             this.temporary_passwords.remove(&id);
-                            this.fill(Profile::default(), window, cx);
-                            this.status = "连接已删除".into();
+                            if this.editing.id == id {
+                                this.fill(Self::empty_profile(DatabaseKind::MySql), window, cx);
+                            }
+                            this.history.remove(&id);
+                            this.navigation.recent.retain(|i| *i != id);
+                            this.navigation.created.remove(&id);
+                            this.navigation.databases.remove(&id);
+                            this.persist_navigation();
+                            if this
+                                .selected_database
+                                .as_ref()
+                                .is_some_and(|(current, _)| *current == id)
+                            {
+                                this.selected_database = None;
+                                this.catalog_objects.clear();
+                                this.schemas.clear();
+                            }
+                            this.status =
+                                crate::locale::t(cx, "feedback.connection.deleted").to_string();
+                            feedback::success(this.status.clone(), cx);
                         }
-                        Err(error) => this.status = format!("删除失败：{error}"),
+                        Err(error) => {
+                            this.status = format!("删除失败：{error}");
+                            feedback::error(this.status.clone(), cx);
+                        }
                     };
                     cx.notify();
                 });
@@ -744,53 +1018,370 @@ impl DatabaseView {
             .iter()
             .find(|p| p.id == self.editing.id)
             .cloned()
-            .unwrap_or_default();
+            .unwrap_or_else(|| Self::empty_profile(self.editing.kind));
         self.fill(profile, window, cx);
+    }
+    fn connect_saved(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.saving
+            || self.sessions.contains_key(&id)
+            || self.states.get(&id).is_some_and(|s| s.ends_with("中…"))
+        {
+            return;
+        }
+        self.select(id, window, cx);
+        if self.editing.id == id && !self.dirty(cx) {
+            self.start(false, cx);
+        }
+    }
+    fn connection_menu(
+        &self,
+        mut menu: gpui_component::menu::PopupMenu,
+        id: Uuid,
+        form: bool,
+        cx: &Context<Self>,
+    ) -> gpui_component::menu::PopupMenu {
+        let view = cx.entity().downgrade();
+        let saved = self.profiles.iter().any(|p| p.id == id);
+        let connected = self.sessions.contains_key(&id);
+        for (key, icon, action) in [
+            (
+                if connected {
+                    "dbwork.connection.disconnect"
+                } else {
+                    "dbwork.connection.connect"
+                },
+                IconName::ArrowRight,
+                "connect",
+            ),
+            ("dbwork.connection.edit", IconName::Settings2, "edit"),
+            ("dbwork.connection.copy", IconName::Copy, "copy"),
+            ("feedback.storage.title", IconName::Info, "records"),
+            ("dbwork.connection.delete", IconName::Delete, "delete"),
+        ] {
+            let view = view.clone();
+            menu = menu.item(
+                PopupMenuItem::new(crate::locale::t(cx, key))
+                    .icon(icon)
+                    .disabled(self.saving || (!saved && action != "copy" && action != "records"))
+                    .on_click(move |_, window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if this.saving {
+                                return;
+                            }
+                            match action {
+                                "connect" => {
+                                    if this.sessions.contains_key(&id) {
+                                        this.disconnect(id, cx);
+                                        feedback::success(
+                                            crate::locale::t(
+                                                cx,
+                                                "feedback.connection.disconnected",
+                                            ),
+                                            cx,
+                                        );
+                                    } else {
+                                        this.connect_saved(id, window, cx);
+                                    }
+                                }
+                                "edit" => this.select(id, window, cx),
+                                "records" => this.show_storage(id, window, cx),
+                                "copy" => {
+                                    if this.editing.id != id && this.dirty(cx) {
+                                        feedback::error(
+                                            crate::locale::t(cx, "dbwork.connection.unsaved"),
+                                            cx,
+                                        );
+                                        return;
+                                    }
+                                    let profile = if form {
+                                        this.draft(cx).ok()
+                                    } else {
+                                        this.profiles.iter().find(|p| p.id == id).cloned()
+                                    };
+                                    if let Some(mut profile) = profile {
+                                        profile.id = Uuid::new_v4();
+                                        profile.name.push_str(" 副本");
+                                        profile.remember_password = false;
+                                        this.fill(profile, window, cx);
+                                        cx.emit(OpenDatabase);
+                                        feedback::success(
+                                            crate::locale::t(cx, "dbwork.connection.copied"),
+                                            cx,
+                                        );
+                                    }
+                                }
+                                "delete" => {
+                                    let view = cx.entity().downgrade();
+                                    let name = this
+                                        .profiles
+                                        .iter()
+                                        .find(|p| p.id == id)
+                                        .map(|p| p.name.clone())
+                                        .unwrap_or_default();
+                                    feedback::confirm(
+                                        crate::locale::t(cx, "feedback.connection.delete.title"),
+                                        crate::locale::tr(
+                                            cx,
+                                            "dbwork.connection.delete_target",
+                                            &[("name", &name)],
+                                        ),
+                                        window,
+                                        cx,
+                                        move |window, cx| {
+                                            let _ = view.update(cx, |this, cx| {
+                                                if !this.saving
+                                                    && this.profiles.iter().any(|p| p.id == id)
+                                                {
+                                                    this.delete(id, window, cx);
+                                                }
+                                            });
+                                        },
+                                    );
+                                }
+                                _ => {}
+                            }
+                        });
+                    }),
+            );
+        }
+        if form {
+            menu = menu.separator().item(
+                PopupMenuItem::new(crate::locale::t(cx, "dbwork.connection.discard"))
+                    .icon(IconName::Undo2)
+                    .disabled(self.saving)
+                    .on_click(move |_, window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if this.editing.id == id && !this.saving {
+                                this.reset(window, cx);
+                            }
+                        });
+                    }),
+            );
+        }
+        menu
     }
     fn more_actions(&self, cx: &Context<Self>) -> AnyElement {
         let view = cx.entity().downgrade();
-        let saved = self.profiles.iter().any(|p| p.id == self.editing.id);
+        let id = self.editing.id;
         Button::new("connection-more")
             .icon(IconName::Ellipsis)
             .label("更多")
             .disabled(self.saving)
-            .dropdown_menu(move |menu, _, _| {
-                let reset = view.clone();
-                let copy = view.clone();
-                let delete = view.clone();
-                menu.item(
-                    PopupMenuItem::new("取消修改")
-                        .icon(IconName::Undo2)
-                        .on_click(move |_, window, cx| {
-                            let _ = reset.update(cx, |this, cx| this.reset(window, cx));
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("复制配置（不含密码）")
-                        .icon(IconName::Copy)
-                        .on_click(move |_, window, cx| {
-                            let _ = copy.update(cx, |this, cx| {
-                                if let Ok(mut profile) = this.draft(cx) {
-                                    profile.id = Uuid::new_v4();
-                                    profile.name.push_str(" 副本");
-                                    profile.remember_password = false;
-                                    this.fill(profile, window, cx);
-                                }
-                            });
-                        }),
-                )
-                .item(
-                    PopupMenuItem::new("删除连接")
-                        .icon(IconName::Delete)
-                        .disabled(!saved)
-                        .on_click(move |_, _, cx| {
-                            let _ = delete.update(cx, |this, cx| {
-                                this.confirm_delete = true;
-                                cx.notify();
-                            });
-                        }),
-                )
+            .dropdown_menu(move |menu, _, cx| {
+                if let Some(view) = view.upgrade() {
+                    view.update(cx, |this, cx| this.connection_menu(menu, id, true, cx))
+                } else {
+                    menu
+                }
             })
+            .into_any_element()
+    }
+    fn show_storage(&self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let h = self.history.get(&id).cloned().unwrap_or_default();
+        let unknown = crate::locale::t(cx, "feedback.time.unknown").to_string();
+        let created = connection_store::display_time(h.created_at.as_deref())
+            .unwrap_or_else(|| unknown.clone());
+        let updated = connection_store::display_time(h.updated_at.as_deref())
+            .unwrap_or_else(|| unknown.clone());
+        let used = connection_store::display_time(h.last_used_at.as_deref()).unwrap_or(unknown);
+        let body = crate::locale::tr(
+            cx,
+            "feedback.storage.details",
+            &[
+                ("created", &created),
+                ("updated", &updated),
+                ("used", &used),
+            ],
+        );
+        let path = self.file.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let path = path.clone();
+            dialog
+                .title(crate::locale::t(cx, "feedback.storage.title"))
+                .w(px(560.))
+                .child(
+                    div()
+                        .w(px(510.))
+                        .h_flex()
+                        .items_start()
+                        .gap_2()
+                        .child(gpui_component::Icon::new(IconName::Info))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .child(body.clone()),
+                        ),
+                )
+                .footer(move |_, _, _, cx| {
+                    let path = path.clone();
+                    vec![
+                        feedback::footer_actions()
+                            .child(
+                                Button::new("open-connection-folder")
+                                    .icon(IconName::FolderOpen)
+                                    .label(crate::locale::t(cx, "feedback.storage.open"))
+                                    .on_click(move |_, _, cx| {
+                                        if path.exists() {
+                                            cx.reveal_path(&path);
+                                        } else {
+                                            feedback::error(
+                                                crate::locale::t(cx, "feedback.storage.missing"),
+                                                cx,
+                                            );
+                                        }
+                                    }),
+                            )
+                            .child(feedback::close_button(cx)),
+                    ]
+                })
+        });
+    }
+    fn password_field(&self, cx: &Context<Self>) -> AnyElement {
+        let draft = self.raw_draft(cx).unwrap_or_else(|_| self.editing.clone());
+        let saved = self.profiles.iter().find(|p| p.id == draft.id);
+        let cached = self.temporary_passwords.get(&draft.id);
+        let entered = !self.entered_password(cx).is_empty();
+        let available = cached.is_some() || saved.is_some_and(|p| p.remember_password);
+        let hint = if entered {
+            "feedback.password.replace"
+        } else if self.clear_password {
+            "feedback.password.clear_pending"
+        } else if available
+            && (cached.is_some_and(|p| !p.matches(&draft))
+                || saved.is_some_and(|p| {
+                    p.remember_password && !connection_secret::same_target(p, &draft)
+                }))
+        {
+            "feedback.password.changed_target"
+        } else if cached.is_some_and(|secret| secret.matches(&draft) && secret.is_empty()) {
+            "feedback.password.empty"
+        } else if saved.is_some_and(|p| p.remember_password) {
+            "feedback.password.stored"
+        } else if cached.is_some() {
+            "feedback.password.session"
+        } else {
+            "feedback.password.empty"
+        };
+        let id = self.editing.id;
+        div()
+            .v_flex()
+            .gap_1()
+            .child(crate::locale::t(cx, "feedback.password.label"))
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        Input::new(&self.fields["password"])
+                            .disabled(
+                                self.saving
+                                    || self.password_load.is_some()
+                                    || self.sessions.contains_key(&id),
+                            )
+                            .flex_1(),
+                    )
+                    .child(
+                        Button::new("toggle-connection-password")
+                            .ghost()
+                            .icon(if self.password_visible {
+                                IconName::EyeOff
+                            } else {
+                                IconName::Eye
+                            })
+                            .tooltip(crate::locale::t(
+                                cx,
+                                if self.password_visible {
+                                    "feedback.password.hide"
+                                } else {
+                                    "feedback.password.show"
+                                },
+                            ))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.password_visible = !this.password_visible;
+                                this.fields["password"].update(cx, |input, cx| {
+                                    input.set_masked(!this.password_visible, window, cx)
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("clear-connection-password")
+                            .ghost()
+                            .icon(IconName::Delete)
+                            .tooltip(crate::locale::t(cx, "feedback.password.clear"))
+                            .disabled(
+                                self.saving
+                                    || self.sessions.contains_key(&id)
+                                    || (!available && !entered),
+                            )
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                let view = cx.entity().downgrade();
+                                let snapshot = this.editing.id;
+                                feedback::confirm(
+                                    crate::locale::t(cx, "feedback.password.clear"),
+                                    crate::locale::t(cx, "feedback.password.clear.confirm"),
+                                    window,
+                                    cx,
+                                    move |window, cx| {
+                                        let _ = view.update(cx, |this, cx| {
+                                            if this.editing.id == snapshot && !this.saving {
+                                                this.clear_password = true;
+                                                this.editing.remember_password = false;
+                                                this.fields["password"].update(cx, |input, cx| {
+                                                    input.set_value("", window, cx)
+                                                });
+                                                feedback::success(
+                                                    crate::locale::t(
+                                                        cx,
+                                                        "feedback.password.clear_pending",
+                                                    ),
+                                                    cx,
+                                                );
+                                                cx.notify();
+                                            }
+                                        });
+                                    },
+                                );
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(crate::locale::t(cx, hint)),
+            )
+            .into_any_element()
+    }
+    fn required_field(
+        &self,
+        key: &'static str,
+        label: &str,
+        error: &str,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        div()
+            .v_flex()
+            .gap_1()
+            .w_full()
+            .child(crate::locale::t(cx, label))
+            .child(
+                Input::new(&self.fields[key])
+                    .disabled(self.saving || self.sessions.contains_key(&self.editing.id)),
+            )
+            .when(
+                self.validation_requested && self.text(key, cx).is_empty(),
+                |el| {
+                    el.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().danger)
+                            .child(crate::locale::t(cx, error)),
+                    )
+                },
+            )
             .into_any_element()
     }
     fn field(&self, key: &'static str, label: &'static str) -> AnyElement {
@@ -805,6 +1396,53 @@ impl DatabaseView {
             )
             .into_any_element()
     }
+    fn sync_database_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut values = self
+            .raw_draft(cx)
+            .ok()
+            .map(|p| self.catalog(&p))
+            .unwrap_or_default();
+        let mut seen = std::collections::HashSet::new();
+        values.retain(|v| !v.trim().is_empty() && seen.insert(v.clone()));
+        if values == self.database_picker_items {
+            return;
+        }
+        // A new detection/context resets the transient filter; typing never changes the database input.
+        let picker = cx.new(|cx| {
+            SelectState::new(
+                SearchableVec::new(
+                    values
+                        .iter()
+                        .cloned()
+                        .map(DatabaseChoice)
+                        .collect::<Vec<_>>(),
+                ),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
+        self._database_picker_subscription = Some(cx.subscribe_in(
+            &picker,
+            window,
+            |this, _, event: &SelectEvent<SearchableVec<DatabaseChoice>>, window, cx| {
+                if let SelectEvent::Confirm(Some(value)) = event
+                    && !this.saving
+                    && !this.sessions.contains_key(&this.editing.id)
+                    && this
+                        .raw_draft(cx)
+                        .is_ok_and(|p| this.catalog(&p).contains(value))
+                {
+                    this.fields["database"]
+                        .update(cx, |input, cx| input.set_value(value.clone(), window, cx));
+                    cx.notify();
+                }
+            },
+        ));
+        self.database_picker = picker;
+        self.database_picker_items = values;
+    }
     fn combo(
         &self,
         key: &'static str,
@@ -815,44 +1453,83 @@ impl DatabaseView {
         values.retain(|v| !v.trim().is_empty());
         let mut seen = std::collections::HashSet::new();
         values.retain(|v| seen.insert(v.clone()));
-        let view = cx.entity().downgrade();
-        let dropdown = Button::new(key)
-            .icon(IconName::ChevronDown)
-            .tooltip("选择已有值，也可直接输入")
-            .disabled(
-                self.saving || self.sessions.contains_key(&self.editing.id) || values.is_empty(),
-            )
-            .dropdown_menu(move |mut menu, _, _| {
-                for value in &values {
-                    let view = view.clone();
-                    let value = value.clone();
-                    menu = menu.item(PopupMenuItem::new(value.clone()).on_click(
-                        move |_, window, cx| {
-                            let _ = view.update(cx, |this, cx| {
-                                if this.saving || this.sessions.contains_key(&this.editing.id) {
-                                    return;
-                                }
-                                this.fields[key].update(cx, |input, cx| {
-                                    input.set_value(value.clone(), window, cx)
+        let dropdown = if key == "database" {
+            div()
+                .w(px(32.))
+                .h(px(28.))
+                .child(
+                    Select::new(&self.database_picker)
+                        .appearance(false)
+                        .placeholder("")
+                        .px_1()
+                        .h(px(28.))
+                        .menu_width(px(320.))
+                        .search_placeholder(crate::locale::t(cx, "dbwork.database.filter"))
+                        .disabled(
+                            self.saving
+                                || self.sessions.contains_key(&self.editing.id)
+                                || self.database_picker_items.is_empty(),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            let view = cx.entity().downgrade();
+            Button::new(key)
+                .icon(IconName::ChevronDown)
+                .tooltip("选择已有值，也可直接输入")
+                .disabled(
+                    self.saving
+                        || self.sessions.contains_key(&self.editing.id)
+                        || values.is_empty(),
+                )
+                .dropdown_menu(move |mut menu, _, _| {
+                    for value in &values {
+                        let view = view.clone();
+                        let value = value.clone();
+                        menu = menu.item(PopupMenuItem::new(value.clone()).on_click(
+                            move |_, window, cx| {
+                                let _ = view.update(cx, |this, cx| {
+                                    if this.saving || this.sessions.contains_key(&this.editing.id) {
+                                        return;
+                                    }
+                                    this.fields[key].update(cx, |input, cx| {
+                                        input.set_value(value.clone(), window, cx)
+                                    });
+                                    cx.notify();
                                 });
-                                cx.notify();
-                            });
-                        },
-                    ));
-                }
-                menu.scrollable(true).max_h(px(320.))
-            });
+                            },
+                        ));
+                    }
+                    menu.scrollable(true).max_h(px(320.))
+                })
+                .into_any_element()
+        };
         div()
             .v_flex()
             .flex_1()
             .min_w_0()
             .gap_1()
             .text_sm()
-            .child(label)
+            .child(if key == "database" {
+                crate::locale::t(cx, "dbwork.connection.database")
+            } else {
+                SharedString::from(label)
+            })
             .child(
                 Input::new(&self.fields[key])
                     .disabled(self.saving || self.sessions.contains_key(&self.editing.id))
                     .suffix(dropdown),
+            )
+            .when(
+                key == "database" && self.validation_requested && self.text(key, cx).is_empty(),
+                |el| {
+                    el.child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().danger)
+                            .child(crate::locale::t(cx, "dbwork.connection.database.required")),
+                    )
+                },
             )
             .into_any_element()
     }
@@ -873,6 +1550,32 @@ impl DatabaseView {
                     let view = view.clone();
                     let value = *value;
                     menu = menu.item(PopupMenuItem::new(*title).on_click(move |_, window, cx| {
+                        if id == "tls" && value != "verify" {
+                            let source = view.clone();
+                            let snapshot = view.upgrade().map(|v| v.read(cx).editing.id);
+                            feedback::confirm(
+                                crate::locale::t(cx, "feedback.tls.confirm"),
+                                crate::locale::t(cx, "feedback.tls.warning"),
+                                window,
+                                cx,
+                                move |_, cx| {
+                                    let _ = source.update(cx, |this, cx| {
+                                        if Some(this.editing.id) == snapshot
+                                            && !this.saving
+                                            && !this.sessions.contains_key(&this.editing.id)
+                                        {
+                                            this.editing.tls = if value == "off" {
+                                                TlsMode::Disabled
+                                            } else {
+                                                TlsMode::Required
+                                            };
+                                            cx.notify();
+                                        }
+                                    });
+                                },
+                            );
+                            return;
+                        }
                         let _ = view.update(cx, |this, cx| {
                             match id {
                                 "driver" => {
@@ -950,6 +1653,7 @@ impl Panel for DatabaseView {
 }
 impl Render for DatabaseView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_database_picker(window, cx);
         if let Some(prompt) = self.pending_tls.take() {
             cx.defer_in(window, move |this, window, cx| {
                 this.show_tls_prompt(prompt, window, cx)
@@ -979,13 +1683,13 @@ impl Render for DatabaseView {
             })))
             .child(div().id("connection-form-body").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_3()
             .when(self.tab==0,|el|el
-            .child(self.field("name", "连接名称"))
+            .child(self.required_field("name", "dbwork.connection.name", "dbwork.connection.name.required",cx))
             .child(
                 div()
                     .h_flex()
                     .gap_3()
-                    .child(self.combo("group", "分组（可输入新分组）",self.profiles.iter().map(|p|p.group.clone()).collect(),cx))
-                    .child(self.combo("environment", "环境（可自定义）",["开发","测试","预发","正式"].into_iter().map(String::from).chain(self.profiles.iter().map(|p|p.environment.clone())).collect(),cx)),
+                    .child(self.combo("group", "分组（可输入新分组）",self.profiles.iter().map(|p|p.group.clone()).chain(self.navigation.categories.clone()).collect(),cx))
+                    .child(self.combo("environment", "环境（可自定义）",["开发","测试","预发","正式"].into_iter().map(String::from).chain(self.profiles.iter().map(|p|p.environment.clone())).chain(self.navigation.environments.clone()).collect(),cx)),
             )
             .when(self.editing.kind!=DatabaseKind::Sqlite,|el|el
             .child(
@@ -997,10 +1701,10 @@ impl Render for DatabaseView {
             )
             .when(self.editing.kind==DatabaseKind::ClickHouse,|el|el.child("ClickHouse HTTP：通常 8123；HTTPS：通常 8443，请与 TLS 模式对应。"))
             .child(self.field("user", if self.editing.kind==DatabaseKind::Redis {"用户名（可选，Redis ACL）"}else{"用户名"}))
-            .child(self.field("password", "密码（已有系统凭据时留空沿用）"))
+            .child(self.password_field(cx))
             .child(
                 Switch::new("remember-db-password")
-                    .label("使用 Windows 凭据管理器保存密码")
+                    .label(crate::locale::t(cx, "feedback.password.remember"))
                     .checked(self.editing.remember_password)
                     .disabled(self.saving)
                     .on_click(cx.listener(|this, value: &bool, _, cx| {
@@ -1008,9 +1712,17 @@ impl Render for DatabaseView {
                         cx.notify();
                     })),
             )
+            .when(!self.editing.remember_password, |el| el.child(
+                div().h_flex().items_start().gap_2().text_sm().text_color(cx.theme().muted_foreground)
+                    .child(gpui_component::Icon::new(IconName::Info))
+                    .child(div().flex_1().min_w_0().whitespace_normal().child(crate::locale::t(cx,
+                        if self.profiles.iter().any(|p| p.id == id && p.remember_password) {
+                            "feedback.password.memory_pending"
+                        } else { "feedback.password.memory_only" })))
+            ))
             )
             .when(self.editing.kind==DatabaseKind::Sqlite,|el|el
-                .child(self.field("sqlite_path","数据库文件"))
+                .child(self.required_field("sqlite_path","dbwork.connection.file","dbwork.connection.file.required",cx))
                 .child(div().h_flex().gap_2()
                     .child(Button::new("sqlite-browse").icon(IconName::FolderOpen).label("选择文件").disabled(running||self.saving).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(false,window,cx))))
                     .child(Button::new("sqlite-create").icon(IconName::Plus).label("新建文件").disabled(running||self.saving).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(true,window,cx)))))
@@ -1020,7 +1732,7 @@ impl Render for DatabaseView {
                 .on_click(cx.listener(|this,v:&bool,_,cx|{this.editing.redis_cluster = *v;cx.notify();}))))
             .when(self.editing.kind!=DatabaseKind::Sqlite,|el|el
             .child(div().h_flex().gap_2().items_end()
-                .child(self.combo("database","数据库（留空显示全部可见库）",self.draft(cx).ok().map(|p|self.catalog(&p)).unwrap_or_default(),cx))
+                .child(self.combo("database","数据库 *",self.raw_draft(cx).ok().map(|p|self.catalog(&p)).unwrap_or_default(),cx))
                 .child(Button::new("detect-databases").icon(IconName::Search).label("检测")
                     .tooltip("使用当前连接信息获取账号可见的数据库，不保存草稿")
                     .disabled(self.saving||running).on_click(cx.listener(|this,_,_,cx|this.start_request(true,true,cx)))))
@@ -1073,7 +1785,11 @@ impl Render for DatabaseView {
                     .on_click(cx.listener(|this,_,window,cx|this.browse_legacy(window,cx))))
                 .child(Switch::new("allow-old-auth").label("允许 pre-4.1 旧密码认证（仅兼容连接）")
                     .checked(self.editing.allow_old_auth).disabled(running||self.saving)
-                    .on_click(cx.listener(|this,checked:&bool,_,cx|{this.editing.allow_old_auth= *checked;cx.notify();})))
+                    .on_click(cx.listener(|this,checked:&bool,window,cx|{
+                        if !*checked{this.editing.allow_old_auth=false;cx.notify();return;}
+                        let view=cx.entity().downgrade();let id=this.editing.id;
+                        feedback::confirm(crate::locale::t(cx,"feedback.auth.confirm"),crate::locale::t(cx,"feedback.auth.warning"),window,cx,move|_,cx|{let _=view.update(cx,|this,cx|{if this.editing.id==id&&!this.saving{this.editing.allow_old_auth=true;cx.notify();}});});
+                    })))
                 .child("兼容驱动运行于独立进程。当前需显式禁用 TLS；4.0 使用服务器默认字符集。请选择可信驱动库。"))
             )
             .child(self.field("timeout", "连接/测试总超时（1–60 秒）"))
@@ -1101,7 +1817,7 @@ impl Render for DatabaseView {
                 .child("当前兼容驱动暂不支持 TLS，可明确切换为不加密。")
                 .child(Button::new("legacy-disable-tls").icon(IconName::Settings2).label("切换为不加密")
                     .disabled(running||self.saving||self.editing.tls==TlsMode::Disabled)
-                    .on_click(cx.listener(|this,_,_,cx|{this.editing.tls=TlsMode::Disabled;cx.notify();})))))
+                    .on_click(cx.listener(|this,_,window,cx|{let view=cx.entity().downgrade();let id=this.editing.id;feedback::confirm(crate::locale::t(cx,"feedback.tls.confirm"),crate::locale::t(cx,"feedback.tls.warning"),window,cx,move|_,cx|{let _=view.update(cx,|this,cx|{if this.editing.id==id&&!this.saving{this.editing.tls=TlsMode::Disabled;cx.notify();}});});})))))
             .when(tls_ui::is_local_host(&self.text("host",cx)),|el|el.child("本机地址：可按本地开发需求选择不加密，应用不会自动修改模式。"))
             .child(self.field("ca", "CA 证书路径（可选）"))
             .child(self.field("cert", "客户端证书路径（可选）"))
@@ -1130,7 +1846,7 @@ impl Render for DatabaseView {
                         Button::new("cancel-db").icon(IconName::Close)
                             .label(if self.states.get(&id).is_some_and(|s|s=="已连接") {"断开"}else{"取消"})
                             .disabled(!running)
-                            .on_click(cx.listener(move |this, _, _, cx| this.disconnect(id, cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| {this.disconnect(id,cx);feedback::success(crate::locale::t(cx,"feedback.connection.disconnected"),cx);})),
                     ))
                     .child(
                         Button::new("save-db").icon(IconName::Check)
@@ -1139,32 +1855,6 @@ impl Render for DatabaseView {
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     )
                     .child(self.more_actions(cx)),
-            )
-            .when(self.confirm_delete, |el| {
-                el.child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .child("删除连接及其系统凭据？")
-                        .child(
-                            Button::new("confirm-delete-db").label("确认删除").on_click(
-                                cx.listener(|this, _, window, cx| this.delete(window, cx)),
-                            ),
-                        )
-                        .child(Button::new("keep-db").label("取消").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.confirm_delete = false;
-                                cx.notify();
-                            },
-                        ))),
-                )
-            })
-            .child(
-                div()
-                    .p_3()
-                    .rounded_md()
-                    .bg(cx.theme().muted)
-                    .child(self.status.clone()),
             )
             .when_some(self.info.get(&id), |el, info| {
                 el.child(Button::new("connection-details").ghost().icon(IconName::Info).label(if self.connection_details {"收起连接详情"}else{"连接详情"})
@@ -1175,5 +1865,62 @@ impl Render for DatabaseView {
                         .child(format!("TLS：{}",if info.tls_cipher.is_empty(){"未加密"}else{&info.tls_cipher}))
                         .when_some(info.database_list_error.as_ref(),|el,error|el.child(error.clone()))))
             }).into_any_element()
+    }
+}
+
+fn required_connection_field(profile: &Profile, discover: bool) -> Option<&'static str> {
+    if !discover && profile.name.trim().is_empty() {
+        Some("dbwork.connection.name.required")
+    } else if profile.kind == DatabaseKind::Sqlite {
+        profile
+            .sqlite_path
+            .trim()
+            .is_empty()
+            .then_some("dbwork.connection.file.required")
+    } else {
+        (!discover && profile.database.trim().is_empty())
+            .then_some("dbwork.connection.database.required")
+    }
+}
+#[cfg(test)]
+mod connection_form_tests {
+    use super::*;
+    #[::core::prelude::v1::test]
+    fn explicit_names_and_database_targets_are_required() {
+        for kind in DatabaseKind::ALL {
+            let mut profile = DatabaseView::empty_profile(kind);
+            assert_eq!(profile.remember_password, kind != DatabaseKind::Sqlite);
+            assert!(profile.name.is_empty());
+            assert_eq!(
+                required_connection_field(&profile, false),
+                Some("dbwork.connection.name.required")
+            );
+            if kind != DatabaseKind::Sqlite {
+                profile.database.clear();
+                assert_eq!(required_connection_field(&profile, true), None);
+            }
+            profile.name = "My connection".into();
+            if kind == DatabaseKind::Sqlite {
+                assert_eq!(
+                    required_connection_field(&profile, false),
+                    Some("dbwork.connection.file.required")
+                );
+                profile.sqlite_path = "C:/fixture.db".into();
+            } else {
+                profile.database.clear();
+                assert_eq!(
+                    required_connection_field(&profile, false),
+                    Some("dbwork.connection.database.required")
+                );
+                assert_eq!(required_connection_field(&profile, true), None);
+                profile.database = if kind == DatabaseKind::Redis {
+                    "0"
+                } else {
+                    "demo"
+                }
+                .into();
+            }
+            assert_eq!(required_connection_field(&profile, false), None);
+        }
     }
 }

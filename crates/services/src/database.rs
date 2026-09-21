@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 mod remote;
+pub mod workbench;
 use remote::{HttpDatabase, RedisDatabase};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -33,6 +34,7 @@ impl ObjectItem {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OperationKind {
+    Workbench(Box<workbench::Request>),
     Databases,
     Objects {
         database: String,
@@ -53,6 +55,7 @@ pub struct Operation {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum OperationResult {
+    Workbench(Box<workbench::Reply>),
     Databases(Vec<String>),
     Objects {
         items: Vec<ObjectItem>,
@@ -349,6 +352,7 @@ impl Backend {
                 current,
             } => {
                 let database = match &op.kind {
+                    OperationKind::Workbench(r) => Some(&r.database),
                     OperationKind::Objects { database, .. }
                     | OperationKind::Details { database, .. } => Some(database),
                     _ => None,
@@ -378,6 +382,9 @@ async fn pg_operation(
     op: &Operation,
 ) -> Result<OperationResult, String> {
     match &op.kind {
+        OperationKind::Workbench(r) => workbench::run(c, p.kind, "", r)
+            .await
+            .map(|r| OperationResult::Workbench(Box::new(r))),
         OperationKind::Databases => Ok(OperationResult::Databases(
             if p.database.is_empty() || p.list_all_databases {
                 pg_databases(c).await?
@@ -417,6 +424,9 @@ async fn sqlite_operation(
     op: &Operation,
 ) -> Result<OperationResult, String> {
     match &op.kind {
+        OperationKind::Workbench(r) => workbench::run(c, p.kind, "", r)
+            .await
+            .map(|r| OperationResult::Workbench(Box::new(r))),
         OperationKind::Databases => Ok(OperationResult::Databases(vec![
             Path::new(&p.sqlite_path)
                 .file_name()
@@ -489,10 +499,14 @@ pub async fn mysql_operation(
     p: &Profile,
     op: &Operation,
 ) -> Result<OperationResult, String> {
-    sqlx::query("SET NAMES utf8")
-        .execute(&mut *c)
-        .await
-        .map_err(db_error)?;
+    sqlx::query(if matches!(op.kind, OperationKind::Workbench(_)) {
+        "SET NAMES utf8mb4"
+    } else {
+        "SET NAMES utf8"
+    })
+    .execute(&mut *c)
+    .await
+    .map_err(db_error)?;
     let result = mysql_inner(c, p, op).await;
     sqlx::query(&format!("SET NAMES {}", p.charset))
         .execute(c)
@@ -513,6 +527,9 @@ async fn mysql_inner(
     op: &Operation,
 ) -> Result<OperationResult, String> {
     match &op.kind {
+        OperationKind::Workbench(r) => workbench::run(c, p.kind, "5.6+", r)
+            .await
+            .map(|r| OperationResult::Workbench(Box::new(r))),
         OperationKind::Databases => {
             if !p.database.is_empty() {
                 return Ok(OperationResult::Databases(vec![p.database.clone()]));
