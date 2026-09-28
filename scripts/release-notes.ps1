@@ -13,5 +13,5 @@ function Get-VersionReleaseNotes {
     $length = if ($next.Success) { $next.Index } else { $text.Length - $start }
     $body = $text.Substring($start, $length).Trim()
     if (-not $body) { throw "Empty [$Version] section in $ChangelogPath" }
-    return "# TurboDbNote v$Version`n`n$body`n"
+    return "# TurboDBNote v$Version`n`n$body`n"
 }

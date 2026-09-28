@@ -63,7 +63,7 @@ impl HttpDatabase {
             .and_then(|v| v["version"].as_str())
             .ok_or("ClickHouse 未返回版本")?
             .to_string();
-        let databases = if p.database.is_empty() {
+        let databases = if p.database.is_empty() || p.list_all_databases {
             this.databases().await?
         } else {
             vec![p.database.clone()]
@@ -140,6 +140,7 @@ impl HttpDatabase {
     }
     pub async fn operation(&self, p: &Profile, op: &Operation) -> Result<OperationResult, String> {
         match &op.kind {
+            OperationKind::CopyDatabase { .. } => Err("当前数据库类型不支持直接复制数据库".into()),
             OperationKind::Workbench(r) => {
                 let mut access = HttpAccess {
                     client: self,
@@ -149,12 +150,17 @@ impl HttpDatabase {
                     .await
                     .map(|r| OperationResult::Workbench(Box::new(r)))
             }
-            OperationKind::Databases => Ok(OperationResult::Databases(if p.database.is_empty() {
-                self.databases().await?
-            } else {
-                vec![p.database.clone()]
-            })),
-            OperationKind::CreateDatabase { name } => {
+            OperationKind::Databases => Ok(OperationResult::Databases(
+                if p.database.is_empty() || p.list_all_databases {
+                    self.databases().await?
+                } else {
+                    vec![p.database.clone()]
+                },
+            )),
+            OperationKind::CreateDatabase { name, charset } => {
+                if !charset.is_empty() {
+                    return Err("ClickHouse 不支持库级字符集设置".into());
+                }
                 validate_name(p.kind, name)?;
                 self.query(
                     "CREATE DATABASE {new_database:Identifier}",
@@ -282,7 +288,7 @@ impl RedisDatabase {
             catalog_limited: false,
             current,
         };
-        let databases = if !p.database.is_empty() {
+        let databases = if !p.database.is_empty() && !p.list_all_databases {
             vec![p.database.clone()]
         } else {
             this.databases().await
@@ -356,12 +362,15 @@ impl RedisDatabase {
         op: &Operation,
     ) -> Result<OperationResult, String> {
         match &op.kind {
+            OperationKind::CopyDatabase { .. } => Err("当前数据库类型不支持直接复制数据库".into()),
             OperationKind::Workbench(_) => Err("Redis 使用 Key 浏览器，不支持关系表 SQL".into()),
-            OperationKind::Databases => Ok(OperationResult::Databases(if !p.database.is_empty() {
-                vec![p.database.clone()]
-            } else {
-                self.databases().await
-            })),
+            OperationKind::Databases => Ok(OperationResult::Databases(
+                if !p.database.is_empty() && !p.list_all_databases {
+                    vec![p.database.clone()]
+                } else {
+                    self.databases().await
+                },
+            )),
             OperationKind::CreateDatabase { .. } => {
                 Err("Redis 使用已有逻辑库，不支持 CREATE DATABASE".into())
             }

@@ -13,18 +13,19 @@
 
 [Setup]
 AppId={{48E57826-489A-4C7B-A181-FBA086AB71D6}
-AppName=TurboDbNote
+AppName=TurboDBNote
 AppVersion={#AppVersion}
-AppVerName=TurboDbNote {#AppVersion}
+AppVerName=TurboDBNote {#AppVersion}
 VersionInfoVersion={#AppVersion}
+; Preserve the installation location and running-app identity for upgrades.
 DefaultDirName={localappdata}\Programs\TurboDbNote
-DefaultGroupName=TurboDbNote
+DefaultGroupName=TurboDBNote
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 OutputDir={#OutputDir}
-OutputBaseFilename=TurboDbNote-v{#AppVersion}-windows-x64-setup
+OutputBaseFilename=TurboDBNote-v{#AppVersion}-windows-x64-setup
 SetupIconFile={#IconFile}
 UninstallDisplayIcon={app}\turbodbnote.exe
 LicenseFile={#SourceDir}\LICENSE
@@ -46,7 +47,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "portable.flag"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\TurboDbNote"; Filename: "{app}\turbodbnote.exe"; WorkingDir: "{app}"
-Name: "{autodesktop}\TurboDbNote"; Filename: "{app}\turbodbnote.exe"; WorkingDir: "{app}"; Tasks: desktopicon
+Name: "{group}\TurboDBNote"; Filename: "{app}\turbodbnote.exe"; WorkingDir: "{app}"
+Name: "{autodesktop}\TurboDBNote"; Filename: "{app}\turbodbnote.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 ; No automatic launch and no deletion of user data directories on uninstall.

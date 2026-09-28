@@ -10,6 +10,7 @@ pub struct OpenTable {
     pub mode: crate::table_view::Mode,
     pub generation: u64,
     pub kind: DatabaseKind,
+    pub writable: bool,
 }
 impl EventEmitter<OpenTable> for DatabaseView {}
 impl DatabaseView {
@@ -41,6 +42,14 @@ impl DatabaseView {
     ) -> Result<(), String> {
         if self.generation.get(&id).copied().unwrap_or_default() != generation {
             return Err("连接已重新建立，请关闭并重新打开此数据页".into());
+        }
+        if matches!(request.action, Action::Commit { .. })
+            && self
+                .profiles
+                .iter()
+                .any(|p| p.id == id && p.kind == DatabaseKind::Sqlite && p.sqlite_read_only)
+        {
+            return Err("当前连接为只读".into());
         }
         if self.request_operation(id, OperationKind::Workbench(Box::new(request)), cx) {
             self.workbench_target = Some(target);
@@ -77,6 +86,7 @@ impl DatabaseView {
                 mode,
                 generation: self.generation.get(&id).copied().unwrap_or_default(),
                 kind: p.kind,
+                writable: p.kind != DatabaseKind::Sqlite || !p.sqlite_read_only,
             });
         }
     }
@@ -116,6 +126,12 @@ impl DatabaseView {
             .as_ref()
             .filter(|p| p.kind.can_create_database())
             .map(|p| p.id);
+        let can_copy = profile.as_ref().is_some_and(|p| {
+            matches!(
+                p.kind,
+                DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+            )
+        });
         let connected = selected
             .as_ref()
             .is_some_and(|(id, _)| self.states.get(id).is_some_and(|state| state == "已连接"));
@@ -125,6 +141,7 @@ impl DatabaseView {
         let relational = profile
             .as_ref()
             .is_some_and(|p| p.kind != DatabaseKind::Redis);
+        let copy_source = selected.clone();
         let mut body = div()
             .v_flex()
             .size_full()
@@ -141,9 +158,9 @@ impl DatabaseView {
                     .child(
                         Button::new("objects-refresh")
                             .ghost()
-                            .icon(IconName::Redo)
+                            .icon(crate::assets::refresh_icon())
                             .tooltip(t(cx, "dbwork.refresh"))
-                            .disabled(busy || selected.is_none())
+                            .disabled(busy || !connected)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some((id, db)) = this.selected_database.clone() {
                                     this.select_database(id, db, cx);
@@ -155,25 +172,38 @@ impl DatabaseView {
                             .ghost()
                             .icon(gpui_component::Icon::default().path("icons/import.svg"))
                             .tooltip(t(cx, "dbwork.import"))
-                            .disabled(!relational || !writable)
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.import_sql(window, cx)),
-                            ),
+                            .disabled(!connected || busy || !relational || !writable)
+                            .dropdown_menu({
+                                let view = cx.entity().downgrade();
+                                move |mut menu, _, cx| {
+                                    for (key, mode) in [
+                                        ("transfer.from_file", crate::transfer::Mode::ImportFile),
+                                        (
+                                            "transfer.from_connection",
+                                            crate::transfer::Mode::ImportConnection,
+                                        ),
+                                    ] {
+                                        let view = view.clone();
+                                        menu = menu.item(PopupMenuItem::new(t(cx, key)).on_click(
+                                            move |_, window, cx| {
+                                                let _ = view.update(cx, |this, cx| {
+                                                    this.transfer_dialog(mode, window, cx)
+                                                });
+                                            },
+                                        ));
+                                    }
+                                    menu
+                                }
+                            }),
                     )
                     .child(
                         Button::new("objects-export")
                             .ghost()
                             .icon(gpui_component::Icon::default().path("icons/export.svg"))
-                            .tooltip(t(cx, "dbwork.export.ddl"))
-                            .disabled(self.schemas.is_empty())
+                            .tooltip(t(cx, "transfer.export"))
+                            .disabled(!connected || busy)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                let ddl = this
-                                    .schemas
-                                    .values()
-                                    .map(|s| s.ddl.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(";\n\n");
-                                crate::table_view::save_text(ddl, "schema.sql", window, cx);
+                                this.transfer_dialog(crate::transfer::Mode::Export, window, cx)
                             })),
                     )
                     .child(
@@ -184,7 +214,9 @@ impl DatabaseView {
                             .disabled(
                                 !connected
                                     || busy
-                                    || !(create_database.is_some() || (relational && writable)),
+                                    || !(can_copy
+                                        || create_database.is_some()
+                                        || (relational && writable)),
                             )
                             .dropdown_menu(move |mut menu, _, cx| {
                                 if let Some(id) = create_database {
@@ -199,6 +231,25 @@ impl DatabaseView {
                                                 .on_click(move |_, window, cx| {
                                                     let _ = view.update(cx, |this, cx| {
                                                         this.create_database_dialog(id, window, cx)
+                                                    });
+                                                }),
+                                        )
+                                        .separator();
+                                }
+                                if can_copy && let Some((id, database)) = copy_source.clone() {
+                                    let view = source.clone();
+                                    menu = menu
+                                        .item(
+                                            PopupMenuItem::new(t(cx, "dbwork.database.copy"))
+                                                .icon(IconName::Copy)
+                                                .on_click(move |_, window, cx| {
+                                                    let _ = view.update(cx, |this, cx| {
+                                                        let _ = (&id, &database);
+                                                        this.transfer_dialog(
+                                                            crate::transfer::Mode::Copy,
+                                                            window,
+                                                            cx,
+                                                        )
                                                     });
                                                 }),
                                         )
@@ -223,40 +274,127 @@ impl DatabaseView {
         if let Some(p) = profile {
             let id = p.id;
             let names = self.catalog(&p);
-            let view = cx.entity().downgrade();
-            body = body.child(
-                Button::new("objects-database")
-                    .ghost()
-                    .icon(gpui_component::Icon::default().path("icons/database.svg"))
-                    .label(
-                        selected
-                            .as_ref()
-                            .map(|(_, db)| db.clone())
-                            .unwrap_or_default(),
-                    )
-                    .justify_start()
-                    .dropdown_menu(move |mut menu, _, _| {
-                        for name in &names {
-                            let v = view.clone();
-                            let db = name.clone();
-                            menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
-                                move |_, _, cx| {
-                                    let _ = v.update(cx, |this, cx| {
-                                        this.select_database(id, db.clone(), cx)
-                                    });
-                                },
-                            ));
-                        }
-                        menu.scrollable(true).max_h(px(320.))
-                    }),
-            );
+            let database = selected
+                .as_ref()
+                .map(|(_, db)| db.clone())
+                .filter(|db| !db.is_empty())
+                .unwrap_or_else(|| t(cx, "dbwork.summary.unspecified").to_string());
+            let status = if !connected {
+                t(
+                    cx,
+                    if self.states.get(&id).is_some_and(|s| s.ends_with("中…")) {
+                        "dbwork.summary.connecting"
+                    } else {
+                        "dbwork.summary.disconnected"
+                    },
+                )
+                .to_string()
+            } else if busy {
+                t(cx, "dbwork.summary.loading").to_string()
+            } else {
+                String::new()
+            };
+            let summary = if status.is_empty() {
+                database.clone().into()
+            } else {
+                crate::locale::tr(
+                    cx,
+                    "dbwork.summary",
+                    &[("database", &database), ("status", &status)],
+                )
+            };
+            if connected {
+                let context = (id, database.clone(), names.clone());
+                if self.object_database_context.as_ref() != Some(&context) {
+                    let picker = cx.new(|cx| {
+                        let mut state =
+                            SelectState::new(SearchableVec::new(names), None, window, cx)
+                                .searchable(true);
+                        state.set_selected_value(&database, window, cx);
+                        state
+                    });
+                    self.object_database_subscription = Some(cx.subscribe(
+                        &picker,
+                        move |this, _, event: &SelectEvent<SearchableVec<String>>, cx| {
+                            if let SelectEvent::Confirm(Some(value)) = event
+                                && this
+                                    .selected_database
+                                    .as_ref()
+                                    .is_some_and(|(current, db)| *current == id && db != value)
+                                && this.sessions.contains_key(&id)
+                                && this.active_operation.is_none()
+                                && this
+                                    .profiles
+                                    .iter()
+                                    .find(|p| p.id == id)
+                                    .is_some_and(|p| this.catalog(p).contains(value))
+                            {
+                                this.select_database(id, value.clone(), cx);
+                            }
+                        },
+                    ));
+                    self.object_database_picker = Some(picker);
+                    self.object_database_context = Some(context);
+                }
+                if let Some(picker) = &self.object_database_picker {
+                    body = body.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .min_w_0()
+                            .child(
+                                gpui_component::Icon::default()
+                                    .path("icons/database.svg")
+                                    .size_4(),
+                            )
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Select::new(picker)
+                                        .appearance(false)
+                                        .w_full()
+                                        .placeholder(summary)
+                                        .search_placeholder(t(cx, "dbwork.database.filter"))
+                                        .menu_width(px(300.))
+                                        .disabled(busy),
+                                ),
+                            ),
+                    );
+                }
+            } else {
+                self.object_database_picker = None;
+                self.object_database_context = None;
+                self.object_database_subscription = None;
+                body = body.child(
+                    Button::new("objects-database")
+                        .ghost()
+                        .icon(gpui_component::Icon::default().path("icons/database.svg"))
+                        .w_full()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(summary.clone()),
+                        )
+                        .tooltip(summary)
+                        .justify_start(),
+                );
+            }
+            if !connected {
+                return body.into_any_element();
+            }
             if p.kind == DatabaseKind::Redis {
                 return body
                     .child(self.render_objects(window, cx))
                     .into_any_element();
             }
         }
-        body = body.child(Input::new(&self.object_filter));
+        body = body.child(Input::new(&self.object_filter).cleanable(true));
         let query = self.object_filter.read(cx).value().trim().to_lowercase();
         let mut roots = Vec::new();
         for category in categories {
@@ -316,7 +454,7 @@ impl DatabaseView {
                         div()
                             .id(SharedString::from(format!("object-{key}")))
                             .h_flex()
-                            .pl_2()
+                            .pl(px(20.))
                             .gap_1()
                             .h(px(30.))
                             .cursor_pointer()
@@ -453,25 +591,11 @@ impl DatabaseView {
                                 let o = object.clone();
                                 let col = column.clone();
                                 let sql = schema.ddl.clone();
-                                let marker = if column.primary {
-                                    "◆"
-                                } else if column.data_type.to_lowercase().contains("int")
-                                    || column.data_type.to_lowercase().contains("decimal")
-                                    || column.data_type.to_lowercase().contains("float")
-                                {
-                                    "123"
-                                } else if column.data_type.to_lowercase().contains("date")
-                                    || column.data_type.to_lowercase().contains("time")
-                                {
-                                    "◷"
-                                } else {
-                                    "ABC"
-                                };
                                 root = root.child(
                                     div()
                                         .id(SharedString::from(format!("column-{key}-{index}")))
                                         .h_flex()
-                                        .pl(px(84.))
+                                        .pl(px(60.))
                                         .gap_1()
                                         .h(px(28.))
                                         .text_sm()
@@ -481,13 +605,10 @@ impl DatabaseView {
                                                 .w(px(28.))
                                                 .text_xs()
                                                 .text_color(cx.theme().muted_foreground)
-                                                .child(if column.primary {
-                                                    gpui_component::Icon::default()
-                                                        .path("icons/key.svg")
-                                                        .into_any_element()
-                                                } else {
-                                                    div().child(marker).into_any_element()
-                                                }),
+                                                .child(crate::table_view::column_icon(
+                                                    Some(column),
+                                                    cx,
+                                                )),
                                         )
                                         .child(
                                             div()
@@ -562,7 +683,7 @@ impl DatabaseView {
                                             )))
                                             .h_flex()
                                             .gap_1()
-                                            .pl(px(84.))
+                                            .pl(px(60.))
                                             .h(px(28.))
                                             .child(detail_icon.clone())
                                             .child(
@@ -597,15 +718,22 @@ impl DatabaseView {
                 .overflow_y_scroll()
                 .children(roots),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(if selected.is_none() {
-                    t(cx, "dbwork.select").to_string()
-                } else {
-                    self.object_notice.clone()
-                }),
+        .when(
+            selected.is_none()
+                || (!self.object_notice.is_empty()
+                    && self.object_notice != format!("{} 个对象", self.catalog_objects.len())),
+            |body| {
+                body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(if selected.is_none() {
+                            t(cx, "dbwork.select").to_string()
+                        } else {
+                            self.object_notice.clone()
+                        }),
+                )
+            },
         )
         .into_any_element()
     }
@@ -627,7 +755,7 @@ impl DatabaseView {
             gpui_component::Icon::new(IconName::Redo)
         };
         div()
-            .pl(px(28.))
+            .pl(px(36.))
             .child(
                 Button::new(SharedString::from(format!("section-{key}")))
                     .ghost()
@@ -670,17 +798,21 @@ impl DatabaseView {
             self.open_table(object, crate::table_view::Mode::Export, cx);
             return;
         }
-        if action == "structure" {
-            self.describe_object(object, cx);
-            cx.emit(OpenObjects);
-            return;
-        }
         let key = Self::object_key(&object);
         let Some(schema) = self.schemas.get(&key).cloned() else {
             self.pending_object_action = Some((object.clone(), action.into()));
             self.describe_object(object, cx);
             return;
         };
+        if action == "structure" {
+            if let Some((_, database)) = &self.selected_database {
+                feedback::details(
+                    crate::table_view::structure_details(database, &object, &schema),
+                    cx,
+                );
+            }
+            return;
+        }
         if action == "ddl" {
             cx.write_to_clipboard(ClipboardItem::new_string(schema.ddl));
             self.object_notice = "已复制 DDL".into();
@@ -899,51 +1031,5 @@ impl DatabaseView {
             })
             .unwrap_or(false)
         });
-    }
-    fn import_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self.selected_database.clone();
-        let pick = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: false,
-            prompt: Some(t(cx, "dbwork.import.sql")),
-        });
-        cx.spawn_in(window, async move |view, cx| {
-            if let Ok(Ok(Some(paths))) = pick.await
-                && let Some(path) = paths.into_iter().next()
-            {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        use std::io::Read;
-                        let mut text = String::new();
-                        std::fs::File::open(path)
-                            .map_err(|e| e.to_string())?
-                            .take(60_001)
-                            .read_to_string(&mut text)
-                            .map_err(|e| e.to_string())?;
-                        if text.len() > 60_000 {
-                            return Err("SQL 文件超过 60 KB".into());
-                        }
-                        Ok(text)
-                    })
-                    .await;
-                let _ = cx.update(|window, cx| {
-                    let _ = view.update(cx, |this, cx| {
-                        if this.selected_database != target {
-                            return;
-                        }
-                        match result {
-                            Ok(sql) => this.sql_dialog(sql, None, window, cx),
-                            Err(e) => {
-                                this.object_notice = e;
-                                cx.notify();
-                            }
-                        }
-                    });
-                });
-            }
-        })
-        .detach();
     }
 }

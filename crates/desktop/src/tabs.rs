@@ -48,7 +48,7 @@ pub fn targets<T: AsRef<str> + Clone>(names: &[T], name: &str, mode: CloseMode) 
         })
         .collect()
 }
-fn send(name: String, mode: CloseMode, cx: &mut App) {
+pub(crate) fn send(name: String, mode: CloseMode, cx: &mut App) {
     let events = cx.global::<TabRouter>().0.clone();
     events.update(cx, |_, cx| cx.emit(CloseTabs { name, mode }));
 }
@@ -87,24 +87,25 @@ pub fn title(
                     send(close_name.clone(), CloseMode::Current, cx);
                 }),
         )
-        .context_menu(move |mut menu, _, cx| {
-            for (label, icon, mode) in [
-                ("common.action.close", IconName::Close, CloseMode::Current),
-                ("tabs.close.others", IconName::Delete, CloseMode::Others),
-                ("tabs.close.right", IconName::ArrowRight, CloseMode::Right),
-                ("tabs.close.left", IconName::ArrowLeft, CloseMode::Left),
-                ("tabs.close.all", IconName::Delete, CloseMode::All),
-            ] {
-                let name = name.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(t(cx, label))
-                        .icon(icon)
-                        .on_click(move |_, _, cx| send(name.clone(), mode, cx)),
-                );
-            }
-            menu
-        })
+        .context_menu(move |menu, _, cx| close_menu(menu, name.clone(), cx))
         .into_any_element()
+}
+pub(crate) fn close_menu(mut menu: PopupMenu, name: String, cx: &App) -> PopupMenu {
+    for (label, icon, mode) in [
+        ("common.action.close", IconName::Close, CloseMode::Current),
+        ("tabs.close.others", IconName::Delete, CloseMode::Others),
+        ("tabs.close.right", IconName::ArrowRight, CloseMode::Right),
+        ("tabs.close.left", IconName::ArrowLeft, CloseMode::Left),
+        ("tabs.close.all", IconName::Delete, CloseMode::All),
+    ] {
+        let name = name.clone();
+        menu = menu.item(
+            PopupMenuItem::new(t(cx, label))
+                .icon(icon)
+                .on_click(move |_, _, cx| send(name.clone(), mode, cx)),
+        );
+    }
+    menu
 }
 #[cfg(test)]
 mod tests {

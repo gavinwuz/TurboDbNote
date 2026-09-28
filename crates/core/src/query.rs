@@ -35,7 +35,7 @@ impl QueryState {
             active: None,
             status: QueryStatus::Idle,
             page: 0,
-            page_size: 256,
+            page_size: 20,
             selected_row: None,
             result_height: 240.0,
         }

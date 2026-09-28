@@ -319,7 +319,7 @@ async fn drive(
 ) -> Result<(), String> {
     s.request(
         "initialize",
-        json!({"clientInfo":{"name":"turbodbnote","title":"TurboDbNote","version":"0.1.0"}}),
+        json!({"clientInfo":{"name":"turbodbnote","title":"TurboDBNote","version":"0.1.0"}}),
         RpcKind::Init,
     )
     .await?;
@@ -350,7 +350,7 @@ async fn drive(
                         } else {
                         s.request("thread/start", json!({"cwd":s.cwd,"model":prompt.model,
                             "approvalPolicy":"never","sandbox":"read-only",
-                            "baseInstructions":"You are TurboDbNote's SQL analysis assistant. Explain or propose SQL and Markdown. Never modify files or execute database statements. Do not request credentials."}), RpcKind::Thread(prompt)).await?;
+                            "baseInstructions":"You are TurboDBNote's SQL analysis assistant. Explain or propose SQL and Markdown. Never modify files or execute database statements. Do not request credentials."}), RpcKind::Thread(prompt)).await?;
                         }
                     } else { s.start_turn(prompt).await?; }
                     events.send(Event::Log("开始只读分析".into())).await.map_err(|e| e.to_string())?;

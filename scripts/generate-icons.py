@@ -46,7 +46,7 @@ def main():
     draw = ImageDraw.Draw(preview)
     draw.rectangle((0, 200, 640, 400), fill="#202A4A")
     for top, color in ((0, "#202A4A"), (200, "#FFFFFF")):
-        draw.text((20, top + 14), "TurboDbNote / Data Note", fill=color)
+        draw.text((20, top + 14), "TurboDBNote / Data Note", fill=color)
         x = 20
         for size, frame in zip(SIZES[:-1], frames[:-1]):
             icon = Image.open(BytesIO(frame)).convert("RGBA")

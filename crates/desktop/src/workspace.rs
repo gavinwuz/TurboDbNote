@@ -24,6 +24,13 @@ const REGIONS: [DockPlacement; 3] = [
 ];
 
 pub struct Workspace {
+    notes: Entity<crate::note_library::NoteLibrary>,
+    note_panels: std::collections::HashMap<String, Entity<crate::notebook::NoteView>>,
+    _notes_subscription: Subscription,
+    _notes_observe: Subscription,
+    pending_note_close: Option<Vec<String>>,
+    closing_notes_window: bool,
+
     dock: Entity<DockArea>,
     ai: Entity<ChatView>,
     settings: Entity<SettingsView>,
@@ -46,6 +53,8 @@ pub struct Workspace {
     navigation: Entity<WorkbenchPanel>,
     database: Entity<DatabaseView>,
     schema: Entity<WorkbenchPanel>,
+    properties: Entity<WorkbenchPanel>,
+    _detail_subscription: Subscription,
     _objects_subscription: Subscription,
     _table_subscription: Subscription,
     table_panels: std::collections::HashMap<String, Entity<crate::table_view::TableView>>,
@@ -73,6 +82,8 @@ impl Workspace {
             &events,
             window,
             |_, _, event: &crate::feedback::Message, window, cx| {
+                let full = crate::feedback::message_preview(&event.text);
+                let copy = event.text.clone();
                 window.push_notification(
                     gpui_component::notification::Notification::new()
                         .with_type(event.kind)
@@ -81,15 +92,49 @@ impl Workspace {
                             event.kind,
                             gpui_component::notification::NotificationType::Error
                         ))
-                        .message(event.text.clone()),
+                        .content(move |_, _, cx| {
+                            div()
+                                .id("notification-details")
+                                .max_h(px(180.))
+                                .w_full()
+                                .min_w_0()
+                                .overflow_y_scroll()
+                                .whitespace_normal()
+                                .text_color(cx.theme().foreground)
+                                .child(full.clone())
+                                .into_any_element()
+                        })
+                        .when(
+                            matches!(
+                                event.kind,
+                                gpui_component::notification::NotificationType::Error
+                            ),
+                            |notification| {
+                                notification.action(move |_, _, cx| {
+                                    let copy = copy.clone();
+                                    Button::new("copy-error")
+                                        .ghost()
+                                        .icon(IconName::Copy)
+                                        .tooltip(t(cx, "grid.error.copy"))
+                                        .on_click(move |_, _, cx| {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                copy.to_string(),
+                                            ));
+                                            crate::feedback::success(t(cx, "feedback.copied"), cx);
+                                        })
+                                })
+                            },
+                        ),
                     cx,
                 );
             },
         );
         let dock = cx.new(|cx| DockArea::new("workbench", Some(2), window, cx));
         let weak = dock.downgrade();
-        let notebook = cx.new(|cx| WorkbenchPanel::notebook(window, cx));
         let database = cx.new(|cx| DatabaseView::new(window, cx));
+        let notes =
+            cx.new(|cx| crate::note_library::NoteLibrary::new(database.clone(), window, cx));
+        let notebook = cx.new(|cx| WorkbenchPanel::notebook(notes.clone(), cx));
         let navigation = cx.new(|cx| {
             WorkbenchPanel::info(
                 "navigation",
@@ -99,7 +144,9 @@ impl Workspace {
                 cx,
             )
         });
+        navigation.update(cx, |panel, cx| panel.show_notes(notes.clone(), cx));
         let output = cx.new(AiLog::new);
+        database.update(cx, |database, _| database.output = Some(output.clone()));
         let ai = cx.new(|cx| ChatView::new(output.clone(), window, cx));
         let settings =
             cx.new(|cx| SettingsView::new(ai.clone(), database.read(cx).drivers(), window, cx));
@@ -133,7 +180,7 @@ impl Workspace {
         let right = DockItem::tabs(
             vec![
                 Arc::new(ai.clone()),
-                Arc::new(properties),
+                Arc::new(properties.clone()),
                 Arc::new(schema.clone()),
             ],
             &weak,
@@ -192,7 +239,12 @@ impl Workspace {
                 }
                 SettingsRequest::Close => {
                     if this.closing_window {
-                        window.remove_window();
+                        this.closing_window = false;
+                        cx.defer_in(window, |this, window, cx| {
+                            if this.prepare_close(window, cx) {
+                                window.remove_window();
+                            }
+                        });
                         return;
                     }
                     let mut names = std::mem::take(&mut this.pending_close);
@@ -266,6 +318,7 @@ impl Workspace {
                 this.dock
                     .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
                 this.ai.update(cx, |ai, cx| ai.sync_zoom(false, cx));
+                this.schema.update(cx, |panel, cx| panel.clear_detail(cx));
                 this.right_tabs.update(cx, |tabs, cx| {
                     let panel = Arc::new(this.schema.clone());
                     tabs.remove_panel(panel.clone(), window, cx);
@@ -278,6 +331,30 @@ impl Workspace {
                 }
                 cx.notify();
             });
+        let detail_subscription = cx.subscribe_in(
+            &events,
+            window,
+            |this, _, event: &crate::feedback::DetailRequest, window, cx| {
+                let panel = if event.inspector {
+                    this.properties.clone()
+                } else {
+                    this.schema.clone()
+                };
+                panel.update(cx, |panel, cx| panel.show_detail(event.clone(), window, cx));
+                this.leave_focus(window, cx);
+                this.right_tabs.update(cx, |tabs, cx| {
+                    let panel: Arc<dyn PanelView> = Arc::new(panel);
+                    tabs.remove_panel(panel.clone(), window, cx);
+                    tabs.add_panel(panel, window, cx);
+                });
+                if !this.dock.read(cx).is_dock_open(DockPlacement::Right, cx) {
+                    this.dock.update(cx, |dock, cx| {
+                        dock.toggle_dock(DockPlacement::Right, window, cx)
+                    });
+                }
+                cx.notify();
+            },
+        );
         let table_subscription = cx.subscribe_in(
             &database,
             window,
@@ -346,9 +423,64 @@ impl Workspace {
                     this.close_names(&names, window, cx);
                 }
             });
+        let notes_subscription = cx.subscribe_in(
+            &notes,
+            window,
+            |this, _, event: &crate::note_library::LibraryEvent, window, cx| match event {
+                crate::note_library::LibraryEvent::Open { key, view } => {
+                    let panel: Arc<dyn PanelView> = Arc::new(view.clone());
+                    this.center_tabs.update(cx, |tabs, cx| {
+                        tabs.remove_panel(panel.clone(), window, cx);
+                        tabs.add_panel(panel, window, cx);
+                    });
+                    this.note_panels.insert(key.clone(), view.clone());
+                    this.center_order.retain(|name| name != key);
+                    this.center_order.push(key.clone());
+                    cx.notify();
+                }
+                crate::note_library::LibraryEvent::Settled { key, success } => {
+                    if !success {
+                        if key.is_empty()
+                            || this
+                                .pending_note_close
+                                .as_ref()
+                                .is_some_and(|names| names.contains(key))
+                        {
+                            this.pending_note_close = None;
+                        }
+                        this.closing_notes_window = false;
+                        return;
+                    }
+                    cx.defer_in(window, |this, window, cx| {
+                        if let Some(names) = &this.pending_note_close
+                            && !names
+                                .iter()
+                                .filter_map(|name| this.note_panels.get(name))
+                                .any(|note| note.read(cx).pending())
+                        {
+                            let names = this.pending_note_close.take().unwrap();
+                            this.close_names(&names, window, cx);
+                        }
+                        this.finish_window_after_notes(window, cx);
+                    });
+                }
+            },
+        );
+        let notes_observe = cx.observe(&notes, |this, _, cx| {
+            this.navigation.update(cx, |_, cx| cx.notify());
+            cx.notify();
+        });
         let status_observe = cx.observe(&ai, |_, _, cx| cx.notify());
         Self {
+            notes,
+            note_panels: Default::default(),
+            _notes_subscription: notes_subscription,
+            _notes_observe: notes_observe,
+            pending_note_close: None,
+            closing_notes_window: false,
             schema,
+            properties,
+            _detail_subscription: detail_subscription,
             table_panels: std::collections::HashMap::new(),
             _table_subscription: table_subscription,
             _objects_subscription: objects_subscription,
@@ -427,6 +559,46 @@ impl Workspace {
     }
 
     pub fn prepare_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let running = self.notes.read(cx).running(cx);
+        if running || self.notes.read(cx).pending(cx) {
+            if running
+                || !cx
+                    .global::<crate::preferences::Preferences>()
+                    .general
+                    .note_autosave
+            {
+                let view = cx.entity().downgrade();
+                crate::feedback::confirm_labels(
+                    t(cx, "notes.close_title"),
+                    t(
+                        cx,
+                        if running {
+                            "notes.close_running"
+                        } else {
+                            "notes.close_dirty"
+                        },
+                    ),
+                    t(cx, "dbwork.draft.keep"),
+                    t(cx, "notes.save_close"),
+                    window,
+                    cx,
+                    move |window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.closing_notes_window = true;
+                            this.notes.update(cx, |notes, cx| {
+                                notes.stop(cx);
+                                notes.flush(cx);
+                            });
+                            this.finish_window_after_notes(window, cx);
+                        });
+                    },
+                );
+            } else {
+                self.closing_notes_window = true;
+                self.notes.update(cx, |notes, cx| notes.flush(cx));
+            }
+            return false;
+        }
         if self.settings.read(cx).pending(cx) {
             self.closing_window = true;
             self.open_settings(None, window, cx);
@@ -437,6 +609,35 @@ impl Workspace {
         }
     }
 
+    fn flush_note_close(
+        &mut self,
+        names: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_note_close = Some(names.clone());
+        for name in &names {
+            if let Some(note) = self.note_panels.get(name) {
+                note.update(cx, |note, cx| note.save_now(cx));
+            }
+        }
+        if !names
+            .iter()
+            .filter_map(|name| self.note_panels.get(name))
+            .any(|note| note.read(cx).pending())
+        {
+            self.pending_note_close = None;
+            self.close_names(&names, window, cx);
+        }
+    }
+    fn finish_window_after_notes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closing_notes_window && !self.notes.read(cx).pending(cx) {
+            self.closing_notes_window = false;
+            if self.prepare_close(window, cx) {
+                window.remove_window();
+            }
+        }
+    }
     fn rebuild_tabs(&mut self, center: bool, window: &mut Window, cx: &mut Context<Self>) {
         let order = if center {
             &self.center_order
@@ -446,9 +647,14 @@ impl Workspace {
         let panels = order
             .iter()
             .filter_map(|name| {
-                self.table_panels
+                self.note_panels
                     .get(name)
                     .map(|p| Arc::new(p.clone()) as Arc<dyn PanelView>)
+                    .or_else(|| {
+                        self.table_panels
+                            .get(name)
+                            .map(|p| Arc::new(p.clone()) as Arc<dyn PanelView>)
+                    })
                     .or_else(|| {
                         self.panels
                             .iter()
@@ -487,6 +693,81 @@ impl Workspace {
         });
     }
     fn close_names(&mut self, names: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        let has_running = names
+            .iter()
+            .filter_map(|name| self.note_panels.get(name))
+            .any(|note| note.read(cx).running(cx));
+        let has_pending = names
+            .iter()
+            .filter_map(|name| self.note_panels.get(name))
+            .any(|note| note.read(cx).pending());
+        if has_running || has_pending {
+            if has_running
+                || !cx
+                    .global::<crate::preferences::Preferences>()
+                    .general
+                    .note_autosave
+            {
+                let view = cx.entity().downgrade();
+                let names = names.to_vec();
+                crate::feedback::confirm_labels(
+                    t(cx, "notes.close_title"),
+                    t(
+                        cx,
+                        if has_running {
+                            "notes.close_running"
+                        } else {
+                            "notes.close_dirty"
+                        },
+                    ),
+                    t(cx, "dbwork.draft.keep"),
+                    t(cx, "notes.save_close"),
+                    window,
+                    cx,
+                    move |window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            for name in &names {
+                                if let Some(note) = this.note_panels.get(name) {
+                                    note.update(cx, |note, cx| note.stop(cx));
+                                }
+                            }
+                            this.flush_note_close(names.clone(), window, cx);
+                        });
+                    },
+                );
+            } else {
+                self.flush_note_close(names.to_vec(), window, cx);
+            }
+            return;
+        }
+        if names.iter().any(|name| name == "database-manager") {
+            if self.database.read(cx).editor_busy() {
+                return;
+            }
+            if self.database.read(cx).dirty(cx) {
+                let view = cx.entity().downgrade();
+                let names = names.to_vec();
+                crate::feedback::confirm_labels(
+                    t(cx, "dbwork.draft.close_title"),
+                    t(cx, "dbwork.draft.close_body"),
+                    crate::locale::t(cx, "dbwork.draft.keep"),
+                    crate::locale::t(cx, "dbwork.draft.discard"),
+                    window,
+                    cx,
+                    move |window, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            if this.database.read(cx).editor_busy() {
+                                return;
+                            }
+                            this.database
+                                .update(cx, |database, cx| database.discard_editor(window, cx));
+                            this.close_names(&names, window, cx);
+                        });
+                    },
+                );
+                return;
+            }
+        }
         self.leave_focus(window, cx);
         self.dock
             .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
@@ -496,9 +777,14 @@ impl Workspace {
                 continue;
             }
             let Some(panel) = self
-                .table_panels
+                .note_panels
                 .get(name)
                 .map(|p| Arc::new(p.clone()) as Arc<dyn PanelView>)
+                .or_else(|| {
+                    self.table_panels
+                        .get(name)
+                        .map(|p| Arc::new(p.clone()) as Arc<dyn PanelView>)
+                })
                 .or_else(|| {
                     self.panels
                         .iter()
@@ -514,6 +800,11 @@ impl Workspace {
             } else if self.right_order.contains(name) {
                 self.right_tabs
                     .update(cx, |tabs, cx| tabs.remove_panel(panel, window, cx));
+            }
+        }
+        for name in names {
+            if self.note_panels.remove(name).is_some() {
+                self.notes.update(cx, |notes, cx| notes.close(name, cx));
             }
         }
         self.center_order.retain(|n| !names.contains(n));
@@ -637,7 +928,7 @@ impl Workspace {
             if connections {
                 panel.show_databases(self.database.clone(), cx);
             } else {
-                panel.show_navigation(false, cx);
+                panel.show_notes(self.notes.clone(), cx);
             }
         });
         if !open || same {
@@ -684,7 +975,7 @@ impl Render for Workspace {
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
-                icon_button("project", IconName::Folder, "navigation.projects", cx)
+                icon_button("project", IconName::BookOpen, "notes.title", cx)
                     .selected(left && !self.connections)
                     .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
             )
@@ -724,7 +1015,7 @@ impl Render for Workspace {
                         )
                         .item(
                             PopupMenuItem::new(t(cx, "help.action.check_updates"))
-                                .icon(IconName::Redo)
+                                .icon(crate::assets::refresh_icon())
                                 .on_click(move |_, _, cx| {
                                     update.update(cx, |this, cx| this.check_update(cx))
                                 }),
@@ -766,7 +1057,7 @@ impl Render for Workspace {
                     .flex_1()
                     .pl_2()
                     .text_size(rems(crate::typography::BODY))
-                    .child("TurboDbNote"),
+                    .child("TurboDBNote"),
             )
             .child(
                 icon_button("left", IconName::PanelLeft, "workspace.sidebar.toggle", cx)
@@ -866,7 +1157,7 @@ impl Render for Workspace {
                                     .child(
                                         div()
                                             .flex_shrink_0()
-                                            .child(self.database.read(cx).summary()),
+                                            .child(self.database.read(cx).summary(cx)),
                                     )
                                     .child(
                                         div()
@@ -887,6 +1178,21 @@ impl Render for Workspace {
                         }),
                 ),
             )
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if !event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.shift
+                {
+                    return;
+                }
+                match event.keystroke.key.as_str() {
+                    "j" => this.toggle_region(DockPlacement::Bottom, window, cx),
+                    "b" => this.toggle_region(DockPlacement::Left, window, cx),
+                    "," => this.open_settings(Some(crate::settings::Category::General), window, cx),
+                    _ => return,
+                }
+                cx.stop_propagation();
+            }))
             .children(dialogs)
             .child(
                 div()

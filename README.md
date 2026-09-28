@@ -1,4 +1,8 @@
-# TurboDbNote
+# TurboDBNote
+
+Note navigation includes a recent-file home page, indented files and shared draggable project order. SQL/MD insertion icons and wider searchable database selectors keep cell editing compact. Standalone bounded JSON notes retain atomic saves; parsing avoids duplicate JSON trees.
+
+Settings include font previews, default grid page sizes, SQL wrapping and compact configuration lists. Connection imports support selection and DBeaver DBP archives. See [settings and common actions](docs/settings-workbench.md).
 
 English | [简体中文](README.zh-CN.md)
 
@@ -6,7 +10,7 @@ A native SQL Notebook workbench built with Rust and GPUI Component.
 
 Current version: **v0.1.0 (preview)**. See the [changelog](CHANGELOG.md).
 
-The product name is **TurboDbNote**. The desktop package and executable are named `turbodbnote` (`turbodbnote.exe` on Windows). Internal packages remain `turbodbn-core` and `turbodbn-services`.
+The product name is **TurboDBNote**. The desktop package and executable are named `turbodbnote` (`turbodbnote.exe` on Windows). Internal packages remain `turbodbn-core` and `turbodbn-services`. Existing data-directory and credential identifiers retain their historical spelling for compatibility.
 
 This initial scaffold provides a four-region Dock layout, auxiliary tabs, independent SQL / Markdown / task editor entities, cell folding and task status changes, plus document and query models that can be tested without a window.
 
@@ -14,7 +18,11 @@ The editor uses a 48px icon-only navigation rail with Data Note branding, projec
 
 The 40px unified title bar combines Data Note branding, the product name, layout/theme actions and window controls in one row. The navigation rail starts below it. This replaces the separate native caption and toolbar; see the [title bar design (Chinese)](docs/plans/2026-09-11-unified-titlebar.md).
 
-> Notebook edits are currently kept only in memory and are lost when the window closes. Notebook SQL cell execution, note-file saving, notebook Markdown preview and result tables are not connected. With saved settings, AI Chat can automatically check the selected CLI when first displayed; model requests start only when you send a message.
+> Notes are standalone `.note` documents, including unnamed drafts. The Notes sidebar shares projects with database connections. SQL cells use saved MySQL/PostgreSQL/SQLite connections and paged results (20 rows by default); Markdown and tasks work offline. Settings → General configures the draft directory and 600ms autosave. See [Note workbench scope and recovery](docs/note-workbench.md). With saved settings, AI Chat can automatically check the selected CLI when first displayed; model requests start only when you send a message.
+
+Note cells now open in reading mode; double-click/F2 edits and Esc returns to reading. Contextual tools provide duplication, movement and insertion. SQL results reuse the table grid, with guarded edits for key-complete single-table projections and read-only joined/derived results.
+
+The Note header is a compact icon toolbar. Unbound SQL cells inherit the document default connection/database; explicit cell scopes remain independent. Run all executes sequentially with per-statement write confirmation. Rename, Save as, project and reveal actions are in Note context menus; tab dots/tooltips show save state and file details.
 
 ## Development environment
 
@@ -73,17 +81,31 @@ python scripts/verify-windows-icon.py
 
 See the [size and background preview](crates/desktop/assets/icon-preview.png). Exit old processes before checking a new EXE. If a pinned shortcut retains its old icon, unpin and pin it again.
 
-VERSIONINFO provides FileDescription / ProductName (TurboDbNote) and version fields. Update `assets/windows.rc` when changing the release version. Task Manager may cache process-group names and icons separately from window icons; restart the application and Task Manager when checking updates.
+VERSIONINFO provides FileDescription / ProductName (TurboDBNote) and version fields. Update `assets/windows.rc` when changing the release version. Task Manager may cache process-group names and icons separately from window icons; restart the application and Task Manager when checking updates.
 
 For compatibility, 16–128px frames use traditional 32-bit DIB + AND masks; 256px uses PNG. Windows startup also explicitly sets `ICON_SMALL` and `ICON_BIG`. The resource verifier calls native Windows decoding APIs. `python scripts/verify-window-icons.py` launches a separate empty instance, verifies both window icon slots and closes that instance.
 
 ## MySQL connection management
 
-Use the left database icon to create or search connection profiles. Profiles open in a central editor with grouping, host/port, credentials, database, driver/version hints, UTF-8 session charset, TLS certificates and timeouts. Test releases its connection; Connect retains a management session until disconnect. Save the profile before opening a persistent connection. Double-click a connection to connect. Its context menu provides connect/disconnect, edit, duplicate, records and delete. Duplicate excludes passwords; deletion requires confirmation.
+Use the left database icon to create or search connection profiles. Profiles open in a central editor with project, host/port, credentials, database, driver/version hints, UTF-8 session charset, TLS certificates and timeouts. Test releases its connection; Connect retains a management session until disconnect. Save the profile before opening a persistent connection. Double-click a connection to connect. Its context menu provides connect/disconnect, edit, duplicate, records and delete. Duplicate excludes passwords; deletion requires confirmation.
 
-SQLx 0.8.6 is the modern adapter for MySQL 5.6/5.7/8.0. MySQL 4.0/4.1/5.0–5.5 use the legacy adapter: a separate helper process loads the managed client or an explicitly selected MySQL 5.1–5.6 x64 `libmysql.dll`. Auto routing uses the configured version hint; it never retries authentication with a weaker driver. The detected server version is shown separately from the requested version hint. TLS verifies identity by default and never silently falls back to plaintext. Passwords are either session-only or encrypted with current-user Windows DPAPI inside `connections.db`, alongside profiles and creation/update/last-used timestamps. Legacy `connections.json` is imported once and retained as a backup. The connection manager browses tables, columns and indexes; Notebook SQL cell execution remains separate and is not connected yet. See the [implementation plan (Chinese)](docs/plans/2026-09-17-mysql-connections.md).
+SQLx 0.8.6 is the modern adapter for MySQL 5.6/5.7/8.0. MySQL 4.0/4.1/5.0–5.5 use the legacy adapter: a separate helper process loads the managed client or an explicitly selected MySQL 5.1–5.6 x64 `libmysql.dll`. Auto routing uses the configured version hint; it never retries authentication with a weaker driver. The detected server version is shown separately from the requested version hint. TLS verifies identity by default and never silently falls back to plaintext. Passwords are either session-only or encrypted with current-user Windows DPAPI inside `connections.db`, alongside profiles and creation/update/last-used timestamps. Legacy `connections.json` is imported once and retained as a backup. The connection manager browses tables, columns and indexes; Notebook SQL execution uses separate background sessions with explicit write confirmation. See the [implementation plan (Chinese)](docs/plans/2026-09-17-mysql-connections.md).
 
 Connection storage is `%APPDATA%/TurboDbNote/connections.db` for installed Windows builds, or `data/connections.db` next to a portable executable. Editing an empty password field preserves the retained password; replacing and clearing are explicit. Enable Save password to reuse a password after restarting. Old Credential Manager entries migrate to encrypted SQLite storage. Changing the host, port or user requires re-entering the password. Dialog actions are right-aligned; destructive actions and reviewed SQL writes require confirmation. See [connection storage and feedback design](docs/connection-storage-and-feedback.md).
+
+Data tabs use a virtual grid with fixed row numbers, primary-key cursor pagination where supported, server-side sorting/filtering and on-demand counts. Edits are staged and submitted with a SQL preview, confirmation, transaction and conflict checks. See [data workbench design](docs/data-grid-workbench.md) for capabilities and limits.
+
+Database header menus provide recent connections and Navicat NCX/DBeaver JSON or ZIP import. Creation supports engine-specific charsets; MySQL and SQLite can copy to new destinations, with data optional. See [database management scope](docs/database-management.md).
+
+Combine up to 20 filter conditions with AND or OR. Date/time values use separate fields and a Now action; the cell editor provides NULL, restore-original and safely quoted copy-WHERE actions.
+
+Filters remain visible above the grid, with an expandable editor and symbolic operators. Date editing offers a calendar while preserving time precision and timezone; double-click/F2 edits a cell and Ctrl+C copies its value in browse mode.
+
+Paging defaults to 200 rows (editable from 1 to 1000). First/previous/page/next/last controls share the toolbar; calculate totals explicitly to enable the last page. Duplicate-row and export actions are directly available as icons.
+
+Data-grid actions and statistics share a compact bottom toolbar. Default highlighting follows the theme: warm yellow in light mode and muted blue-gray in dark mode; custom colors take priority.
+
+Single-click selects a connection and updates Objects without opening its editor; use **Edit connection** from the context menu. The database heading shows its name and offline/loading state without duplicate table/view counts.
 
 ## Packaging and releases
 
@@ -117,7 +139,7 @@ Validated against Codex CLI 0.153.4 and Claude Code CLI 2.1.139. Claude uses pri
 
 ## Layout and settings
 
-Title-bar actions and the left navigation rail are icon-only with tooltips; content buttons and settings categories use icons plus text. Tabs show an icon, title and close icon. The editor menu and tab context menu include Close all tabs; context menus also offer Close, Close others, Close right and Close left. The right-side AI Chat, Inspector and Schema tabs are fixed, non-closable and retain their order. Closing keeps notebook and chat entities in memory; Help → Restore auxiliary tabs reopens the notebook and auxiliary tabs. Settings temporarily collapses auxiliary regions and restores their visibility on close.
+Title-bar actions and the left navigation rail are icon-only with tooltips; content buttons and settings categories use icons plus text. Tabs show an icon, title and close icon. The editor menu and tab context menu include Close all tabs; context menus also offer Close, Close others, Close right and Close left. The right-side AI Chat, Inspector and Schema tabs are fixed, non-closable and retain their order. Closing a Note saves pending edits (or prompts when autosave is disabled); chat entities remain in memory; Help → Restore auxiliary tabs reopens the notebook and auxiliary tabs. Settings temporarily collapses auxiliary regions and restores their visibility on close.
 
 Settings saves valid edits automatically after a 600 ms pause, without a Save button. Closing a tab/window flushes pending edits; validation and disk errors retain the draft. Auto-save does not connect an agent or send inference. General contains Light/Dark and extensible themes, language, font and size. AI Agents preserves Codex/Claude configuration and adds an OpenClaw/extension registry with executable, working directory and explicit installation-guide links. Extension entries are configuration only; built-in chat still uses Codex or Claude.
 
@@ -147,7 +169,7 @@ Verified against real MySQL 4.0.27, 4.1.22 and 5.1.73 servers using the 5.1.73 x
 
 Settings → Database provides an official download (~119 MiB), offline import of `mysql-noinstall-5.1.73-winx64.zip`, progress, cancellation and retry. SHA-256 is pinned for both archive and DLL; incomplete downloads never become installed drivers. Custom DLLs remain available in each connection’s Advanced tab. Downloaded drivers live beside settings in `drivers`; bundled drivers live beside the executable in `drivers` and take precedence on restart. DLL paths are explicit and PATH is not modified.
 
-Connections have Connection / TLS / Advanced tabs and a fixed action area with Test and Save & Connect. Environment offers Development, Test, Staging and Production (Chinese labels), plus free text; groups suggest existing saved groups and allow new names. TLS and old-auth permission remain explicit choices.
+Connections have Connection / TLS / Advanced tabs and a fixed action area with Test and Save & Connect. Environment offers Development, Test, Staging and Production (Chinese labels), plus free text; projects suggest existing saved projects and allow new names. TLS and old-auth permission remain explicit choices.
 
 Windows packaging includes the x64 5.1.73 client for 4.x servers, **not** the incompatible win32 4.x DLLs. It downloads the official client and matching source by default. For offline builds, add `-LegacyDriverArchive <official-zip> -LegacySourceArchive <mysql-5.1.73.tar.gz>` to `scripts/package-windows.ps1`. Release folders include MySQL source and the current application source. No MySQL server is installed or started.
 
@@ -171,7 +193,7 @@ Retry tests keep saved configuration unchanged by default. Enable “save this c
 
 New Connection first selects MySQL, SQLite, PostgreSQL, ClickHouse or Redis, then opens the appropriate configuration form. Each type retains its own unsaved draft when switching back. Existing MySQL profiles load unchanged. Files containing other database types use connection format v2 so older applications reject them instead of treating them as MySQL; this version reads both v1 and v2.
 
-Navigation is Group → Connection → Database. Groups collapse and reorder by drag handle or Move Up/Down; order and collapse state persist in `database-navigation.json`. Connections display a type icon, environment color marker and status icon. Catalogs start with 20 entries, offer local filtering/Load More and use virtual scrolling. Search only examines known metadata and never connects automatically. A configured database restricts navigation to that database.
+The database sidebar organizes connections by Project → Connection, with alternative environment and date views. Project order and collapse state persist in `database-navigation.json`. The separate Objects area initially selects the configured default database and supports searching and switching to other databases. Search uses known metadata and does not connect automatically.
 
 Click a database in a live connection to open the right-hand Objects panel. Columns and indexes stay in that panel. Operations reuse the live adapter, carry request IDs and run off the UI thread. Connection loss and adapter failures release pending operations. Creating a database requires an explicit dialog submission, shows the target/environment and does not retry automatically. Unrestricted connections select the new database after success.
 
@@ -200,3 +222,9 @@ Output uses a terminal icon and the title **Output**, with icon-only Follow, Cle
 Optional Windows CrashSight dynamic loading and a macOS Objective-C bridge are implemented with a separate bounded SQLite usage queue. The selected project is overseas first, with a domestic fallback applied only at the next launch after a confirmed failure signal. **Automatic detection of upload failure is not available in the documented C API and is not wired.** No App Key is embedded. A public Windows SDK was downloaded to the ignored vendor directory and inspected without initialization; macOS still needs its native framework and an on-device build.
 
 Without an SDK the application continues running and records allowlisted lifecycle/action metadata locally. Usage upload requires your own HTTPS receiver; none is configured. Native crash dumps may contain memory/device data. See [setup, limitations, symbols and local verification](docs/crashsight-integration.md).
+
+Database browsing supports searchable database selection and unified export, copy, and import tasks with side-by-side source/destination, timestamped export filenames, selectable tables, grid previews, configurable batches, confirmation, progress, and cancellation. SQLite and modern MySQL data imports support append, replace, and guarded primary-key upsert. See [transfer capabilities and limits](docs/database-transfer.md).
+
+Transfer destinations now include files, new databases, and existing databases. Copy-to-new refuses existing targets; preflight validates the execution transport. Bounded bottom-panel operation traces are persisted as structured log volumes. Closing or switching a dirty connection editor requires an explicit keep/discard choice.
+
+Development previews reuse `target/debug` and `target/preview`: run `pwsh -File scripts/build-preview.ps1`. Inspect reclaimable old binaries and incremental caches with `pwsh -File scripts/clean-target.ps1`, then add `-Apply` to remove them. Runtime notes, databases and settings are preserved; packaging reuses a locked isolated source workspace.

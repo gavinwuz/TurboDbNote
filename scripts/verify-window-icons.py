@@ -32,7 +32,7 @@ def visit(hwnd, _):
     user.GetWindowThreadProcessId(hwnd, c.byref(owner))
     text = c.create_unicode_buffer(256)
     user.GetWindowTextW(hwnd, text, 256)
-    if owner.value == app.pid and text.value == "TurboDbNote":
+    if owner.value == app.pid and text.value == "TurboDBNote":
         found.append(hwnd)
     return True
 
@@ -44,11 +44,11 @@ try:
         if found:
             break
         time.sleep(0.2)
-    assert found, "No TurboDbNote window detected within 20 seconds"
+    assert found, "No TurboDBNote window detected within 20 seconds"
     for kind in (0, 1):  # ICON_SMALL, ICON_BIG
         icon = user.SendMessageW(found[0], 0x007F, kind, 0)  # WM_GETICON
         assert icon, f"Missing window icon slot {kind}"
-    print("PASS: live TurboDbNote HWND returns both ICON_SMALL and ICON_BIG")
+    print("PASS: live TurboDBNote HWND returns both ICON_SMALL and ICON_BIG")
     if "--unified-titlebar" in sys.argv:
         rect, origin = w.RECT(), w.POINT(0, 0)
         assert user.GetWindowRect(found[0], c.byref(rect))

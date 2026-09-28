@@ -101,7 +101,7 @@ with tempfile.TemporaryDirectory(prefix="auto-connect-", dir="target") as folder
                 user.GetWindowThreadProcessId(hwnd, c.byref(owner))
                 title = c.create_unicode_buffer(256)
                 user.GetWindowTextW(hwnd, title, 256)
-                if owner.value == process.pid and title.value == "TurboDbNote":
+                if owner.value == process.pid and title.value == "TurboDBNote":
                     windows.append(hwnd)
                 return True
 

@@ -28,6 +28,14 @@ pub(super) enum GroupMode {
     UsedDate,
 }
 impl GroupMode {
+    fn add_key(self) -> &'static str {
+        if self == Self::Group {
+            "dbwork.project.add"
+        } else {
+            "dbwork.environment.add"
+        }
+    }
+
     fn key(self) -> &'static str {
         match self {
             Self::Group => "dbwork.group",
@@ -87,6 +95,7 @@ impl Render for GroupDrag {
         div().p_2().child(self.0.clone())
     }
 }
+// Keep historical grouping keys so existing order/collapse preferences survive the terminology change.
 fn group(p: &Profile) -> String {
     if p.group.trim().is_empty() {
         "未分组".into()
@@ -94,7 +103,7 @@ fn group(p: &Profile) -> String {
         p.group.clone()
     }
 }
-fn environment_color(name: &str) -> Hsla {
+pub(super) fn environment_color(name: &str) -> Hsla {
     let n = name.to_lowercase();
     if n.contains("正式") || n.contains("生产") || n == "prod" {
         hsla(0., 0.7, 0.55, 1.)
@@ -108,7 +117,7 @@ fn environment_color(name: &str) -> Hsla {
         hsla(0., 0., 0.55, 1.)
     }
 }
-fn type_icon(kind: DatabaseKind) -> gpui_component::Icon {
+pub(super) fn type_icon(kind: DatabaseKind) -> gpui_component::Icon {
     gpui_component::Icon::default()
         .path(match kind {
             DatabaseKind::MySql => "icons/db-mysql.svg",
@@ -237,61 +246,173 @@ impl DatabaseView {
     }
     pub fn navigation_tools(&self, cx: &Context<Self>) -> AnyElement {
         let view = cx.entity().downgrade();
-        let can_add = !matches!(self.navigation.mode, GroupMode::Date | GroupMode::UsedDate);
-        Button::new("connection-grouping")
-            .ghost()
-            .icon(IconName::SortAscending)
-            .tooltip(crate::locale::t(cx, self.navigation.mode.key()))
-            .dropdown_menu(move |mut menu, _, cx| {
-                for mode in [
-                    GroupMode::Group,
-                    GroupMode::Environment,
-                    GroupMode::Date,
-                    GroupMode::UsedDate,
-                ] {
-                    let v = view.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(crate::locale::t(cx, mode.key())).on_click(
-                            move |_, _, cx| {
-                                let _ = v.update(cx, |this, cx| {
-                                    this.navigation.mode = mode;
-                                    this.persist_navigation();
-                                    cx.notify();
-                                });
-                            },
-                        ),
-                    );
-                }
-                if !can_add {
-                    return menu;
-                }
-                let v = view.clone();
-                menu.item(
-                    PopupMenuItem::new(crate::locale::t(cx, "dbwork.category.add")).on_click(
-                        move |_, window, cx| {
-                            let _ = v.update(cx, |this, cx| this.add_category(window, cx));
-                        },
-                    ),
-                )
-            })
+        let mode = self.navigation.mode;
+        let can_add = mode == GroupMode::Environment;
+        let recent = self
+            .navigation
+            .recent
+            .iter()
+            .filter_map(|id| self.profiles.iter().find(|p| p.id == *id))
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        let history = self.history.clone();
+        let recent_view = view.clone();
+        let import_view = view.clone();
+        div()
+            .h_flex()
+            .gap_1()
+            .child(
+                Button::new("new-database-project")
+                    .ghost()
+                    .icon(gpui_component::Icon::default().path("icons/project-add.svg"))
+                    .tooltip(crate::locale::t(cx, "dbwork.project.add"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.add_category_for(GroupMode::Group, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("open-recent-connections")
+                    .ghost()
+                    .icon(IconName::FolderOpen)
+                    .tooltip(crate::locale::t(cx, "dbwork.recent.open"))
+                    .dropdown_menu(move |mut menu, _, cx| {
+                        if recent.is_empty() {
+                            return menu.item(
+                                PopupMenuItem::new(crate::locale::t(cx, "dbwork.recent.empty"))
+                                    .disabled(true),
+                            );
+                        }
+                        for profile in &recent {
+                            let view = recent_view.clone();
+                            let id = profile.id;
+                            menu = menu.item(
+                                PopupMenuItem::element({
+                                    let name = profile.name.clone();
+                                    let address = connection_address(profile);
+                                    let used =
+                                        history.get(&id).and_then(|h| h.last_used_at.clone());
+                                    move |_, cx| {
+                                        div()
+                                            .h_flex()
+                                            .gap_3()
+                                            .child(name.clone())
+                                            .child(
+                                                div()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(address.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(relative_used(used.as_deref(), cx)),
+                                            )
+                                    }
+                                })
+                                .icon(type_icon(profile.kind))
+                                .on_click(move |_, window, cx| {
+                                    let _ = view.update(cx, |this, cx| {
+                                        if this.sessions.contains_key(&id) {
+                                            this.follow_connection(id, false, cx);
+                                        } else {
+                                            this.connect_saved(id, window, cx);
+                                        }
+                                    });
+                                }),
+                            );
+                        }
+                        menu
+                    }),
+            )
+            .child(
+                Button::new("import-connections")
+                    .ghost()
+                    .icon(gpui_component::Icon::default().path("icons/import.svg"))
+                    .tooltip(crate::locale::t(cx, "dbwork.connections.import"))
+                    .dropdown_menu(move |mut menu, _, cx| {
+                        for (key, source) in [
+                            ("dbwork.import.navicat", true),
+                            ("dbwork.import.dbeaver", false),
+                        ] {
+                            let view = import_view.clone();
+                            menu =
+                                menu.item(PopupMenuItem::new(crate::locale::t(cx, key)).on_click(
+                                    move |_, window, cx| {
+                                        let _ = view.update(cx, |this, cx| {
+                                            this.import_connections(source, window, cx)
+                                        });
+                                    },
+                                ));
+                        }
+                        menu
+                    }),
+            )
+            .child(
+                Button::new("connection-grouping")
+                    .ghost()
+                    .icon(gpui_component::Icon::default().path("icons/group-list.svg"))
+                    .tooltip(crate::locale::t(cx, self.navigation.mode.key()))
+                    .dropdown_menu(move |mut menu, _, cx| {
+                        for mode in [
+                            GroupMode::Group,
+                            GroupMode::Environment,
+                            GroupMode::Date,
+                            GroupMode::UsedDate,
+                        ] {
+                            let v = view.clone();
+                            menu = menu.item(
+                                PopupMenuItem::new(crate::locale::t(cx, mode.key())).on_click(
+                                    move |_, _, cx| {
+                                        let _ = v.update(cx, |this, cx| {
+                                            this.navigation.mode = mode;
+                                            this.persist_navigation();
+                                            cx.notify();
+                                        });
+                                    },
+                                ),
+                            );
+                        }
+                        if !can_add {
+                            return menu;
+                        }
+                        let v = view.clone();
+                        menu.item(
+                            PopupMenuItem::new(crate::locale::t(cx, mode.add_key())).on_click(
+                                move |_, window, cx| {
+                                    let _ = v.update(cx, |this, cx| this.add_category(window, cx));
+                                },
+                            ),
+                        )
+                    }),
+            )
             .into_any_element()
     }
     fn add_category(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_category_for(self.navigation.mode, window, cx);
+    }
+    fn add_category_for(&mut self, mode: GroupMode, window: &mut Window, cx: &mut Context<Self>) {
         use gpui_component::WindowExt;
-        let mode = self.navigation.mode;
         if matches!(mode, GroupMode::Date | GroupMode::UsedDate) {
             return;
         }
-        let input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(crate::locale::t(cx, mode.key())));
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::locale::t(
+                cx,
+                if mode == GroupMode::Group {
+                    "dbwork.project.name"
+                } else {
+                    "dbwork.environment.name"
+                },
+            ))
+        });
         let view = cx.entity().downgrade();
         window.open_dialog(cx, move |dialog, _, cx| {
             let input = input.clone();
             let field = input.clone();
             let view = view.clone();
             dialog
-                .title(crate::locale::t(cx, "dbwork.category.add"))
-                .child(Input::new(&input))
+                .title(crate::locale::t(cx, mode.add_key()))
+                .child(Input::new(&input).cleanable(true))
                 .child(
                     feedback::actions().child(feedback::close_button(cx)).child(
                         Button::new("save-category")
@@ -312,12 +433,22 @@ impl DatabaseView {
                                     if !list.contains(&name) {
                                         list.push(name.clone());
                                     }
+                                    if mode == GroupMode::Group {
+                                        this.navigation.mode = GroupMode::Group;
+                                    }
                                     this.persist_navigation();
                                     cx.notify();
                                 });
                                 window.close_dialog(cx);
                                 feedback::success(
-                                    crate::locale::t(cx, "feedback.category.saved"),
+                                    crate::locale::t(
+                                        cx,
+                                        if mode == GroupMode::Group {
+                                            "dbwork.project.added"
+                                        } else {
+                                            "dbwork.environment.added"
+                                        },
+                                    ),
                                     cx,
                                 );
                             }),
@@ -343,21 +474,73 @@ impl DatabaseView {
         }
     }
     pub(super) fn render_type_picker(&self, cx: &Context<Self>) -> AnyElement {
+        let filter = self.text("type_filter", cx).to_lowercase();
+        let kinds = DatabaseKind::ALL
+            .into_iter()
+            .filter(|kind| kind.label().to_lowercase().contains(&filter))
+            .collect::<Vec<_>>();
         div()
             .v_flex()
             .size_full()
             .p_4()
             .gap_4()
-            .child(div().text_lg().child("新建连接 · 选择数据库类型"))
-            .child("选择类型后填写连接信息，可随时返回切换。")
-            .children(DatabaseKind::ALL.into_iter().map(|kind| {
-                Button::new(SharedString::from(format!("pick-{}", kind.label())))
-                    .icon(type_icon(kind))
-                    .label(kind.label())
-                    .on_click(
-                        cx.listener(move |this, _, window, cx| this.choose_type(kind, window, cx)),
+            .child(
+                div()
+                    .text_lg()
+                    .child(crate::locale::t(cx, "grid.connection.choose")),
+            )
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        Input::new(&self.fields["type_filter"])
+                            .cleanable(true)
+                            .flex_1(),
                     )
-            }))
+                    .children(
+                        [
+                            (true, IconName::LayoutDashboard, "grid.view.icons"),
+                            (false, IconName::Menu, "grid.view.list"),
+                        ]
+                        .into_iter()
+                        .map(|(grid, icon, key)| {
+                            Button::new(key)
+                                .ghost()
+                                .icon(icon)
+                                .selected(self.type_grid == grid)
+                                .tooltip(crate::locale::t(cx, key))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.type_grid = grid;
+                                    cx.notify();
+                                }))
+                        }),
+                    ),
+            )
+            .when(kinds.is_empty(), |el| {
+                el.child(crate::locale::t(cx, "grid.filter.empty"))
+            })
+            .child(
+                div()
+                    .id("database-types")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .flex()
+                    .gap_3()
+                    .when(self.type_grid, |el| el.flex_wrap().content_start())
+                    .when(!self.type_grid, |el| el.flex_col())
+                    .children(kinds.into_iter().map(|kind| {
+                        Button::new(SharedString::from(format!("pick-{}", kind.label())))
+                            .when(self.type_grid, |el| el.w(px(144.)).h(px(92.)).flex_col())
+                            .when(!self.type_grid, |el| el.w_full().justify_start())
+                            .icon(type_icon(kind))
+                            .label(kind.label())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.choose_type(kind, window, cx)
+                            }))
+                    })),
+            )
             .into_any_element()
     }
     fn choose_type(&mut self, kind: DatabaseKind, window: &mut Window, cx: &mut Context<Self>) {
@@ -451,26 +634,6 @@ impl DatabaseView {
         use gpui_component::resizable::{resizable_panel, v_resizable};
         let search = self.search.read(cx).value().trim().to_lowercase();
         let mut sections = Vec::new();
-        if !matches!(self.navigation.mode, GroupMode::Date | GroupMode::UsedDate)
-            && !self.navigation.recent.is_empty()
-        {
-            let recent = self
-                .navigation
-                .recent
-                .iter()
-                .filter_map(|id| self.profiles.iter().find(|p| p.id == *id))
-                .take(5)
-                .cloned()
-                .collect::<Vec<_>>();
-            sections.push(self.connection_section(
-                "__recent",
-                crate::locale::t(cx, "dbwork.recent").to_string(),
-                recent,
-                true,
-                &search,
-                cx,
-            ));
-        }
         for name in self.ordered_groups() {
             let members = self
                 .profiles
@@ -512,7 +675,7 @@ impl DatabaseView {
                         cx.notify();
                     })),
             )
-            .child(Input::new(&self.search))
+            .child(Input::new(&self.search).cleanable(true))
             .child(
                 div()
                     .id("connection-sections")
@@ -614,29 +777,21 @@ impl DatabaseView {
                     })),
             );
         if !recent && !matches!(self.navigation.mode, GroupMode::Date | GroupMode::UsedDate) {
-            header = header
-                .child(
-                    div()
-                        .id(SharedString::from(format!("grip-{key}")))
-                        .w(px(24.))
-                        .h(px(28.))
-                        .flex_shrink_0()
-                        .h_flex()
-                        .justify_center()
-                        .cursor_grab()
-                        .child(gpui_component::Icon::new(IconName::Menu))
-                        .on_drag(GroupDrag(drag), |drag, _, _, cx| {
-                            cx.stop_propagation();
-                            cx.new(|_| drag.clone())
-                        }),
-                )
-                .child(
-                    Button::new(SharedString::from(format!("add-category-{key}")))
-                        .ghost()
-                        .icon(IconName::Plus)
-                        .tooltip(crate::locale::t(cx, "dbwork.category.add"))
-                        .on_click(cx.listener(|this, _, window, cx| this.add_category(window, cx))),
-                );
+            header = header.child(
+                div()
+                    .id(SharedString::from(format!("grip-{key}")))
+                    .w(px(24.))
+                    .h(px(28.))
+                    .flex_shrink_0()
+                    .h_flex()
+                    .justify_center()
+                    .cursor_grab()
+                    .child(gpui_component::Icon::new(IconName::Menu))
+                    .on_drag(GroupDrag(drag), |drag, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.new(|_| drag.clone())
+                    }),
+            );
         }
         let mut block = div()
             .id(SharedString::from(format!("connection-section-{key}")))
@@ -745,7 +900,7 @@ impl DatabaseView {
                                             {
                                                 this.connect_saved(id, window, cx);
                                             } else {
-                                                this.select(id, window, cx);
+                                                this.follow_connection(id, false, cx);
                                             }
                                         },
                                     )),
@@ -839,4 +994,31 @@ fn connection_address(p: &Profile) -> String {
             .into_owned();
     }
     format!("{}:{}/{}", p.host, p.port, p.database)
+}
+
+fn relative_used(at: Option<&str>, cx: &App) -> SharedString {
+    let Some(at) = at.and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok()) else {
+        return crate::locale::t(cx, "dbwork.recent.unknown");
+    };
+    let seconds = (chrono::Utc::now() - at.with_timezone(&chrono::Utc))
+        .num_seconds()
+        .max(0);
+    let (key, n) = if seconds < 60 {
+        ("dbwork.recent.now", 0)
+    } else if seconds < 3600 {
+        ("dbwork.recent.minutes", seconds / 60)
+    } else if seconds < 86400 {
+        ("dbwork.recent.hours", seconds / 3600)
+    } else if seconds < 2592000 {
+        ("dbwork.recent.days", seconds / 86400)
+    } else if seconds < 31536000 {
+        ("dbwork.recent.months", seconds / 2592000)
+    } else {
+        ("dbwork.recent.years", seconds / 31536000)
+    };
+    if n == 0 {
+        crate::locale::t(cx, key)
+    } else {
+        crate::locale::tr(cx, key, &[("n", &n.to_string())])
+    }
 }

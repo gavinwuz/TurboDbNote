@@ -10,7 +10,11 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+pub mod connection_import;
+pub mod copy;
+pub mod notebook_query;
 mod remote;
+pub mod transfer;
 pub mod workbench;
 use remote::{HttpDatabase, RedisDatabase};
 
@@ -44,8 +48,18 @@ pub enum OperationKind {
         database: String,
         object: ObjectItem,
     },
+    CopyDatabase {
+        source: String,
+        target: String,
+        #[serde(default)]
+        charset: String,
+        #[serde(default)]
+        include_data: bool,
+    },
     CreateDatabase {
         name: String,
+        #[serde(default)]
+        charset: String,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,6 +78,11 @@ pub enum OperationResult {
     },
     Details(Vec<(String, String)>),
     Created(String),
+    Copied {
+        name: String,
+        tables: usize,
+        include_data: bool,
+    },
 }
 pub fn objects(items: Vec<ObjectItem>) -> OperationResult {
     let truncated = items.len() > 500;
@@ -118,6 +137,38 @@ pub fn validate_name(kind: DatabaseKind, name: &str) -> Result<(), String> {
         return Err("该类型不支持服务器建库".into());
     }
     Ok(())
+}
+pub fn create_database_sql(
+    kind: DatabaseKind,
+    name: &str,
+    charset: &str,
+) -> Result<String, String> {
+    validate_name(kind, name)?;
+    if !charset.is_empty()
+        && (charset.len() > 40
+            || !charset
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+    {
+        return Err("字符集名称无效".into());
+    }
+    let quoted = if kind == DatabaseKind::MySql {
+        quote_mysql(name)
+    } else {
+        quote_pg(name)
+    };
+    let suffix = if charset.is_empty() {
+        String::new()
+    } else {
+        match kind {
+            DatabaseKind::MySql if !charset.contains('-') => {
+                format!(" CHARACTER SET {}", quote_mysql(charset))
+            }
+            DatabaseKind::PostgreSql => format!(" ENCODING '{charset}' TEMPLATE template0"),
+            _ => return Err("当前数据库类型不支持此字符集设置".into()),
+        }
+    };
+    Ok(format!("CREATE DATABASE {quoted}{suffix}"))
 }
 pub fn quote_mysql(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
@@ -382,6 +433,9 @@ async fn pg_operation(
     op: &Operation,
 ) -> Result<OperationResult, String> {
     match &op.kind {
+        OperationKind::CopyDatabase { .. } => {
+            Err("PostgreSQL 请使用原生导出/导入工具复制数据库".into())
+        }
         OperationKind::Workbench(r) => workbench::run(c, p.kind, "", r)
             .await
             .map(|r| OperationResult::Workbench(Box::new(r))),
@@ -392,9 +446,8 @@ async fn pg_operation(
                 vec![p.database.clone()]
             },
         )),
-        OperationKind::CreateDatabase { name } => {
-            validate_name(p.kind, name)?;
-            sqlx::query(&format!("CREATE DATABASE {}", quote_pg(name)))
+        OperationKind::CreateDatabase { name, charset } => {
+            sqlx::query(&create_database_sql(p.kind, name, charset)?)
                 .execute(c)
                 .await
                 .map_err(db_error)?;
@@ -424,6 +477,11 @@ async fn sqlite_operation(
     op: &Operation,
 ) -> Result<OperationResult, String> {
     match &op.kind {
+        OperationKind::CopyDatabase {
+            target,
+            include_data,
+            ..
+        } => copy::sqlite(c, target, *include_data).await,
         OperationKind::Workbench(r) => workbench::run(c, p.kind, "", r)
             .await
             .map(|r| OperationResult::Workbench(Box::new(r))),
@@ -527,6 +585,12 @@ async fn mysql_inner(
     op: &Operation,
 ) -> Result<OperationResult, String> {
     match &op.kind {
+        OperationKind::CopyDatabase {
+            source,
+            target,
+            charset,
+            include_data,
+        } => copy::mysql(c, source, target, charset, *include_data).await,
         OperationKind::Workbench(r) => workbench::run(c, p.kind, "5.6+", r)
             .await
             .map(|r| OperationResult::Workbench(Box::new(r))),
@@ -544,9 +608,8 @@ async fn mysql_inner(
             }
             Ok(OperationResult::Databases(out))
         }
-        OperationKind::CreateDatabase { name } => {
-            validate_name(p.kind, name)?;
-            sqlx::query(&format!("CREATE DATABASE {}", quote_mysql(name)))
+        OperationKind::CreateDatabase { name, charset } => {
+            sqlx::query(&create_database_sql(p.kind, name, charset)?)
                 .execute(c)
                 .await
                 .map_err(db_error)?;
@@ -693,5 +756,23 @@ mod tests {
         }
         drop(session);
         assert!(matches!(events.recv().await.unwrap(), Event::Disconnected));
+    }
+}
+
+#[cfg(test)]
+mod create_charset_tests {
+    use super::*;
+    #[test]
+    fn charset_is_explicit_and_quoted() {
+        assert_eq!(
+            create_database_sql(DatabaseKind::MySql, "new`db", "gbk").unwrap(),
+            "CREATE DATABASE `new``db` CHARACTER SET `gbk`"
+        );
+        assert!(create_database_sql(DatabaseKind::MySql, "demo", "utf8;DROP").is_err());
+        assert_eq!(
+            create_database_sql(DatabaseKind::PostgreSql, "demo", "UTF8").unwrap(),
+            "CREATE DATABASE \"demo\" ENCODING 'UTF8' TEMPLATE template0"
+        );
+        assert!(create_database_sql(DatabaseKind::ClickHouse, "demo", "UTF8").is_err());
     }
 }

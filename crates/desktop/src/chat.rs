@@ -35,6 +35,7 @@ struct LogLine {
     error: bool,
 }
 pub struct AiLog {
+    journal: crate::operation_log::Journal,
     focus: FocusHandle,
     lines: VecDeque<LogLine>,
     scroll: ScrollHandle,
@@ -42,7 +43,12 @@ pub struct AiLog {
 }
 impl AiLog {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let directory = crate::preferences::Preferences::path()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("logs")))
+            .unwrap_or_else(|| std::env::temp_dir().join("turbodbnote-logs"));
         let mut log = Self {
+            journal: crate::operation_log::Journal::new(directory),
             focus: cx.focus_handle(),
             lines: VecDeque::new(),
             scroll: ScrollHandle::new(),
@@ -50,6 +56,60 @@ impl AiLog {
         };
         log.push(turbodbn_diagnostics::status().to_owned(), false, cx);
         log
+    }
+    pub(crate) fn operation(
+        &mut self,
+        event: crate::operation_log::Record,
+        cx: &mut Context<Self>,
+    ) {
+        self.journal.write(&event);
+        let kind = crate::locale::t(cx, event.kind.key());
+        let phase = crate::locale::t(cx, event.phase.key());
+        let task = event
+            .task
+            .simple()
+            .to_string()
+            .chars()
+            .take(8)
+            .collect::<String>();
+        let class = if event.failure == "-" {
+            String::new()
+        } else {
+            format!(" · {}", event.failure)
+        };
+        let text = if event.rows == 0 && event.bytes == 0 {
+            crate::locale::tr(
+                cx,
+                "output.operation.line_brief",
+                &[
+                    ("task", &task),
+                    ("kind", kind.as_ref()),
+                    ("phase", phase.as_ref()),
+                    ("elapsed", &event.elapsed_ms.to_string()),
+                    ("class", &class),
+                ],
+            )
+        } else {
+            crate::locale::tr(
+                cx,
+                "output.operation.line",
+                &[
+                    ("task", &task),
+                    ("kind", kind.as_ref()),
+                    ("phase", phase.as_ref()),
+                    ("elapsed", &event.elapsed_ms.to_string()),
+                    ("rows", &event.rows.to_string()),
+                    ("bytes", &event.bytes.to_string()),
+                    ("class", &class),
+                ],
+            )
+        }
+        .to_string();
+        self.push(
+            text,
+            matches!(event.phase, crate::operation_log::Phase::Failed),
+            cx,
+        );
     }
     fn push(&mut self, text: String, error: bool, cx: &mut Context<Self>) {
         if self.lines.len() == 200 {
@@ -82,9 +142,25 @@ impl Panel for AiLog {
             .gap_2()
             .child(IconName::SquareTerminal)
             .child(crate::locale::t(cx, "panel.output.title"))
+            .id("open-output-layout")
+            .on_click(|_, _, cx| {
+                let router = cx.global::<crate::tabs::TabRouter>().0.clone();
+                router.update(cx, |_, cx| {
+                    cx.emit(crate::tabs::CloseTabs {
+                        name: "ai-output".into(),
+                        mode: crate::tabs::CloseMode::Current,
+                    })
+                });
+            })
     }
     fn toolbar_buttons(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<Vec<Button>> {
+        let directory = self.journal.directory.clone();
         Some(vec![
+            Button::new("open-operation-logs")
+                .ghost()
+                .icon(IconName::FolderOpen)
+                .tooltip(crate::locale::t(cx, "output.operation.open_logs"))
+                .on_click(move |_, _, cx| cx.reveal_path(&directory)),
             Button::new("follow-log")
                 .ghost()
                 .icon(IconName::ArrowDown)
@@ -161,6 +237,18 @@ impl Render for AiLog {
             .track_focus(&self.focus)
             .font_family(cx.theme().mono_font_family.clone())
             .text_size(rems(crate::typography::BODY))
+            .when(
+                self.journal
+                    .failed
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                |el| {
+                    el.child(
+                        div()
+                            .text_color(cx.theme().danger)
+                            .child(crate::locale::t(cx, "output.operation.disk_failed")),
+                    )
+                },
+            )
             .child(
                 div()
                     .id("ai-log-lines")
@@ -1809,6 +1897,7 @@ impl ChatView {
             .child(crate::locale::t(cx, "agents.executable.label"))
             .child(
                 Input::new(&self.path)
+                    .cleanable(true)
                     .text_size(rems(crate::typography::BODY))
                     .disabled(self.connection.is_some() || self.saving),
             )
@@ -1887,6 +1976,7 @@ impl ChatView {
             .child(crate::locale::t(cx, "agents.directory.label"))
             .child(
                 Input::new(&self.cwd)
+                    .cleanable(true)
                     .text_size(rems(crate::typography::BODY))
                     .disabled(self.connection.is_some() || self.saving),
             )
@@ -2131,7 +2221,7 @@ impl Render for ChatView {
                         .child(
                             Button::new("retry-connect")
                                 .ghost()
-                                .icon(IconName::Redo)
+                                .icon(crate::assets::refresh_icon())
                                 .w(px(32.))
                                 .h(px(32.))
                                 .p_0()

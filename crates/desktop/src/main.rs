@@ -17,11 +17,16 @@ mod drivers;
 mod feedback;
 mod locale;
 mod locale_catalog;
+mod note_library;
+mod notebook;
+mod operation_log;
 mod panels;
 mod preferences;
+mod query_grid;
 mod settings;
 mod table_view;
 mod tabs;
+use turbodbn_services::database::transfer;
 mod typography;
 #[cfg(target_os = "windows")]
 mod windows_icon;
@@ -110,7 +115,7 @@ fn main() {
             ))),
             window_min_size: Some(size(px(1000.), px(700.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("TurboDbNote".into()),
+                title: Some("TurboDBNote".into()),
                 ..TitleBar::title_bar_options()
             }),
             ..Default::default()
@@ -118,7 +123,7 @@ fn main() {
         cx.open_window(options, |window, cx| {
             #[cfg(target_os = "windows")]
             if let Err(error) = windows_icon::install(window) {
-                eprintln!("Unable to set TurboDbNote window icons: {error}");
+                eprintln!("Unable to set TurboDBNote window icons: {error}");
             }
             let view = cx.new(|cx| workspace::Workspace::new(window, cx));
             let weak = view.downgrade();
@@ -128,7 +133,7 @@ fn main() {
             });
             cx.new(|cx| Root::new(view, window, cx))
         })
-        .expect("Unable to open TurboDbNote window");
+        .expect("Unable to open TurboDBNote window");
         cx.activate(true);
     });
 }

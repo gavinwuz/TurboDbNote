@@ -14,6 +14,9 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'windows-sdk.ps1')
 . (Join-Path $PSScriptRoot 'prepare-package-build.ps1')
 . (Join-Path $PSScriptRoot 'stage-crashsight.ps1')
+$targetRoot = Join-Path $root 'target'
+New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
+$packageLock = [IO.File]::Open((Join-Path $targetRoot 'package-build.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
 Push-Location $root
 try {
     if ($LegacySourceArchive -and -not $LegacyDriverArchive) { throw 'LegacySourceArchive requires LegacyDriverArchive' }
@@ -35,7 +38,7 @@ try {
     if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -ne "v$version") {
         throw 'Git tag and Cargo version do not match'
     }
-    $name = "TurboDbNote-v$version-windows-x64"
+    $name = "TurboDBNote-v$version-windows-x64"
     $output = [IO.Path]::GetFullPath((Join-Path $root $OutputDirectory))
     $stage = Join-Path $output $name
     $zip = Join-Path $output "$name-portable.zip"
@@ -58,7 +61,7 @@ try {
     $exe = Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote.exe'
     Invoke-Checked python @('scripts/verify-windows-icon.py', $exe)
     $info = (Get-Item -LiteralPath $exe).VersionInfo
-    if ($info.FileVersion -ne $version -or $info.ProductVersion -ne $version -or $info.ProductName -ne 'TurboDbNote') {
+    if ($info.FileVersion -ne $version -or $info.ProductVersion -ne $version -or $info.ProductName -ne 'TurboDBNote') {
         throw 'Windows VERSIONINFO and Cargo version do not match'
     }
     $commit = & git rev-parse HEAD
@@ -78,7 +81,7 @@ try {
     if ($LegacySourceArchive) { $driverArguments += (Resolve-Path -LiteralPath $LegacySourceArchive).Path }
     Invoke-Checked cargo $driverArguments
     # Include the exact application source used for this build alongside the third-party source.
-    $sourceStage = Join-Path $stage 'sources/TurboDbNote'
+    $sourceStage = Join-Path $stage 'sources/TurboDBNote'
     $sourceFiles = & git ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) { throw 'Unable to enumerate release source' }
     foreach ($sourceFile in ($sourceFiles | Sort-Object -Unique)) {
@@ -102,7 +105,7 @@ try {
     $notes | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.md') -Encoding utf8
     $notesZh | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.zh-CN.md') -Encoding utf8
     @"
-TurboDbNote v$version (Preview) / Windows x64
+TurboDBNote v$version (Preview) / Windows x64
 Run turbodbnote.exe from this extracted folder.
 Edits are in-memory only and are LOST when the app exits.
 Note-file saving and Notebook SQL cell execution are not available yet.
@@ -129,4 +132,5 @@ This build is unsigned. Read RELEASE-NOTES.md before use.
     Write-Output "Checksums: $checksum"
 } finally {
     Pop-Location
+    $packageLock.Dispose()
 }

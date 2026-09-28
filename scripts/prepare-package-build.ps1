@@ -6,7 +6,21 @@ function New-PackageBuildWorkspace {
     $metadata = $json | ConvertFrom-Json
     $gpui = @($metadata.packages | Where-Object { $_.name -eq 'gpui' -and $_.version -eq '0.2.2' })
     if ($gpui.Count -ne 1) { throw 'Build adapter requires exactly gpui 0.2.2; review it before upgrading' }
-    $workspace = Join-Path $Root ('target/package-builds/' + [guid]::NewGuid().ToString('N'))
+    $workspace = [IO.Path]::GetFullPath((Join-Path $Root 'target/package-builds/current'))
+    $allowed = [IO.Path]::GetFullPath((Join-Path $Root 'target/package-builds')) + [IO.Path]::DirectorySeparatorChar
+    if (-not $workspace.StartsWith($allowed, [StringComparison]::OrdinalIgnoreCase)) { throw 'Invalid isolated workspace' }
+    foreach ($ancestor in @((Join-Path $Root 'target'), (Join-Path $Root 'target/package-builds'), $workspace)) {
+        if ((Test-Path -LiteralPath $ancestor) -and ((Get-Item -LiteralPath $ancestor).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Refusing linked build workspace' }
+    }
+    # Caller holds the package lock for the complete build; replace only generated source.
+    foreach ($name in @('crates', 'upstream')) {
+        $generated = Join-Path $workspace $name
+        if (Test-Path -LiteralPath $generated) {
+            if ((Get-Item -LiteralPath $generated).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing linked build source' }
+            if (Get-ChildItem -LiteralPath $generated -Recurse -Force | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }) { throw 'Refusing links inside generated source' }
+            Remove-Item -LiteralPath $generated -Recurse -Force
+        }
+    }
     New-Item -ItemType Directory -Path $workspace -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $Root 'Cargo.toml'), (Join-Path $Root 'Cargo.lock') -Destination $workspace
     Copy-Item -LiteralPath (Join-Path $Root 'crates') -Destination $workspace -Recurse

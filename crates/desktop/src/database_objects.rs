@@ -5,6 +5,7 @@ impl DatabaseView {
         self.object_scroll = UniformListScrollHandle::new();
         self.selected_object = None;
         self.object_items.clear();
+        self.object_catalog_loaded = false;
         self.object_details.clear();
         self.object_cursor = None;
         self.catalog_objects.clear();
@@ -39,12 +40,15 @@ impl DatabaseView {
             self.active_operation = None;
         }
         let names = self.catalog(&profile);
-        let database = self
-            .navigation
-            .databases
-            .get(&id)
-            .filter(|db| names.contains(db))
-            .cloned()
+        let database = (!profile.database.is_empty())
+            .then(|| profile.database.clone())
+            .or_else(|| {
+                self.navigation
+                    .databases
+                    .get(&id)
+                    .filter(|db| names.contains(db))
+                    .cloned()
+            })
             .or_else(|| names.first().cloned())
             .unwrap_or_else(|| {
                 if profile.kind == DatabaseKind::Sqlite {
@@ -87,6 +91,11 @@ impl DatabaseView {
         if self.states.get(&id).is_none_or(|s| s != "已连接") {
             return false;
         }
+        let log_kind = match &kind {
+            OperationKind::CreateDatabase { .. } => crate::operation_log::Kind::Create,
+            OperationKind::CopyDatabase { .. } => crate::operation_log::Kind::Copy,
+            _ => crate::operation_log::Kind::Query,
+        };
         self.request_sequence += 1;
         let request = self.request_sequence;
         if let Err(error) = session.request(Operation {
@@ -97,6 +106,7 @@ impl DatabaseView {
             cx.notify();
             return false;
         }
+        self.operation_log(id, log_kind, crate::operation_log::Phase::Started, None, cx);
         if let OperationKind::Details { object, .. } = &kind {
             self.selected_object = Some(object.clone());
         }
@@ -154,6 +164,22 @@ impl DatabaseView {
             return;
         }
         self.active_operation = None;
+        let log_kind = match &kind {
+            OperationKind::CreateDatabase { .. } => crate::operation_log::Kind::Create,
+            OperationKind::CopyDatabase { .. } => crate::operation_log::Kind::Copy,
+            _ => crate::operation_log::Kind::Query,
+        };
+        self.operation_log(
+            id,
+            log_kind,
+            if result.is_ok() {
+                crate::operation_log::Phase::Succeeded
+            } else {
+                crate::operation_log::Phase::Failed
+            },
+            result.as_ref().err().map(String::as_str),
+            cx,
+        );
         if result.is_ok() {
             self.remember_connection(id, cx);
         }
@@ -171,6 +197,7 @@ impl DatabaseView {
             Ok(OperationResult::Workbench(reply)) => match *reply {
                 Reply::Catalog { objects, notice } => {
                     self.catalog_objects = objects;
+                    self.object_catalog_loaded = true;
                     self.object_notice = if notice.is_empty() {
                         format!("{} 个对象", self.catalog_objects.len())
                     } else {
@@ -208,7 +235,11 @@ impl DatabaseView {
                     feedback::success(crate::locale::t(cx, "dbwork.executed"), cx);
                     self.schemas.clear();
                 }
-                Reply::Page { .. } => {}
+                Reply::Page { .. }
+                | Reply::GridPage { .. }
+                | Reply::Count(_)
+                | Reply::NotePrepared(_)
+                | Reply::NoteResult(_) => {}
             },
             Err(error) => {
                 self.pending_object_action = None;
@@ -247,6 +278,7 @@ impl DatabaseView {
                 } else {
                     self.object_items = items;
                 }
+                self.object_catalog_loaded = true;
                 self.object_cursor = cursor;
                 self.object_notice =
                     notice.unwrap_or_else(|| format!("{} 个对象", self.object_items.len()));
@@ -255,6 +287,19 @@ impl DatabaseView {
                 self.detail_scroll = UniformListScrollHandle::new();
                 self.object_details = details;
                 self.object_notice = "对象详情已更新".into();
+            }
+            Ok(OperationResult::Copied {
+                name,
+                tables,
+                include_data: _,
+            }) => {
+                self.object_notice = crate::locale::tr(
+                    cx,
+                    "dbwork.copy.done",
+                    &[("name", &name), ("count", &tables.to_string())],
+                )
+                .to_string();
+                feedback::success(self.object_notice.clone(), cx);
             }
             Ok(OperationResult::Created(name)) => {
                 self.status = format!("数据库已创建：{name}");
@@ -284,94 +329,345 @@ impl DatabaseView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.database_creation_dialog(id, None, window, cx);
+    }
+    fn database_creation_dialog(
+        &mut self,
+        id: Uuid,
+        source: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use std::{cell::Cell, rc::Rc};
         let Some(profile) = self.profiles.iter().find(|p| p.id == id).cloned() else {
             return;
         };
-        if !profile.kind.can_create_database() {
+        let copying = source.is_some();
+        let sqlite = profile.kind == DatabaseKind::Sqlite;
+        if copying && !matches!(profile.kind, DatabaseKind::MySql | DatabaseKind::Sqlite)
+            || !copying && !profile.kind.can_create_database()
+        {
             return;
         }
-        let input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(crate::locale::t(cx, "feedback.database.name"))
+        let legacy40 = self
+            .info
+            .get(&id)
+            .is_some_and(|info| info.version.starts_with("4.0"));
+        let supports_mb4 = self
+            .info
+            .get(&id)
+            .is_none_or(|info| mysql::modern_version(&info.version));
+        let show_charset =
+            matches!(profile.kind, DatabaseKind::MySql | DatabaseKind::PostgreSql) && !legacy40;
+        let target = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(if sqlite {
+                    String::new()
+                } else {
+                    source
+                        .as_ref()
+                        .map(|s| format!("{s}_copy"))
+                        .unwrap_or_default()
+                })
+                .placeholder(crate::locale::t(
+                    cx,
+                    if sqlite {
+                        "dbwork.copy.file"
+                    } else {
+                        "feedback.database.name"
+                    },
+                ))
         });
+        let charset = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::locale::t(
+                cx,
+                if copying {
+                    "dbwork.copy.charset"
+                } else {
+                    "dbwork.create.charset_default"
+                },
+            ))
+        });
+        let include_data = Rc::new(Cell::new(false));
         let view = cx.entity().downgrade();
         let generation = self.generation.get(&id).copied().unwrap_or_default();
         window.open_dialog(cx, move |dialog, _, cx| {
+            let target_field = target.clone();
+            let charset_field = charset.clone();
+            let data = include_data.clone();
             let view = view.clone();
-            let field = input.clone();
             let profile = profile.clone();
-            dialog
-                .title(crate::locale::t(cx, "dbwork.database.new"))
-                .w(px(500.))
-                .overlay_closable(false)
-                .child(
-                    div()
-                        .v_flex()
-                        .gap_3()
-                        .child(format!(
-                            "{} · {} · {}:{}",
-                            profile.name, profile.environment, profile.host, profile.port
-                        ))
-                        .child(Input::new(&input)),
-                )
-                .child(
-                    feedback::actions().child(feedback::close_button(cx)).child(
-                        Button::new("confirm-create-database")
-                            .primary()
-                            .icon(IconName::Plus)
-                            .label(crate::locale::t(cx, "feedback.database.create"))
-                            .on_click(move |_, window, cx| {
-                                let name = field.read(cx).value().trim().to_string();
-                                if let Err(error) =
-                                    turbodbn_services::database::validate_name(profile.kind, &name)
-                                {
-                                    feedback::error(error, cx);
-                                    return;
-                                }
-                                let view = view.clone();
-                                feedback::confirm(
-                                    crate::locale::t(cx, "feedback.database.confirm"),
-                                    format!(
-                                        "{} · {} / {}",
-                                        profile.name, profile.environment, name
-                                    ),
-                                    window,
-                                    cx,
-                                    move |window, cx| {
-                                        let sent = view
-                                            .update(cx, |this, cx| {
-                                                if this
-                                                    .generation
-                                                    .get(&id)
-                                                    .copied()
-                                                    .unwrap_or_default()
-                                                    != generation
-                                                {
-                                                    feedback::error(
-                                                        crate::locale::t(
-                                                            cx,
-                                                            "dbwork.context.changed",
-                                                        ),
-                                                        cx,
-                                                    );
-                                                    return false;
-                                                }
-                                                this.request_operation(
-                                                    id,
-                                                    OperationKind::CreateDatabase {
-                                                        name: name.clone(),
-                                                    },
+            let source = source.clone();
+            let mut fields = div()
+                .v_flex()
+                .gap_2()
+                .child(format!("{} · {}", profile.name, profile.environment))
+                .when_some(source.clone(), |el, source| {
+                    el.child(crate::locale::tr(
+                        cx,
+                        "dbwork.copy.source",
+                        &[("source", &source)],
+                    ))
+                })
+                .child(Input::new(&target));
+            if sqlite {
+                let field = target.clone();
+                let directory = std::path::Path::new(&profile.sqlite_path)
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .to_path_buf();
+                fields = fields.child(
+                    Button::new("copy-database-file")
+                        .icon(IconName::FolderOpen)
+                        .label(crate::locale::t(cx, "dbwork.copy.choose_file"))
+                        .on_click(move |_, window, cx| {
+                            let chosen =
+                                cx.prompt_for_new_path(&directory, Some("database-copy.db"));
+                            let field = field.clone();
+                            window
+                                .spawn(cx, async move |cx| {
+                                    if let Ok(Ok(Some(path))) = chosen.await {
+                                        let _ = cx.update(|window, cx| {
+                                            field.update(cx, |input, cx| {
+                                                input.set_value(
+                                                    path.display().to_string(),
+                                                    window,
                                                     cx,
                                                 )
                                             })
-                                            .unwrap_or(false);
-                                        if sent {
-                                            window.close_dialog(cx);
-                                        }
-                                    },
-                                );
+                                        });
+                                    }
+                                })
+                                .detach();
+                        }),
+                );
+            }
+            if show_charset {
+                let field = charset.clone();
+                let pg = profile.kind == DatabaseKind::PostgreSql;
+                fields = fields.child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(Input::new(&charset).flex_1())
+                        .child(
+                            Button::new("database-charset")
+                                .icon(IconName::ChevronDown)
+                                .tooltip(crate::locale::t(cx, "dbwork.create.charset"))
+                                .dropdown_menu(move |mut menu, _, cx| {
+                                    let choices = if pg {
+                                        vec!["", "UTF8", "LATIN1", "WIN1252"]
+                                    } else if supports_mb4 {
+                                        vec!["", "utf8mb4", "utf8", "gbk", "gb2312", "latin1"]
+                                    } else {
+                                        vec!["", "utf8", "gbk", "gb2312", "latin1"]
+                                    };
+                                    for value in choices {
+                                        let field = field.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(if value.is_empty() {
+                                                crate::locale::t(
+                                                    cx,
+                                                    if copying {
+                                                        "dbwork.copy.charset"
+                                                    } else {
+                                                        "dbwork.create.charset_default"
+                                                    },
+                                                )
+                                                .to_string()
+                                            } else {
+                                                value.to_string()
+                                            })
+                                            .on_click(move |_, window, cx| {
+                                                field.update(cx, |input, cx| {
+                                                    input.set_value(value, window, cx)
+                                                })
+                                            }),
+                                        );
+                                    }
+                                    menu
+                                }),
+                        ),
+                );
+            } else if legacy40 {
+                fields = fields.child(crate::locale::t(cx, "dbwork.create.legacy_charset"));
+            }
+            if copying {
+                let data = include_data.clone();
+                fields = fields
+                    .child(
+                        Switch::new("copy-database-data")
+                            .label(crate::locale::t(cx, "dbwork.copy.include_data"))
+                            .checked(include_data.get())
+                            .on_click(move |checked, _, cx| {
+                                data.set(*checked);
+                                cx.refresh_windows();
                             }),
-                    ),
-                )
+                    )
+                    .child(crate::locale::t(
+                        cx,
+                        if sqlite {
+                            "dbwork.copy.sqlite_scope"
+                        } else {
+                            "dbwork.copy.mysql_scope"
+                        },
+                    ));
+            }
+            dialog
+                .title(crate::locale::t(
+                    cx,
+                    if copying {
+                        "dbwork.database.copy"
+                    } else {
+                        "dbwork.database.new"
+                    },
+                ))
+                .w(px(560.))
+                .overlay_closable(false)
+                .child(fields)
+                .footer(move |_, _, _, cx| {
+                    let target = target_field.clone();
+                    let charset = charset_field.clone();
+                    let data = data.clone();
+                    let view = view.clone();
+                    let profile = profile.clone();
+                    let source = source.clone();
+                    vec![
+                        feedback::footer_actions()
+                            .child(feedback::close_button(cx))
+                            .child(
+                                Button::new("confirm-create-database")
+                                    .primary()
+                                    .icon(if copying {
+                                        IconName::Copy
+                                    } else {
+                                        IconName::Plus
+                                    })
+                                    .label(crate::locale::t(
+                                        cx,
+                                        if copying {
+                                            "dbwork.database.copy"
+                                        } else {
+                                            "feedback.database.create"
+                                        },
+                                    ))
+                                    .on_click(move |_, window, cx| {
+                                        let name = target.read(cx).value().trim().to_string();
+                                        let charset = charset.read(cx).value().trim().to_string();
+                                        let sql = if sqlite {
+                                            if !std::path::Path::new(&name).is_absolute()
+                                                || std::path::Path::new(&name).exists()
+                                            {
+                                                feedback::error(
+                                                    crate::locale::t(cx, "dbwork.copy.new_file"),
+                                                    cx,
+                                                );
+                                                return;
+                                            }
+                                            String::new()
+                                        } else {
+                                            match turbodbn_services::database::create_database_sql(
+                                                profile.kind,
+                                                &name,
+                                                &charset,
+                                            ) {
+                                                Ok(sql) => sql,
+                                                Err(error) => {
+                                                    feedback::error(error, cx);
+                                                    return;
+                                                }
+                                            }
+                                        };
+                                        let with_data = data.get();
+                                        let action = if let Some(source) = &source {
+                                            if source.eq_ignore_ascii_case(&name) {
+                                                feedback::error(
+                                                    crate::locale::t(cx, "dbwork.copy.different"),
+                                                    cx,
+                                                );
+                                                return;
+                                            }
+                                            OperationKind::CopyDatabase {
+                                                source: source.clone(),
+                                                target: name.clone(),
+                                                charset,
+                                                include_data: with_data,
+                                            }
+                                        } else {
+                                            OperationKind::CreateDatabase {
+                                                name: name.clone(),
+                                                charset,
+                                            }
+                                        };
+                                        let view = view.clone();
+                                        let display = if sqlite {
+                                            std::path::Path::new(&name)
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .into_owned()
+                                        } else {
+                                            name
+                                        };
+                                        let mut message = format!(
+                                            "{} · {} / {}",
+                                            profile.name, profile.environment, display
+                                        );
+                                        if copying {
+                                            message.push_str(&format!(
+                                                "\n{}",
+                                                crate::locale::t(
+                                                    cx,
+                                                    if with_data {
+                                                        "dbwork.copy.confirm_data"
+                                                    } else {
+                                                        "dbwork.copy.confirm_schema"
+                                                    }
+                                                )
+                                            ));
+                                        } else {
+                                            message.push_str(&format!("\n{sql}"));
+                                        }
+                                        feedback::confirm(
+                                            crate::locale::t(cx, "feedback.database.confirm"),
+                                            message,
+                                            window,
+                                            cx,
+                                            move |window, cx| {
+                                                let sent = view
+                                                    .update(cx, |this, cx| {
+                                                        if this
+                                                            .generation
+                                                            .get(&id)
+                                                            .copied()
+                                                            .unwrap_or_default()
+                                                            != generation
+                                                        {
+                                                            feedback::error(
+                                                                crate::locale::t(
+                                                                    cx,
+                                                                    "dbwork.context.changed",
+                                                                ),
+                                                                cx,
+                                                            );
+                                                            return false;
+                                                        }
+                                                        this.request_operation(
+                                                            id,
+                                                            action.clone(),
+                                                            cx,
+                                                        )
+                                                    })
+                                                    .unwrap_or(false);
+                                                if sent {
+                                                    window.close_dialog(cx);
+                                                }
+                                            },
+                                        );
+                                    }),
+                            ),
+                    ]
+                })
         });
     }
     pub fn render_objects(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -418,7 +714,7 @@ impl DatabaseView {
                     .gap_2()
                     .child(
                         Button::new("refresh-objects")
-                            .icon(IconName::Redo)
+                            .icon(crate::assets::refresh_icon())
                             .label("刷新")
                             .disabled(busy || !connected)
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -562,6 +858,6 @@ fn is_metadata_read(kind: &OperationKind) -> bool {
         OperationKind::Workbench(request) => {
             matches!(request.action, Action::Catalog | Action::Describe(_))
         }
-        OperationKind::CreateDatabase { .. } => false,
+        OperationKind::CreateDatabase { .. } | OperationKind::CopyDatabase { .. } => false,
     }
 }

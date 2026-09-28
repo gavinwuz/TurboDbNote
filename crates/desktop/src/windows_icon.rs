@@ -22,6 +22,7 @@ impl Drop for InstallGuard {
 }
 
 pub fn install_guard() -> std::io::Result<InstallGuard> {
+    // Compatibility identity shared with older installers; not the display brand.
     let name: Vec<u16> = "TurboDbNote.Running\0".encode_utf16().collect();
     // SAFETY: null security attributes and a valid NUL-terminated name. We hold
     // a handle, not mutex ownership; Inno checks whether the object exists.

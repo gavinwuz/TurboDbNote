@@ -1,7 +1,12 @@
+#[path = "database_import.rs"]
+mod import_ui;
 #[path = "database_navigation.rs"]
 mod navigation;
 #[path = "database_objects.rs"]
 mod objects_ui;
+#[path = "database_transfer.rs"]
+mod transfer_ui;
+pub(crate) use transfer_ui::Connection as SavedConnection;
 #[path = "database_workbench.rs"]
 mod workbench_ui;
 use crate::{connection_secret, connection_store, feedback};
@@ -34,7 +39,7 @@ use turbodbn_services::mysql::{self, Driver, Event, Profile, ServerInfo, Session
 use uuid::Uuid;
 
 #[derive(Clone)]
-struct DatabaseChoice(String);
+pub(crate) struct DatabaseChoice(pub(crate) String);
 impl SelectItem for DatabaseChoice {
     type Value = String;
     fn title(&self) -> SharedString {
@@ -51,8 +56,13 @@ impl SelectItem for DatabaseChoice {
 pub struct OpenDatabase;
 pub struct OpenObjects;
 pub struct DatabaseView {
+    pub(crate) output: Option<Entity<crate::chat::AiLog>>,
+    operation_started: HashMap<Uuid, std::time::Instant>,
     focus: FocusHandle,
     sidebar_split: Entity<gpui_component::resizable::ResizableState>,
+    object_database_picker: Option<Entity<SelectState<SearchableVec<String>>>>,
+    object_database_context: Option<(Uuid, String, Vec<String>)>,
+    object_database_subscription: Option<Subscription>,
     object_filter: Entity<InputState>,
     _object_filter: Subscription,
     catalog_objects: Vec<Object>,
@@ -62,6 +72,7 @@ pub struct DatabaseView {
     workbench_target: Option<WeakEntity<crate::table_view::TableView>>,
 
     choosing_type: bool,
+    type_grid: bool,
     typed_drafts: HashMap<DatabaseKind, (Profile, String)>,
     navigation: Navigation,
     nav_writer: async_channel::Sender<Navigation>,
@@ -72,6 +83,7 @@ pub struct DatabaseView {
     selected_object: Option<ObjectItem>,
     detail_scroll: UniformListScrollHandle,
     object_notice: String,
+    object_catalog_loaded: bool,
     active_operation: Option<(Uuid, u64, OperationKind)>,
     request_sequence: u64,
     object_scroll: UniformListScrollHandle,
@@ -110,14 +122,15 @@ pub struct DatabaseView {
     _search: Subscription,
     _inputs: Vec<Subscription>,
 }
-const FIELDS: [(&str, &str); 15] = [
+const FIELDS: [(&str, &str); 16] = [
     ("sqlite_path", "选择数据库文件"),
     ("charset", "utf8mb4 / gbk / 自定义字符集"),
     ("legacy", "兼容驱动库绝对路径"),
     ("name", "连接名称"),
-    ("group", "分组"),
+    ("group", "项目"),
     ("environment", "环境"),
     ("host", "主机"),
+    ("type_filter", "筛选数据库类型"),
     ("port", "端口"),
     ("user", "用户名"),
     ("password", "密码（可留空）"),
@@ -128,6 +141,69 @@ const FIELDS: [(&str, &str); 15] = [
     ("key", "客户端私钥路径"),
 ];
 impl DatabaseView {
+    pub(crate) fn note_databases(&self, id: Uuid) -> Vec<String> {
+        self.profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| {
+                let mut names = self.catalog(p);
+                if !p.database.is_empty() {
+                    names.push(p.database.clone());
+                }
+                names.sort();
+                names.dedup();
+                names
+            })
+            .unwrap_or_default()
+    }
+    pub(crate) fn note_profiles(&self) -> Vec<Profile> {
+        self.profiles.clone()
+    }
+    pub(crate) fn note_projects(&self) -> Vec<String> {
+        let mut projects = self
+            .navigation
+            .categories
+            .iter()
+            .cloned()
+            .chain(self.profiles.iter().map(|p| p.group.clone()))
+            .filter(|p| !p.trim().is_empty())
+            .collect::<Vec<_>>();
+        projects.sort();
+        projects.dedup();
+        projects.sort_by_key(|name| {
+            self.navigation
+                .order
+                .iter()
+                .position(|p| p == name)
+                .unwrap_or(usize::MAX)
+        });
+        projects
+    }
+    pub(crate) fn move_note_project(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
+        let mut projects = self.note_projects();
+        if let (Some(a), Some(b)) = (
+            projects.iter().position(|p| p == from),
+            projects.iter().position(|p| p == to),
+        ) {
+            let project = projects.remove(a);
+            projects.insert(b, project);
+            // Preserve the database sidebar's unassigned category position.
+            let unassigned = self.navigation.order.iter().position(|p| p == "未分组");
+            if let Some(position) = unassigned {
+                projects.insert(position.min(projects.len()), "未分组".into());
+            }
+            self.navigation.order = projects;
+            self.persist_navigation();
+            cx.notify();
+        }
+    }
+    pub(crate) fn ensure_note_project(&mut self, name: &str, cx: &mut Context<Self>) {
+        if !name.trim().is_empty() && !self.note_projects().iter().any(|p| p == name) {
+            self.navigation.categories.push(name.to_owned());
+            self.persist_navigation();
+            cx.notify();
+        }
+    }
     pub fn drivers(&self) -> Entity<crate::drivers::DriverManager> {
         self.drivers.clone()
     }
@@ -146,8 +222,7 @@ impl DatabaseView {
             {
                 let _ = cx.update(|window, cx| {
                     let _ = view.update(cx, |this, cx| {
-                        if this.editing.id == id && !this.saving && !this.sessions.contains_key(&id)
-                        {
+                        if this.editing.id == id && !this.saving {
                             this.fields["legacy"].update(cx, |input, cx| {
                                 input.set_value(path.display().to_string(), window, cx)
                             });
@@ -159,13 +234,17 @@ impl DatabaseView {
         })
         .detach();
     }
-    pub fn summary(&self) -> String {
+    pub fn summary(&self, cx: &App) -> SharedString {
         let count = self
             .states
             .values()
             .filter(|s| s.as_str() == "已连接")
             .count();
-        format!("数据库连接：{count} 个    ·    内存示例    ·    SQL Notebook")
+        crate::locale::tr(
+            cx,
+            "notes.connection_summary",
+            &[("count", &count.to_string())],
+        )
     }
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let file = Preferences::path()
@@ -184,6 +263,8 @@ impl DatabaseView {
                     cx.new(|cx| {
                         let input = InputState::new(window, cx).placeholder(match *key {
                             "name" => crate::locale::t(cx, "dbwork.connection.name.required"),
+                            "group" => crate::locale::t(cx, "dbwork.project.name"),
+                            "type_filter" => crate::locale::t(cx, "grid.connection.filter"),
                             "database" => {
                                 crate::locale::t(cx, "dbwork.connection.database.required")
                             }
@@ -226,6 +307,11 @@ impl DatabaseView {
             sidebar_split: cx.new(|_| gpui_component::resizable::ResizableState::default()),
             _object_filter: cx.observe(&object_filter, |_, _, cx| cx.notify()),
             object_filter,
+            output: None,
+            operation_started: HashMap::new(),
+            object_database_picker: None,
+            object_database_context: None,
+            object_database_subscription: None,
             catalog_objects: Vec::new(),
             schemas: HashMap::new(),
             expanded_objects: std::collections::HashSet::new(),
@@ -233,6 +319,7 @@ impl DatabaseView {
             pending_object_action: None,
             focus: cx.focus_handle(),
             choosing_type: false,
+            type_grid: true,
             typed_drafts: HashMap::new(),
             navigation,
             nav_writer,
@@ -243,6 +330,7 @@ impl DatabaseView {
             selected_object: None,
             detail_scroll: UniformListScrollHandle::new(),
             object_notice: String::new(),
+            object_catalog_loaded: false,
             active_operation: None,
             request_sequence: 0,
             object_scroll: UniformListScrollHandle::new(),
@@ -339,6 +427,37 @@ impl DatabaseView {
             });
         }));
         this
+    }
+    pub(crate) fn operation_log(
+        &mut self,
+        id: Uuid,
+        kind: crate::operation_log::Kind,
+        phase: crate::operation_log::Phase,
+        error: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::operation_log::{Phase, Record};
+        if matches!(phase, Phase::Started) {
+            self.operation_started.insert(id, std::time::Instant::now());
+        }
+        let mut record = Record::new(id, kind, phase);
+        record.source = Some(id);
+        record.elapsed_ms = self
+            .operation_started
+            .get(&id)
+            .map_or(0, |at| at.elapsed().as_millis() as u64);
+        if let Some(error) = error {
+            record.failure = crate::operation_log::failure_class(error);
+        }
+        if let Some(log) = &self.output {
+            log.update(cx, |log, cx| log.operation(record, cx));
+        }
+        if matches!(
+            phase,
+            Phase::Succeeded | Phase::Failed | Phase::Cancelled | Phase::Disconnected
+        ) {
+            self.operation_started.remove(&id);
+        }
     }
     fn text(&self, key: &str, cx: &App) -> String {
         self.fields[key].read(cx).value().trim().to_string()
@@ -438,33 +557,66 @@ impl DatabaseView {
     fn draft(&self, cx: &App) -> Result<Profile, String> {
         self.draft_for(false, cx)
     }
-    fn dirty(&self, cx: &App) -> bool {
+    pub(crate) fn dirty(&self, cx: &App) -> bool {
         self.clear_password
             || self.raw_draft(cx).ok().as_ref() != Some(&self.baseline)
             || self.fields["password"].read(cx).value().as_str() != self.loaded_password
     }
-    fn select(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    fn select(&mut self, id: Uuid, open_editor: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving {
             return;
         }
         if let Some(profile) = self.profiles.iter().find(|p| p.id == id).cloned() {
-            // Explicit discard confirmation is inline; selection changes never touch live sessions.
             if self.dirty(cx) {
-                self.status = "请先保存当前修改，或点击“取消修改”后选择其他连接".into();
-                feedback::error(self.status.clone(), cx);
-                // The tab may have been closed through the shared tab router; retain and reopen its draft.
-                cx.emit(OpenDatabase);
-                cx.notify();
+                if self.editing.id == id {
+                    if open_editor {
+                        cx.emit(OpenDatabase);
+                    }
+                    return;
+                }
+                if open_editor {
+                    let view = cx.entity().downgrade();
+                    feedback::confirm_labels(
+                        crate::locale::t(cx, "dbwork.draft.switch_title"),
+                        crate::locale::t(cx, "dbwork.draft.switch_body"),
+                        crate::locale::t(cx, "dbwork.draft.keep"),
+                        crate::locale::t(cx, "dbwork.draft.discard"),
+                        window,
+                        cx,
+                        move |window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                if !this.saving {
+                                    this.discard_editor(window, cx);
+                                    this.select(id, true, window, cx);
+                                }
+                            });
+                        },
+                    );
+                } else {
+                    feedback::error(crate::locale::t(cx, "dbwork.connection.unsaved"), cx);
+                }
                 return;
             }
             if !self.follow_connection(id, false, cx) {
                 return;
             }
             self.fill(profile, window, cx);
-            cx.emit(OpenDatabase);
+            if open_editor {
+                cx.emit(OpenDatabase);
+            }
         }
     }
     fn disconnect(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.sessions.contains_key(&id) {
+            self.operation_log(
+                id,
+                crate::operation_log::Kind::Connection,
+                crate::operation_log::Phase::Disconnected,
+                None,
+                cx,
+            );
+        }
+
         *self.generation.entry(id).or_default() += 1;
         self.tasks.remove(&id);
         self.sessions.remove(&id);
@@ -606,11 +758,9 @@ impl DatabaseView {
         }
         let attempted_mode = profile.tls;
         catalog_source.database.clear();
-        if discover {
-            profile.list_all_databases = true;
-            if profile.kind != DatabaseKind::PostgreSql {
-                profile.database.clear();
-            }
+        profile.list_all_databases = true;
+        if discover && profile.kind != DatabaseKind::PostgreSql {
+            profile.database.clear();
         }
         if mysql::uses_legacy(&profile)
             && profile.legacy_library.is_empty()
@@ -656,6 +806,13 @@ impl DatabaseView {
         self.states
             .insert(id, if test { "测试中…" } else { "连接中…" }.into());
         self.status = "正在后台连接…".into();
+        self.operation_log(
+            id,
+            crate::operation_log::Kind::Connection,
+            crate::operation_log::Phase::Started,
+            None,
+            cx,
+        );
         let credential_id = self.history.get(&id).and_then(|h| h.credential_id);
         let secret_path = self.file.clone();
         let secret = cx.background_executor().spawn(async move {
@@ -676,6 +833,13 @@ impl DatabaseView {
                     Err(error) => {
                         let _ = view.update(cx, |this, cx| {
                             if this.generation.get(&id) == Some(&generation) {
+                                this.operation_log(
+                                    id,
+                                    crate::operation_log::Kind::Connection,
+                                    crate::operation_log::Phase::Failed,
+                                    Some(&error),
+                                    cx,
+                                );
                                 feedback::error(error.clone(), cx);
                                 this.status = error;
                                 this.states.insert(id, "凭据错误".into());
@@ -708,6 +872,13 @@ impl DatabaseView {
                             let previous_status = this.status.clone();
                             match event {
                                 Event::Connected(info) => {
+                                    this.operation_log(
+                                        id,
+                                        crate::operation_log::Kind::Connection,
+                                        crate::operation_log::Phase::Succeeded,
+                                        None,
+                                        cx,
+                                    );
                                     if this.profiles.iter().find(|p| p.id == id).is_none_or(
                                         |saved| connection_secret::same_target(saved, &snapshot),
                                     ) {
@@ -738,6 +909,13 @@ impl DatabaseView {
                                     }
                                 }
                                 Event::Tested(info) => {
+                                    this.operation_log(
+                                        id,
+                                        crate::operation_log::Kind::Connection,
+                                        crate::operation_log::Phase::Succeeded,
+                                        None,
+                                        cx,
+                                    );
                                     if this.profiles.iter().find(|p| p.id == id).is_none_or(
                                         |saved| connection_secret::same_target(saved, &snapshot),
                                     ) {
@@ -781,6 +959,13 @@ impl DatabaseView {
                                     }
                                 }
                                 Event::Failed(error) => {
+                                    this.operation_log(
+                                        id,
+                                        crate::operation_log::Kind::Connection,
+                                        crate::operation_log::Phase::Failed,
+                                        Some(&error),
+                                        cx,
+                                    );
                                     if this
                                         .active_operation
                                         .as_ref()
@@ -876,6 +1061,25 @@ impl DatabaseView {
                 return;
             }
         };
+        if self.sessions.contains_key(&self.editing.id) {
+            let id = self.editing.id;
+            let view = cx.entity().downgrade();
+            feedback::confirm(
+                crate::locale::t(cx, "dbwork.edit.disconnect_title"),
+                crate::locale::t(cx, "dbwork.edit.disconnect_body"),
+                window,
+                cx,
+                move |window, cx| {
+                    let _ = view.update(cx, |this, cx| {
+                        if this.editing.id == id && !this.saving {
+                            this.disconnect(id, cx);
+                            this.save(window, cx);
+                        }
+                    });
+                },
+            );
+            return;
+        }
         let old_credential = self.history.get(&id).and_then(|h| h.credential_id);
         let file = self.file.clone();
         let payload = profile.clone();
@@ -1012,6 +1216,13 @@ impl DatabaseView {
             .map(|info| info.databases.clone())
             .unwrap_or_default()
     }
+    pub(crate) fn editor_busy(&self) -> bool {
+        self.saving
+    }
+    pub(crate) fn discard_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.typed_drafts.clear();
+        self.reset(window, cx);
+    }
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let profile = self
             .profiles
@@ -1028,7 +1239,7 @@ impl DatabaseView {
         {
             return;
         }
-        self.select(id, window, cx);
+        self.select(id, false, window, cx);
         if self.editing.id == id && !self.dirty(cx) {
             self.start(false, cx);
         }
@@ -1083,7 +1294,7 @@ impl DatabaseView {
                                         this.connect_saved(id, window, cx);
                                     }
                                 }
-                                "edit" => this.select(id, window, cx),
+                                "edit" => this.select(id, true, window, cx),
                                 "records" => this.show_storage(id, window, cx),
                                 "copy" => {
                                     if this.editing.id != id && this.dirty(cx) {
@@ -1264,7 +1475,6 @@ impl DatabaseView {
         } else {
             "feedback.password.empty"
         };
-        let id = self.editing.id;
         div()
             .v_flex()
             .gap_1()
@@ -1275,11 +1485,7 @@ impl DatabaseView {
                     .gap_2()
                     .child(
                         Input::new(&self.fields["password"])
-                            .disabled(
-                                self.saving
-                                    || self.password_load.is_some()
-                                    || self.sessions.contains_key(&id),
-                            )
+                            .disabled(self.saving || self.password_load.is_some())
                             .flex_1(),
                     )
                     .child(
@@ -1311,11 +1517,7 @@ impl DatabaseView {
                             .ghost()
                             .icon(IconName::Delete)
                             .tooltip(crate::locale::t(cx, "feedback.password.clear"))
-                            .disabled(
-                                self.saving
-                                    || self.sessions.contains_key(&id)
-                                    || (!available && !entered),
-                            )
+                            .disabled(self.saving || (!available && !entered))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 let view = cx.entity().downgrade();
                                 let snapshot = this.editing.id;
@@ -1369,7 +1571,33 @@ impl DatabaseView {
             .child(crate::locale::t(cx, label))
             .child(
                 Input::new(&self.fields[key])
-                    .disabled(self.saving || self.sessions.contains_key(&self.editing.id)),
+                    .when(key == "name", |input| {
+                        input.suffix(
+                            Button::new("generate-connection-name")
+                                .ghost()
+                                .icon(
+                                    gpui_component::Icon::default().path("icons/name-generate.svg"),
+                                )
+                                .tooltip(crate::locale::t(cx, "grid.connection.generate"))
+                                .disabled(self.saving)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    let p = Profile {
+                                        database: this.text("database", cx),
+                                        host: this.text("host", cx),
+                                        sqlite_path: this.text("sqlite_path", cx),
+                                        ..this.editing.clone()
+                                    };
+                                    let name = generated_connection_name(&p, &this.profiles);
+                                    this.fields["name"]
+                                        .update(cx, |input, cx| input.set_value(name, window, cx));
+                                    feedback::success(
+                                        crate::locale::t(cx, "grid.connection.generated"),
+                                        cx,
+                                    );
+                                })),
+                        )
+                    })
+                    .disabled(self.saving),
             )
             .when(
                 self.validation_requested && self.text(key, cx).is_empty(),
@@ -1390,10 +1618,7 @@ impl DatabaseView {
             .gap_1()
             .w_full()
             .child(label)
-            .child(
-                Input::new(&self.fields[key])
-                    .disabled(self.saving || self.sessions.contains_key(&self.editing.id)),
-            )
+            .child(Input::new(&self.fields[key]).disabled(self.saving))
             .into_any_element()
     }
     fn sync_database_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1429,7 +1654,6 @@ impl DatabaseView {
             |this, _, event: &SelectEvent<SearchableVec<DatabaseChoice>>, window, cx| {
                 if let SelectEvent::Confirm(Some(value)) = event
                     && !this.saving
-                    && !this.sessions.contains_key(&this.editing.id)
                     && this
                         .raw_draft(cx)
                         .is_ok_and(|p| this.catalog(&p).contains(value))
@@ -1465,11 +1689,7 @@ impl DatabaseView {
                         .h(px(28.))
                         .menu_width(px(320.))
                         .search_placeholder(crate::locale::t(cx, "dbwork.database.filter"))
-                        .disabled(
-                            self.saving
-                                || self.sessions.contains_key(&self.editing.id)
-                                || self.database_picker_items.is_empty(),
-                        ),
+                        .disabled(self.saving || self.database_picker_items.is_empty()),
                 )
                 .into_any_element()
         } else {
@@ -1477,28 +1697,39 @@ impl DatabaseView {
             Button::new(key)
                 .icon(IconName::ChevronDown)
                 .tooltip("选择已有值，也可直接输入")
-                .disabled(
-                    self.saving
-                        || self.sessions.contains_key(&self.editing.id)
-                        || values.is_empty(),
-                )
+                .disabled(self.saving || values.is_empty())
                 .dropdown_menu(move |mut menu, _, _| {
                     for value in &values {
                         let view = view.clone();
                         let value = value.clone();
-                        menu = menu.item(PopupMenuItem::new(value.clone()).on_click(
-                            move |_, window, cx| {
-                                let _ = view.update(cx, |this, cx| {
-                                    if this.saving || this.sessions.contains_key(&this.editing.id) {
-                                        return;
-                                    }
-                                    this.fields[key].update(cx, |input, cx| {
-                                        input.set_value(value.clone(), window, cx)
-                                    });
-                                    cx.notify();
+                        let item = if key == "environment" {
+                            let label = value.clone();
+                            PopupMenuItem::element(move |_, _| {
+                                div()
+                                    .h_flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .size(px(10.))
+                                            .rounded_sm()
+                                            .bg(navigation::environment_color(&label)),
+                                    )
+                                    .child(label.clone())
+                            })
+                        } else {
+                            PopupMenuItem::new(value.clone())
+                        };
+                        menu = menu.item(item.on_click(move |_, window, cx| {
+                            let _ = view.update(cx, |this, cx| {
+                                if this.saving {
+                                    return;
+                                }
+                                this.fields[key].update(cx, |input, cx| {
+                                    input.set_value(value.clone(), window, cx)
                                 });
-                            },
-                        ));
+                                cx.notify();
+                            });
+                        }));
                     }
                     menu.scrollable(true).max_h(px(320.))
                 })
@@ -1512,12 +1743,15 @@ impl DatabaseView {
             .text_sm()
             .child(if key == "database" {
                 crate::locale::t(cx, "dbwork.connection.database")
+            } else if key == "group" {
+                crate::locale::t(cx, "dbwork.project.field")
             } else {
                 SharedString::from(label)
             })
             .child(
                 Input::new(&self.fields[key])
-                    .disabled(self.saving || self.sessions.contains_key(&self.editing.id))
+                    .cleanable(true)
+                    .disabled(self.saving)
                     .suffix(dropdown),
             )
             .when(
@@ -1544,7 +1778,7 @@ impl DatabaseView {
         Button::new(id)
             .label(label)
             .icon(IconName::ChevronDown)
-            .disabled(self.saving || self.sessions.contains_key(&self.editing.id))
+            .disabled(self.saving)
             .dropdown_menu(move |mut menu, _, _| {
                 for (title, value) in &values {
                     let view = view.clone();
@@ -1560,10 +1794,7 @@ impl DatabaseView {
                                 cx,
                                 move |_, cx| {
                                     let _ = source.update(cx, |this, cx| {
-                                        if Some(this.editing.id) == snapshot
-                                            && !this.saving
-                                            && !this.sessions.contains_key(&this.editing.id)
-                                        {
+                                        if Some(this.editing.id) == snapshot && !this.saving {
                                             this.editing.tls = if value == "off" {
                                                 TlsMode::Disabled
                                             } else {
@@ -1688,7 +1919,7 @@ impl Render for DatabaseView {
                 div()
                     .h_flex()
                     .gap_3()
-                    .child(self.combo("group", "分组（可输入新分组）",self.profiles.iter().map(|p|p.group.clone()).chain(self.navigation.categories.clone()).collect(),cx))
+                    .child(self.combo("group", "",self.profiles.iter().map(|p|p.group.clone()).chain(self.navigation.categories.clone()).collect(),cx))
                     .child(self.combo("environment", "环境（可自定义）",["开发","测试","预发","正式"].into_iter().map(String::from).chain(self.profiles.iter().map(|p|p.environment.clone())).chain(self.navigation.environments.clone()).collect(),cx)),
             )
             .when(self.editing.kind!=DatabaseKind::Sqlite,|el|el
@@ -1724,11 +1955,11 @@ impl Render for DatabaseView {
             .when(self.editing.kind==DatabaseKind::Sqlite,|el|el
                 .child(self.required_field("sqlite_path","dbwork.connection.file","dbwork.connection.file.required",cx))
                 .child(div().h_flex().gap_2()
-                    .child(Button::new("sqlite-browse").icon(IconName::FolderOpen).label("选择文件").disabled(running||self.saving).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(false,window,cx))))
-                    .child(Button::new("sqlite-create").icon(IconName::Plus).label("新建文件").disabled(running||self.saving).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(true,window,cx)))))
-                .child(Switch::new("sqlite-read-only").label("只读连接").checked(self.editing.sqlite_read_only).disabled(running||self.saving)
+                    .child(Button::new("sqlite-browse").icon(IconName::FolderOpen).label("选择文件").disabled(self.saving).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(false,window,cx))))
+                    .child(Button::new("sqlite-create").icon(IconName::Plus).label("新建文件").disabled(self.saving).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(true,window,cx)))))
+                .child(Switch::new("sqlite-read-only").label("只读连接").checked(self.editing.sqlite_read_only).disabled(self.saving)
                     .on_click(cx.listener(|this,v:&bool,_,cx|{this.editing.sqlite_read_only = *v;cx.notify();}))))
-            .when(self.editing.kind==DatabaseKind::Redis,|el|el.child(Switch::new("redis-cluster").label("Redis 集群（仅 DB 0，浏览当前节点）").checked(self.editing.redis_cluster).disabled(running||self.saving)
+            .when(self.editing.kind==DatabaseKind::Redis,|el|el.child(Switch::new("redis-cluster").label("Redis 集群（仅 DB 0，浏览当前节点）").checked(self.editing.redis_cluster).disabled(self.saving)
                 .on_click(cx.listener(|this,v:&bool,_,cx|{this.editing.redis_cluster = *v;cx.notify();}))))
             .when(self.editing.kind!=DatabaseKind::Sqlite,|el|el
             .child(div().h_flex().gap_2().items_end()
@@ -1781,10 +2012,10 @@ impl Render for DatabaseView {
             .child(self.combo("charset","字符集（可自定义）",["utf8mb4","utf8","gb2312","gbk","latin1","server-default"].into_iter().map(String::from).collect(),cx))
             .when(mysql::uses_legacy(&self.editing),|el|el
                 .child(self.field("legacy","自定义 DLL 路径（留空使用已安装驱动）"))
-                .child(Button::new("browse-legacy-driver").label("浏览驱动库").disabled(running||self.saving)
+                .child(Button::new("browse-legacy-driver").label("浏览驱动库").disabled(self.saving)
                     .on_click(cx.listener(|this,_,window,cx|this.browse_legacy(window,cx))))
                 .child(Switch::new("allow-old-auth").label("允许 pre-4.1 旧密码认证（仅兼容连接）")
-                    .checked(self.editing.allow_old_auth).disabled(running||self.saving)
+                    .checked(self.editing.allow_old_auth).disabled(self.saving)
                     .on_click(cx.listener(|this,checked:&bool,window,cx|{
                         if !*checked{this.editing.allow_old_auth=false;cx.notify();return;}
                         let view=cx.entity().downgrade();let id=this.editing.id;
@@ -1816,7 +2047,7 @@ impl Render for DatabaseView {
             .when(mysql::uses_legacy(&self.editing),|el|el.child(div().v_flex().gap_2()
                 .child("当前兼容驱动暂不支持 TLS，可明确切换为不加密。")
                 .child(Button::new("legacy-disable-tls").icon(IconName::Settings2).label("切换为不加密")
-                    .disabled(running||self.saving||self.editing.tls==TlsMode::Disabled)
+                    .disabled(self.saving||self.editing.tls==TlsMode::Disabled)
                     .on_click(cx.listener(|this,_,window,cx|{let view=cx.entity().downgrade();let id=this.editing.id;feedback::confirm(crate::locale::t(cx,"feedback.tls.confirm"),crate::locale::t(cx,"feedback.tls.warning"),window,cx,move|_,cx|{let _=view.update(cx,|this,cx|{if this.editing.id==id&&!this.saving{this.editing.tls=TlsMode::Disabled;cx.notify();}});});})))))
             .when(tls_ui::is_local_host(&self.text("host",cx)),|el|el.child("本机地址：可按本地开发需求选择不加密，应用不会自动修改模式。"))
             .child(self.field("ca", "CA 证书路径（可选）"))
@@ -1851,7 +2082,7 @@ impl Render for DatabaseView {
                     .child(
                         Button::new("save-db").icon(IconName::Check)
                             .label("保存")
-                            .disabled(self.saving || running)
+                            .disabled(self.saving)
                             .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                     )
                     .child(self.more_actions(cx)),
@@ -1882,9 +2113,73 @@ fn required_connection_field(profile: &Profile, discover: bool) -> Option<&'stat
             .then_some("dbwork.connection.database.required")
     }
 }
+
+fn generated_connection_name(profile: &Profile, profiles: &[Profile]) -> String {
+    let prefix = if !profile.database.trim().is_empty() {
+        profile.database.clone()
+    } else if profile.kind == DatabaseKind::Sqlite {
+        std::path::Path::new(&profile.sqlite_path)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "SQLite".into())
+    } else {
+        profile.kind.label().to_string()
+    };
+    let prefix = prefix.chars().take(18).collect::<String>();
+    let used = |name: &str| {
+        profiles
+            .iter()
+            .any(|p| p.id != profile.id && p.name.to_lowercase() == name.to_lowercase())
+    };
+    if !used(&prefix) {
+        return prefix;
+    }
+    let host = if profile.host == "127.0.0.1" || profile.host.eq_ignore_ascii_case("localhost") {
+        "local".into()
+    } else {
+        profile
+            .host
+            .rsplit('.')
+            .next()
+            .unwrap_or("db")
+            .chars()
+            .take(8)
+            .collect::<String>()
+    };
+    let base = format!("{prefix}@{host}");
+    if !used(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base}-{n}"))
+        .find(|name| !used(name))
+        .unwrap()
+}
+
 #[cfg(test)]
 mod connection_form_tests {
     use super::*;
+    #[::core::prelude::v1::test]
+    fn generated_names_prefer_database_and_resolve_collisions() {
+        let mut draft = DatabaseView::empty_profile(DatabaseKind::MySql);
+        draft.database = "demo".into();
+        draft.host = "127.0.0.1".into();
+        let mut saved = draft.clone();
+        saved.id = Uuid::new_v4();
+        saved.name = "DEMO".into();
+        assert_eq!(generated_connection_name(&draft, &[]), "demo");
+        assert_eq!(
+            generated_connection_name(&draft, std::slice::from_ref(&saved)),
+            "demo@local"
+        );
+        let mut second = saved.clone();
+        second.id = Uuid::new_v4();
+        second.name = "demo@local".into();
+        assert_eq!(
+            generated_connection_name(&draft, &[saved, second]),
+            "demo@local-2"
+        );
+    }
     #[::core::prelude::v1::test]
     fn explicit_names_and_database_targets_are_required() {
         for kind in DatabaseKind::ALL {

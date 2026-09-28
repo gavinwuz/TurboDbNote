@@ -238,6 +238,52 @@ fn save_inner(
     tx.commit().map_err(db_error)?;
     Ok(history)
 }
+/// Import basic profiles as new records only; commit the entire selection atomically.
+pub fn import_profiles(
+    path: &Path,
+    profiles: &[Profile],
+) -> Result<HashMap<Uuid, History>, String> {
+    let mut c = open(path)?;
+    let tx = c
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let count: i64 = tx
+        .query_row("SELECT count(*) FROM connections", [], |r| r.get(0))
+        .map_err(db_error)?;
+    if count + profiles.len() as i64 > 200 {
+        return Err("最多保存 200 个连接".into());
+    }
+    let now = timestamp();
+    let mut history = HashMap::new();
+    for p in profiles {
+        p.validate()?;
+        if p.remember_password {
+            return Err("导入不接受密码引用".into());
+        }
+        if p.kind != turbodbn_services::DatabaseKind::Sqlite && p.database.trim().is_empty() {
+            return Err("请补全数据库名".into());
+        }
+        let data = serde_json::to_string(p).map_err(db_error)?;
+        if data.len() > 65536 {
+            return Err("连接记录过大".into());
+        }
+        tx.execute(
+            "INSERT INTO connections(id,profile,created_at,updated_at) VALUES(?1,?2,?3,?3)",
+            params![p.id.to_string(), data, now],
+        )
+        .map_err(db_error)?;
+        history.insert(
+            p.id,
+            History {
+                created_at: Some(now.clone()),
+                updated_at: Some(now.clone()),
+                ..Default::default()
+            },
+        );
+    }
+    tx.commit().map_err(db_error)?;
+    Ok(history)
+}
 pub fn mark_used(path: &Path, id: Uuid, at: &str) -> Result<(), String> {
     let c = open(path)?;
     c.execute("UPDATE connections SET last_used_at=?2 WHERE id=?1 AND (last_used_at IS NULL OR last_used_at<?2)",params![id.to_string(),at]).map_err(db_error)?;
@@ -566,6 +612,38 @@ mod tests {
             c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
                 .unwrap(),
             4
+        );
+    }
+}
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    #[test]
+    fn batch_import_never_overwrites_and_rolls_back_partial_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.db");
+        load(&path).unwrap();
+        let old = turbodbn_services::mysql::Profile {
+            name: "Existing".into(),
+            database: "demo".into(),
+            remember_password: false,
+            ..Default::default()
+        };
+        save(&path, &old, None).unwrap();
+        let mut new = old.clone();
+        new.id = Uuid::new_v4();
+        new.name = "Imported".into();
+        assert!(import_profiles(&path, &[new.clone(), old.clone()]).is_err());
+        assert_eq!(load(&path).unwrap().profiles.len(), 1);
+        import_profiles(&path, &[new]).unwrap();
+        let snapshot = load(&path).unwrap();
+        assert_eq!(snapshot.profiles.len(), 2);
+        assert!(
+            snapshot
+                .profiles
+                .iter()
+                .any(|p| p.id == old.id && p.name == "Existing")
         );
     }
 }

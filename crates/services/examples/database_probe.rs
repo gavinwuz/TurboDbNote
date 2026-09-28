@@ -79,7 +79,10 @@ fn main() {
         session
             .request(Operation {
                 id: 3,
-                kind: OperationKind::CreateDatabase { name: name.clone() },
+                kind: OperationKind::CreateDatabase {
+                    name: name.clone(),
+                    charset: String::new(),
+                },
             })
             .unwrap();
         match events.recv_blocking().unwrap() {
@@ -177,6 +180,7 @@ fn workbench_probe(
         } = call(Action::Page {
             object: object.clone(),
             offset,
+            page_size: 100,
         })
         else {
             panic!()
@@ -252,6 +256,7 @@ fn workbench_http_probe(session: &Session, events: &async_channel::Receiver<Even
     let Reply::Page { rows, .. } = call(Action::Page {
         object: table,
         offset: 0,
+        page_size: 100,
     }) else {
         panic!()
     };

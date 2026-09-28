@@ -1,16 +1,30 @@
+#[path = "grid_filter.rs"]
+mod filter_ui;
+#[path = "data_grid.rs"]
+mod grid_ui;
+#[path = "note_results.rs"]
+mod note_results;
+#[path = "grid_value.rs"]
+mod value_ui;
 use crate::{
     database::{DatabaseView, OpenTable},
     locale::t,
 };
 use gpui::{prelude::*, *};
+use gpui_component::table::{Table, TableState};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, StyledExt,
+    ActiveTheme, Disableable, IconName, Selectable, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
+    color_picker::{ColorPicker, ColorPickerEvent, ColorPickerState},
     dock::{Panel, PanelEvent},
-    input::{Input, InputState},
-    menu::{ContextMenuExt, PopupMenuItem},
+    input::{Input, InputEvent, InputState},
+    menu::{DropdownMenu, PopupMenuItem},
+    scroll::{Scrollbar, ScrollbarShow},
 };
+pub(crate) use grid_ui::column_icon;
+use std::{collections::BTreeMap, rc::Rc};
 use turbodbn_services::database::workbench::{self, Action, Reply, Request, Rows, Schema};
+use workbench::{Change, Filter, FilterJoin, FilterSet, PageOptions};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Grid,
@@ -21,6 +35,7 @@ pub enum Mode {
     Export,
 }
 pub struct TableView {
+    notebook: Option<note_results::NotebookContext>,
     key: String,
     source: WeakEntity<DatabaseView>,
     target: OpenTable,
@@ -30,12 +45,32 @@ pub struct TableView {
     offset: usize,
     more: bool,
     busy: bool,
+    counting: bool,
     notice: String,
     sql: String,
     note: Entity<InputState>,
     comparison: Entity<InputState>,
     _note: Subscription,
-    scroll: UniformListScrollHandle,
+    grid_state: Entity<TableState<grid_ui::GridDelegate>>,
+    options: PageOptions,
+    filter_draft: Option<filter_ui::Draft>,
+    last_options: PageOptions,
+    anchors: BTreeMap<usize, Option<Vec<String>>>,
+    page_size_input: Entity<InputState>,
+    page_number_input: Entity<InputState>,
+    sync_pager_inputs: bool,
+    _pager_subscriptions: Vec<Subscription>,
+    elapsed_ms: u64,
+    total: Option<u64>,
+    keyset: bool,
+    selected: Option<(usize, usize)>,
+    highlight: bool,
+    highlight_color: Option<Hsla>,
+    color_picker: Entity<ColorPickerState>,
+    _color_subscription: Subscription,
+    changes: BTreeMap<usize, Change>,
+    insert_count: usize,
+    committing: bool,
     baseline: Option<Rows>,
 }
 impl TableView {
@@ -46,6 +81,16 @@ impl TableView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::create(key, source, target, true, window, cx)
+    }
+    fn create(
+        key: String,
+        source: WeakEntity<DatabaseView>,
+        target: OpenTable,
+        autoload: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let note = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -53,10 +98,77 @@ impl TableView {
         });
         let comparison =
             cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "dbwork.compare.target")));
-        cx.defer_in(window, |this, _, cx| {
-            this.load(cx);
+        if autoload {
+            cx.defer_in(window, |this, _, cx| {
+                this.load(cx);
+            });
+        }
+        let page_size = cx
+            .global::<crate::preferences::Preferences>()
+            .database
+            .page_size
+            .clamp(1, 1000);
+        let page_size_input =
+            cx.new(|cx| InputState::new(window, cx).default_value(page_size.to_string()));
+        let page_number_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
+        let pager_subscriptions = [
+            (page_size_input.clone(), true),
+            (page_number_input.clone(), false),
+        ]
+        .into_iter()
+        .map(|(input, size)| {
+            cx.subscribe_in(
+                &input,
+                window,
+                move |_, _, event: &InputEvent, window, cx| {
+                    if matches!(event, InputEvent::PressEnter { .. }) {
+                        cx.defer_in(window, move |this, _, cx| this.apply_pager_input(size, cx));
+                    }
+                },
+            )
+        })
+        .collect();
+        let grid_state = cx.new(|cx| {
+            TableState::new(grid_ui::GridDelegate::new(), window, cx)
+                .row_selectable(false)
+                .col_selectable(false)
+                .col_movable(false)
         });
+        let highlight_color = default_highlight_color(cx);
+        let color_picker =
+            cx.new(|cx| ColorPickerState::new(window, cx).default_value(highlight_color));
+        let color_subscription =
+            cx.subscribe(&color_picker, |this, _, event: &ColorPickerEvent, cx| {
+                let ColorPickerEvent::Change(color) = event;
+                this.highlight_color = *color;
+                this.highlight = true;
+                this.sync_selection(cx);
+            });
         Self {
+            notebook: None,
+            grid_state,
+            options: PageOptions {
+                page_size,
+                ..PageOptions::default()
+            },
+            filter_draft: None,
+            last_options: PageOptions::default(),
+            anchors: BTreeMap::new(),
+            page_size_input,
+            page_number_input,
+            sync_pager_inputs: false,
+            _pager_subscriptions: pager_subscriptions,
+            elapsed_ms: 0,
+            total: None,
+            keyset: false,
+            selected: None,
+            highlight: true,
+            highlight_color: None,
+            color_picker,
+            _color_subscription: color_subscription,
+            changes: BTreeMap::new(),
+            insert_count: 0,
+            committing: false,
             key,
             source,
             target,
@@ -66,19 +178,25 @@ impl TableView {
             offset: 0,
             more: false,
             busy: false,
+            counting: false,
             notice: String::new(),
             sql: String::new(),
             _note: cx.observe(&note, |_, _, cx| cx.notify()),
             note,
             comparison,
-            scroll: UniformListScrollHandle::new(),
             baseline: None,
         }
     }
     fn request(&mut self, action: Action, cx: &mut Context<Self>) {
+        if self.notebook.is_some() {
+            self.note_request(action, cx);
+            return;
+        }
         if self.busy {
             return;
         }
+        let paging = matches!(&action, Action::GridPage { .. });
+        let counting = matches!(&action, Action::Count { .. });
         let target = cx.entity().downgrade();
         let request = Request {
             database: self.target.database.clone(),
@@ -95,10 +213,23 @@ impl TableView {
         }) {
             Ok(Ok(())) => {
                 self.busy = true;
-                self.notice = t(cx, "dbwork.loading").to_string();
+                self.counting = counting;
+                self.notice = if self.target.mode == Mode::Grid {
+                    String::new()
+                } else {
+                    t(cx, "dbwork.loading").to_string()
+                };
             }
             Ok(Err(e)) => self.notice = e,
             Err(_) => self.notice = t(cx, "dbwork.disconnected").to_string(),
+        }
+        if !self.busy {
+            if paging {
+                self.sync_pager_inputs = true;
+                self.options = self.last_options.clone();
+                self.offset = self.options.offset;
+            }
+            crate::feedback::error(self.notice.clone(), cx);
         }
         cx.notify();
     }
@@ -106,20 +237,65 @@ impl TableView {
         if matches!(self.target.mode, Mode::Er | Mode::Import) {
             self.request(Action::Describe(self.target.object.clone()), cx);
         } else {
+            if !self.changes.is_empty() {
+                crate::feedback::error(t(cx, "grid.pending"), cx);
+                return;
+            }
+            self.options.offset = self.offset;
             self.request(
-                Action::Page {
+                Action::GridPage {
                     object: self.target.object.clone(),
-                    offset: self.offset,
+                    options: self.options.clone(),
                 },
                 cx,
             );
         }
     }
+
     pub fn receive(&mut self, result: Result<Reply, String>, cx: &mut Context<Self>) {
         self.busy = false;
+        self.counting = false;
         match result {
+            Ok(Reply::GridPage {
+                rows,
+                schema,
+                offset,
+                more,
+                sql,
+                next,
+                elapsed_ms,
+                keyset,
+            }) => {
+                self.sync_pager_inputs = true;
+                self.last_options = self.options.clone();
+                self.rows = rows;
+                self.schema = Some(schema);
+                self.offset = offset;
+                self.more = more;
+                self.sql = sql;
+                self.anchors.insert(offset, self.options.after.clone());
+                if more {
+                    self.anchors
+                        .insert(offset + self.options.page_size, next.clone());
+                }
+                self.elapsed_ms = elapsed_ms;
+                self.keyset = keyset;
+                self.selected = None;
+                self.notice = String::new();
+                self.sync_grid(cx);
+                self.grid_state
+                    .update(cx, |table, cx| table.scroll_to_row(0, cx));
+            }
+            Ok(Reply::Count(count)) => {
+                self.total = Some(count);
+                self.notice.clear();
+            }
             Err(e) => {
+                self.sync_pager_inputs = true;
+                self.options = self.last_options.clone();
+                self.offset = self.options.offset;
                 self.baseline = None;
+                self.committing = false;
                 crate::feedback::error(e.clone(), cx);
                 self.notice = e;
             }
@@ -163,8 +339,29 @@ impl TableView {
                 self.notice = String::new();
             }
             Ok(Reply::Executed) => {
-                self.notice = t(cx, "dbwork.executed").to_string();
+                self.notice = if self.committing {
+                    crate::locale::tr(
+                        cx,
+                        "grid.commit.saved",
+                        &[("count", &self.changes.len().to_string())],
+                    )
+                    .to_string()
+                } else {
+                    t(cx, "dbwork.executed").to_string()
+                };
                 crate::feedback::success(self.notice.clone(), cx);
+                if self.committing {
+                    self.committing = false;
+                    self.changes.clear();
+                    self.insert_count = 0;
+                    self.total = None;
+                    self.selected = None;
+                    self.sync_grid(cx);
+                    let view = cx.entity().downgrade();
+                    cx.defer(move |cx| {
+                        let _ = view.update(cx, |this, cx| this.load(cx));
+                    });
+                }
             }
             _ => self.notice = t(cx, "dbwork.unexpected").to_string(),
         }
@@ -182,6 +379,7 @@ impl TableView {
             Action::Page {
                 object,
                 offset: self.offset,
+                page_size: self.options.page_size,
             },
             cx,
         );
@@ -266,89 +464,634 @@ impl TableView {
             .unwrap_or(false)
         });
     }
-    fn grid(&self, cx: &mut Context<Self>) -> AnyElement {
-        let width = px((self.rows.columns.len().max(1) * 180) as f32);
-        let head = div()
-            .h_flex()
-            .w(width)
-            .h(px(32.))
-            .bg(cx.theme().muted)
-            .children(self.rows.columns.iter().map(|c| {
-                div()
-                    .w(px(180.))
-                    .flex_shrink_0()
-                    .px_2()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(c.clone())
-            }));
+    fn grid(&self, cx: &Context<Self>) -> AnyElement {
+        let state = self.grid_state.read(cx);
+        let vertical = state.vertical_scroll_handle.clone();
+        let horizontal = state.horizontal_scroll_handle.clone();
+        // Match the component's medium header (32px) and the fixed 58px row-number column.
+        // Scrollbar itself suppresses an axis when its content fits the viewport.
         div()
-            .id("data-grid-horizontal")
+            .relative()
             .size_full()
-            .overflow_x_scroll()
-            .child(
-                div().v_flex().w(width).h_full().child(head).child(
-                    uniform_list(
-                        "data-grid-rows",
-                        self.rows.values.len(),
-                        cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                            range
-                                .map(|ix| {
-                                    div()
-                                        .h_flex()
-                                        .h(px(30.))
-                                        .border_b_1()
-                                        .border_color(cx.theme().border)
-                                        .children(this.rows.values[ix].iter().enumerate().map(
-                                            |(col, v)| {
-                                                let value =
-                                                    v.clone().unwrap_or_else(|| "NULL".into());
-                                                let copy = value.clone();
-                                                div()
-                                                    .id(("cell", ix * 512 + col))
-                                                    .w(px(180.))
-                                                    .flex_shrink_0()
-                                                    .px_2()
-                                                    .overflow_hidden()
-                                                    .text_ellipsis()
-                                                    .whitespace_nowrap()
-                                                    .text_color(if v.is_none() {
-                                                        cx.theme().muted_foreground
-                                                    } else {
-                                                        cx.theme().foreground
-                                                    })
-                                                    .child(value)
-                                                    .context_menu(move |menu, _, cx| {
-                                                        let copy = copy.clone();
-                                                        menu.item(
-                                                            PopupMenuItem::new(t(
-                                                                cx,
-                                                                "dbwork.copy",
-                                                            ))
-                                                            .on_click(move |_, _, cx| {
-                                                                cx.write_to_clipboard(
-                                                                    ClipboardItem::new_string(
-                                                                        copy.clone(),
-                                                                    ),
-                                                                )
-                                                            }),
-                                                        )
-                                                    })
-                                            },
-                                        ))
-                                        .into_any_element()
-                                })
-                                .collect::<Vec<_>>()
-                        }),
+            .child(Table::new(&self.grid_state).scrollbar_visible(false, false))
+            .when(
+                !self.rows.values.is_empty() || self.insert_count > 0,
+                |grid| {
+                    grid.child(
+                        div()
+                            .absolute()
+                            .top(px(32.))
+                            .right_0()
+                            .bottom_0()
+                            .w(px(16.))
+                            .child(
+                                Scrollbar::vertical(&vertical)
+                                    .scrollbar_show(ScrollbarShow::Always),
+                            ),
                     )
-                    .track_scroll(self.scroll.clone())
-                    .flex_1()
-                    .min_h_0()
-                    .w(width),
-                ),
+                },
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(grid_ui::ROW_NUMBER_WIDTH))
+                    .right_0()
+                    .bottom_0()
+                    .h(px(16.))
+                    .child(
+                        Scrollbar::horizontal(&horizontal).scrollbar_show(ScrollbarShow::Always),
+                    ),
             )
             .into_any_element()
+    }
+    fn display_rows(&self) -> Rows {
+        let mut rows = self.rows.clone();
+        rows.values.resize(
+            rows.values.len() + self.insert_count,
+            vec![None; rows.columns.len()],
+        );
+        for (row, change) in &self.changes {
+            if let Some(values) = &change.values
+                && let Some(target) = rows.values.get_mut(*row)
+            {
+                for (name, value) in values {
+                    if let Some(col) = rows.columns.iter().position(|c| c == name) {
+                        target[col] = value.clone();
+                    }
+                }
+            }
+        }
+        rows
+    }
+    fn sync_grid(&mut self, cx: &mut Context<Self>) {
+        let data = grid_ui::GridDelegate::snapshot(self, cx.entity().downgrade());
+        self.grid_state.update(cx, |table, cx| {
+            let columns_changed = table.delegate().column_names() != data.column_names();
+            table.clear_selection(cx);
+            *table.delegate_mut() = data;
+            if columns_changed {
+                table.refresh(cx);
+            } else {
+                cx.notify();
+            }
+        });
+        cx.notify();
+    }
+    fn sync_selection(&mut self, cx: &mut Context<Self>) {
+        self.grid_state.update(cx, |table, cx| {
+            table.clear_selection(cx);
+            table.delegate_mut().selection = self.selected;
+            table.delegate_mut().highlight = self.highlight;
+            table.delegate_mut().highlight_color = self.highlight_color;
+            cx.notify();
+        });
+        cx.notify();
+    }
+    fn select_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.selected = Some((row, col));
+        self.focus.focus(window);
+        self.sync_selection(cx);
+    }
+    fn can_insert(&self) -> bool {
+        self.target.mode == Mode::Grid
+            && !self.notebook.as_ref().is_some_and(|n| n.stale)
+            && self.target.writable
+            && self.target.object.kind == "table"
+            && matches!(
+                self.target.kind,
+                turbodbn_services::DatabaseKind::MySql
+                    | turbodbn_services::DatabaseKind::Sqlite
+                    | turbodbn_services::DatabaseKind::PostgreSql
+            )
+            && self.schema.as_ref().is_some_and(|s| {
+                self.target.kind != turbodbn_services::DatabaseKind::MySql
+                    || s.ddl.to_lowercase().contains("engine=innodb")
+            })
+    }
+    fn can_edit(&self) -> bool {
+        self.can_insert()
+            && self.schema.as_ref().is_some_and(|s| {
+                s.columns.iter().any(|c| c.primary)
+                    && s.columns.iter().filter(|c| c.primary).all(|c| {
+                        !["binary", "blob", "bytea", "float", "double", "real"]
+                            .iter()
+                            .any(|ty| c.data_type.to_lowercase().contains(ty))
+                    })
+            })
+    }
+    fn can_edit_row(&self, row: usize) -> bool {
+        if row >= self.rows.values.len() {
+            self.can_insert()
+        } else {
+            self.can_edit()
+        }
+    }
+    fn add_row(&mut self, duplicate: bool, cx: &mut Context<Self>) {
+        if self.busy || !self.can_insert() {
+            crate::feedback::error(t(cx, "grid.readonly"), cx);
+            return;
+        }
+        let mut values = BTreeMap::new();
+        if duplicate
+            && let Some((row, _)) = self.selected
+            && let Some(schema) = &self.schema
+        {
+            let data = self.display_rows();
+            for (col, c) in schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.primary)
+            {
+                if let Some(value) = data.values.get(row).and_then(|r| r.get(col)) {
+                    values.insert(c.name.clone(), value.clone());
+                }
+            }
+        }
+        let ix = self.rows.values.len() + self.insert_count;
+        self.insert_count += 1;
+        self.changes.insert(
+            ix,
+            Change {
+                original: None,
+                values: Some(values),
+            },
+        );
+        let column = self
+            .schema
+            .as_ref()
+            .and_then(|s| s.columns.iter().position(|c| !c.primary))
+            .unwrap_or(0);
+        self.selected = Some((ix, column));
+        self.sync_grid(cx);
+        self.grid_state.update(cx, |table, cx| {
+            table.scroll_to_row(ix, cx);
+            table.scroll_to_col(column + 1, cx);
+        });
+    }
+    fn edit_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || !self.can_edit_row(row) {
+            crate::feedback::error(t(cx, "grid.readonly"), cx);
+            return;
+        }
+        let Some(name) = self.rows.columns.get(col).cloned() else {
+            return;
+        };
+        let value = self
+            .display_rows()
+            .values
+            .get(row)
+            .and_then(|r| r.get(col))
+            .cloned()
+            .flatten();
+        let allow_default = row >= self.rows.values.len();
+        let uses_default = allow_default
+            && self
+                .changes
+                .get(&row)
+                .and_then(|change| change.values.as_ref())
+                .is_none_or(|values| !values.contains_key(&name));
+        let column = self
+            .schema
+            .as_ref()
+            .and_then(|s| s.columns.iter().find(|c| c.name == name))
+            .cloned()
+            .unwrap_or(workbench::Column {
+                name: name.clone(),
+                data_type: String::new(),
+                comment: String::new(),
+                primary: false,
+            });
+        let restore_value = self
+            .rows
+            .values
+            .get(row)
+            .and_then(|r| r.get(col))
+            .cloned()
+            .unwrap_or_else(|| value.clone());
+        let kind = self.target.kind;
+        let data_type = column.data_type.as_str();
+        let editor = Rc::new(value_ui::ValueInput::new(
+            data_type,
+            value.clone().unwrap_or_default(),
+            true,
+            false,
+            window,
+            cx,
+        ));
+        let mode = Rc::new(std::cell::Cell::new(if uses_default {
+            "default"
+        } else if value.is_none() {
+            "null"
+        } else {
+            "value"
+        }));
+        let view = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let field = editor.input.clone();
+            let mode = mode.clone();
+            let null_mode = mode.clone();
+            let default_mode = mode.clone();
+            let restore_mode = mode.clone();
+            let restore_input = editor.input.clone();
+            let restore_value = restore_value.clone();
+            let copy_mode = mode.clone();
+            let copy_input = editor.input.clone();
+            let copy_column = column.clone();
+            let view = view.clone();
+            let name = name.clone();
+            dialog
+                .title(name.clone())
+                .w(px(640.))
+                .on_ok(|_, _, _| false)
+                .child(
+                    div()
+                        .h_flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(
+                            Button::new("cell-null")
+                                .ghost()
+                                .small()
+                                .icon(IconName::CircleX)
+                                .label(t(cx, "grid.null"))
+                                .selected(mode.get() == "null")
+                                .on_click(move |_, _, cx| {
+                                    null_mode.set(if null_mode.get() == "null" {
+                                        "value"
+                                    } else {
+                                        "null"
+                                    });
+                                    cx.refresh_windows();
+                                }),
+                        )
+                        .child(
+                            Button::new("cell-restore")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Undo2)
+                                .label(t(cx, "grid.cell.restore"))
+                                .on_click(move |_, window, cx| {
+                                    restore_input.update(cx, |input, cx| {
+                                        input.set_value(
+                                            restore_value.clone().unwrap_or_default(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                    restore_mode.set(if uses_default {
+                                        "default"
+                                    } else if restore_value.is_none() {
+                                        "null"
+                                    } else {
+                                        "value"
+                                    });
+                                    crate::feedback::success(t(cx, "grid.cell.restored"), cx);
+                                    cx.refresh_windows();
+                                }),
+                        )
+                        .child(
+                            Button::new("cell-copy-where")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Copy)
+                                .label(t(cx, "grid.cell.copy_where"))
+                                .disabled(mode.get() == "default")
+                                .on_click(move |_, _, cx| {
+                                    let value = copy_input.read(cx).value();
+                                    let value = if copy_mode.get() == "null" {
+                                        None
+                                    } else {
+                                        Some(value.as_str())
+                                    };
+                                    match workbench::cell_where(kind, &copy_column, value) {
+                                        Ok(sql) => {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(sql));
+                                            crate::feedback::success(t(cx, "feedback.copied"), cx);
+                                        }
+                                        Err(error) => crate::feedback::error(error, cx),
+                                    }
+                                }),
+                        )
+                        .when(allow_default, |bar| {
+                            bar.child(
+                                Button::new("cell-default")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Asterisk)
+                                    .label(t(cx, "grid.default"))
+                                    .selected(mode.get() == "default")
+                                    .on_click(move |_, _, cx| {
+                                        default_mode.set(if default_mode.get() == "default" {
+                                            "value"
+                                        } else {
+                                            "default"
+                                        });
+                                        cx.refresh_windows();
+                                    }),
+                            )
+                        }),
+                )
+                .child(editor.render(mode.get() != "value", cx))
+                .footer(move |_, _, _, cx| {
+                    let field = field.clone();
+                    let mode = mode.clone();
+                    let view = view.clone();
+                    let name = name.clone();
+                    vec![
+                        crate::feedback::footer_actions()
+                            .child(crate::feedback::close_button(cx))
+                            .child(
+                                Button::new("apply-cell")
+                                    .primary()
+                                    .icon(IconName::Check)
+                                    .label(t(cx, "grid.apply"))
+                                    .on_click(move |_, window, cx| {
+                                        let value = if mode.get() == "null" {
+                                            None
+                                        } else {
+                                            Some(field.read(cx).value().to_string())
+                                        };
+                                        let _ = view.update(cx, |this, cx| {
+                                            let original = this.rows.values.get(row).cloned();
+                                            if original.as_ref().and_then(|r| r.get(col))
+                                                == Some(&value)
+                                            {
+                                                if let Some(values) = this
+                                                    .changes
+                                                    .get_mut(&row)
+                                                    .and_then(|change| change.values.as_mut())
+                                                {
+                                                    values.remove(&name);
+                                                    if values.is_empty() {
+                                                        this.changes.remove(&row);
+                                                    }
+                                                }
+                                                this.sync_grid(cx);
+                                                return;
+                                            }
+
+                                            let values = this
+                                                .changes
+                                                .entry(row)
+                                                .or_insert_with(|| Change {
+                                                    original,
+                                                    values: Some(BTreeMap::new()),
+                                                })
+                                                .values
+                                                .get_or_insert_with(BTreeMap::new);
+                                            if mode.get() == "default" {
+                                                values.remove(&name);
+                                            } else {
+                                                values.insert(name.clone(), value);
+                                            }
+                                            this.sync_grid(cx);
+                                        });
+                                        window.close_dialog(cx);
+                                    }),
+                            ),
+                    ]
+                })
+        });
+    }
+    fn can_delete_row(&self, row: usize) -> bool {
+        self.can_edit_row(row)
+            && (row >= self.rows.values.len()
+                || self.notebook.as_ref().is_none_or(|n| n.source.complete_row))
+    }
+    fn delete_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || !self.can_delete_row(row) {
+            return;
+        }
+        let view = cx.entity().downgrade();
+        crate::feedback::confirm(
+            t(cx, "grid.delete.row"),
+            t(cx, "grid.delete.body"),
+            window,
+            cx,
+            move |_, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    if let Some(original) = this.rows.values.get(row).cloned() {
+                        this.changes.insert(
+                            row,
+                            Change {
+                                original: Some(original),
+                                values: None,
+                            },
+                        );
+                    } else {
+                        this.changes.remove(&row);
+                        this.changes = std::mem::take(&mut this.changes)
+                            .into_iter()
+                            .map(|(i, c)| (if i > row { i - 1 } else { i }, c))
+                            .collect();
+                        this.insert_count = this.insert_count.saturating_sub(1);
+                        this.selected = None;
+                    }
+                    this.sync_grid(cx);
+                });
+            },
+        );
+    }
+    fn rollback(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        crate::feedback::confirm(
+            t(cx, "grid.rollback"),
+            t(cx, "grid.rollback.body"),
+            window,
+            cx,
+            move |_, cx| {
+                let _ = view.update(cx, |this, cx| {
+                    this.changes.clear();
+                    this.insert_count = 0;
+                    this.selected = None;
+                    this.sync_grid(cx);
+                });
+            },
+        );
+    }
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.notebook.as_ref().is_some_and(|n| n.stale) {
+            crate::feedback::error(t(cx, "notes.results_stale"), cx);
+            return;
+        }
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let changes = self.changes.values().cloned().collect::<Vec<_>>();
+        let sql = match workbench::edit_preview(
+            self.target.kind,
+            &self.target.database,
+            &self.target.object,
+            &schema,
+            &changes,
+        ) {
+            Ok(sql) => sql,
+            Err(e) => {
+                crate::feedback::error(e, cx);
+                return;
+            }
+        };
+        let expected_sql = sql.clone();
+        let view = cx.entity().downgrade();
+        let object = self.target.object.clone();
+        crate::feedback::sql_preview(
+            sql,
+            format!("{}.{}", self.target.database, object.name),
+            window,
+            cx,
+            move |submitted, _, cx| {
+                if submitted != expected_sql {
+                    crate::feedback::error(t(cx, "grid.preview.changed"), cx);
+                    return false;
+                }
+                view.update(cx, |this, cx| {
+                    if this.busy {
+                        return false;
+                    }
+                    this.committing = true;
+                    this.request(
+                        Action::Commit {
+                            object: object.clone(),
+                            ddl: schema.ddl.clone(),
+                            changes: changes.clone(),
+                        },
+                        cx,
+                    );
+                    if !this.busy {
+                        this.committing = false;
+                    }
+                    this.busy
+                })
+                .unwrap_or(false)
+            },
+        );
+    }
+    fn copy(&self, row: usize, col: usize, format: &str, cx: &mut App) {
+        if format == "sql"
+            && self
+                .notebook
+                .as_ref()
+                .is_some_and(|n| n.source.object.is_none())
+        {
+            crate::feedback::error(t(cx, "notes.result_no_table"), cx);
+            return;
+        }
+        let data = self.display_rows();
+        if format == "sql"
+            && self.schema.as_ref().is_some_and(|schema| {
+                schema.columns.iter().enumerate().any(|(i, c)| {
+                    ["blob", "binary", "bytea"]
+                        .iter()
+                        .any(|ty| c.data_type.to_lowercase().contains(ty))
+                        && data
+                            .values
+                            .get(row)
+                            .and_then(|r| r.get(i))
+                            .is_some_and(|v| v.is_some())
+                })
+            })
+        {
+            crate::feedback::error(t(cx, "grid.copy.binary"), cx);
+            return;
+        }
+        let uses_default = row >= self.rows.values.len()
+            && self
+                .changes
+                .get(&row)
+                .and_then(|change| change.values.as_ref())
+                .is_some_and(|values| {
+                    data.columns
+                        .get(col)
+                        .is_some_and(|name| !values.contains_key(name))
+                });
+        let result = if format == "cell" {
+            Ok(data
+                .values
+                .get(row)
+                .and_then(|r| r.get(col))
+                .and_then(Clone::clone)
+                .unwrap_or_else(|| {
+                    if uses_default {
+                        "DEFAULT".into()
+                    } else {
+                        "NULL".into()
+                    }
+                }))
+        } else if format == "sql" && row >= self.rows.values.len() {
+            match (self.schema.as_ref(), self.changes.get(&row)) {
+                (Some(schema), Some(change)) => workbench::edit_preview(
+                    self.target.kind,
+                    &self.target.database,
+                    &self.target.object,
+                    schema,
+                    std::slice::from_ref(change),
+                )
+                .map(|sql| format!("{sql};")),
+                _ => Err(t(cx, "grid.filter.empty").to_string()),
+            }
+        } else {
+            workbench::copy_row(
+                self.target.kind,
+                &self.target.database,
+                &self.target.object,
+                &data,
+                row,
+                format,
+            )
+        };
+        match result {
+            Ok(text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                crate::feedback::success(t(cx, "feedback.copied"), cx)
+            }
+            Err(e) => crate::feedback::error(e, cx),
+        }
+    }
+    fn change_query(&mut self, cx: &mut Context<Self>) {
+        self.offset = 0;
+        self.options.after = None;
+        self.anchors.clear();
+        self.total = None;
+        self.load(cx);
+    }
+    fn show_details(&self, row: Option<usize>, cx: &mut App) {
+        if let Some(row) = row {
+            let data = self.display_rows();
+            let entries = data
+                .columns
+                .iter()
+                .cloned()
+                .zip(
+                    data.values
+                        .get(row)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|v| v.unwrap_or_else(|| "NULL".into())),
+                )
+                .collect::<Vec<_>>();
+            let text = serde_json::to_string_pretty(&entries).unwrap_or_default();
+            crate::feedback::details(
+                crate::feedback::DetailRequest {
+                    inspector: true,
+                    title: format!(
+                        "{}.{} · #{}",
+                        self.target.database,
+                        self.target.object.name,
+                        self.offset + row + 1
+                    ),
+                    entries,
+                    text,
+                },
+                cx,
+            );
+        } else if let Some(schema) = &self.schema {
+            crate::feedback::details(
+                structure_details(&self.target.database, &self.target.object, schema),
+                cx,
+            );
+        }
     }
     fn er(&self, cx: &Context<Self>) -> AnyElement {
         let Some(schema) = &self.schema else {
@@ -451,7 +1194,110 @@ impl Panel for TableView {
     }
 }
 impl Render for TableView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let default_color = default_highlight_color(cx);
+        if self.highlight_color.is_none()
+            && self.color_picker.read(cx).value() != Some(default_color)
+        {
+            self.color_picker
+                .update(cx, |picker, cx| picker.set_value(default_color, window, cx));
+        }
+        for (input, value) in [
+            (&self.page_size_input, self.options.page_size.to_string()),
+            (
+                &self.page_number_input,
+                (self.offset / self.options.page_size + 1).to_string(),
+            ),
+        ] {
+            if (self.sync_pager_inputs || !input.read(cx).focus_handle(cx).is_focused(window))
+                && input.read(cx).value().as_str() != value
+            {
+                input.update(cx, |input, cx| input.set_value(value, window, cx));
+            }
+        }
+        self.sync_pager_inputs = false;
+        if self.target.mode == Mode::Grid {
+            self.render_grid(cx)
+        } else {
+            self.render_workspace(window, cx)
+        }
+    }
+}
+impl TableView {
+    fn grid_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.focus.is_focused(window) {
+            return;
+        }
+        let Some((row, col)) = self.selected else {
+            return;
+        };
+        if event.keystroke.key.eq_ignore_ascii_case("c") && event.keystroke.modifiers.control {
+            self.copy(row, col, "cell", cx);
+            cx.stop_propagation();
+            return;
+        }
+        if event.keystroke.key.eq_ignore_ascii_case("f2") {
+            self.edit_cell(row, col, window, cx);
+            cx.stop_propagation();
+            return;
+        }
+        let rows = self.rows.values.len() + self.insert_count;
+        let cols = self.rows.columns.len();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let next = match event.keystroke.key.as_str() {
+            "left" => (row, col.saturating_sub(1)),
+            "right" => (row, (col + 1).min(cols - 1)),
+            "up" => (row.saturating_sub(1), col),
+            "down" => ((row + 1).min(rows - 1), col),
+            _ => return,
+        };
+        self.select_cell(next.0, next.1, window, cx);
+        self.grid_state.update(cx, |table, cx| {
+            if !table.visible_range().rows().contains(&next.0) {
+                table.scroll_to_row(next.0, cx);
+            }
+            if !table.visible_range().cols().contains(&(next.1 + 1)) {
+                table.scroll_to_col(next.1 + 1, cx);
+            }
+        });
+        cx.stop_propagation();
+    }
+    fn render_grid(&self, cx: &Context<Self>) -> AnyElement {
+        let mut body = div()
+            .v_flex()
+            .size_full()
+            .min_h_0()
+            .p_2()
+            .gap_2()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::grid_key));
+        if self.query_controls() {
+            body = body.child(self.filter_bar(cx));
+        }
+        if let Some(note) = &self.notebook {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t(
+                        cx,
+                        if note.stale {
+                            "notes.results_stale"
+                        } else if self.target.writable {
+                            "notes.result_editable"
+                        } else {
+                            "notes.result_readonly"
+                        },
+                    )),
+            );
+        }
+        body.child(div().flex_1().min_h_0().child(self.grid(cx)))
+            .child(self.data_toolbar(cx))
+            .into_any_element()
+    }
+    fn render_workspace(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.target.mode;
         let mut body = div()
             .v_flex()
@@ -460,46 +1306,69 @@ impl Render for TableView {
             .p_3()
             .gap_2()
             .track_focus(&self.focus)
-            .child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .child(format!(
-                                "{} / {}",
-                                self.target.database, self.target.object.name
-                            )),
-                    )
-                    .child(
-                        Button::new("table-refresh")
-                            .ghost()
-                            .icon(IconName::Redo)
-                            .tooltip(t(cx, "dbwork.refresh"))
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
-                    )
-                    .when(!matches!(mode, Mode::Er | Mode::Import), |el| {
-                        el.child(
-                            Button::new("table-export")
-                                .ghost()
-                                .icon(gpui_component::Icon::default().path("icons/export.svg"))
-                                .label(t(cx, "dbwork.export.page"))
-                                .disabled(self.busy || self.rows.columns.is_empty())
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.export(window, cx)),
-                                ),
+            .on_key_down(cx.listener(Self::grid_key))
+            .when(mode != Mode::Grid, |body| {
+                body.child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(format!(
+                                    "{} / {}",
+                                    self.target.database, self.target.object.name
+                                )),
                         )
-                    }),
+                        .child(
+                            Button::new("table-refresh")
+                                .ghost()
+                                .icon(crate::assets::refresh_icon())
+                                .tooltip(t(cx, "dbwork.refresh"))
+                                .disabled(self.busy)
+                                .on_click(cx.listener(|this, _, _, cx| this.load(cx))),
+                        )
+                        .when(!matches!(mode, Mode::Er | Mode::Import), |el| {
+                            el.child(
+                                Button::new("table-export")
+                                    .ghost()
+                                    .icon(gpui_component::Icon::default().path("icons/export.svg"))
+                                    .label(t(cx, "dbwork.export.page"))
+                                    .disabled(self.busy || self.rows.columns.is_empty())
+                                    .on_click(
+                                        cx.listener(|this, _, window, cx| this.export(window, cx)),
+                                    ),
+                            )
+                        }),
+                )
+            });
+        if !matches!(mode, Mode::Er | Mode::Import) && self.query_controls() {
+            body = body.child(self.filter_bar(cx));
+        }
+        if let Some(note) = &self.notebook {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(t(
+                        cx,
+                        if note.stale {
+                            "notes.results_stale"
+                        } else if self.target.writable {
+                            "notes.result_editable"
+                        } else {
+                            "notes.result_readonly"
+                        },
+                    )),
             );
+        }
         if mode == Mode::Note {
             body = body
                 .child(div().text_sm().child(self.sql.clone()))
-                .child(Input::new(&self.note).h(px(140.)))
+                .child(crate::feedback::editable_multiline(&self.note, false, cx).h(px(140.)))
                 .child(
                     Button::new("save-table-note")
                         .ghost()
@@ -521,7 +1390,7 @@ impl Render for TableView {
                 div()
                     .h_flex()
                     .gap_2()
-                    .child(Input::new(&self.comparison).flex_1())
+                    .child(Input::new(&self.comparison).cleanable(true).flex_1())
                     .child(
                         Button::new("compare-page")
                             .label(t(cx, "dbwork.compare.page"))
@@ -543,44 +1412,549 @@ impl Render for TableView {
         } else {
             body = body
                 .child(div().flex_1().min_h_0().child(self.grid(cx)))
+                .child(self.data_toolbar(cx));
+        }
+        body.when(!self.notice.is_empty() && mode != Mode::Grid, |body| {
+            body.child(
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(self.notice.clone()),
+            )
+        })
+        .into_any_element()
+    }
+}
+
+impl TableView {
+    fn jump_page(&mut self, page: usize, cx: &mut Context<Self>) {
+        if self.busy || !self.changes.is_empty() {
+            return;
+        }
+        let Some(offset) = page
+            .checked_sub(1)
+            .and_then(|p| p.checked_mul(self.options.page_size))
+            .filter(|offset| *offset <= 10_000_000)
+        else {
+            crate::feedback::error(t(cx, "grid.pager.invalid_page"), cx);
+            return;
+        };
+        if self
+            .total
+            .is_some_and(|n| page as u64 > n.div_ceil(self.options.page_size as u64).max(1))
+        {
+            crate::feedback::error(t(cx, "grid.pager.invalid_page"), cx);
+            return;
+        }
+        self.offset = offset;
+        self.options.after = self.anchors.get(&offset).cloned().flatten();
+        self.load(cx);
+    }
+    fn apply_pager_input(&mut self, size: bool, cx: &mut Context<Self>) {
+        if self.busy || !self.changes.is_empty() {
+            return;
+        }
+        let input = if size {
+            &self.page_size_input
+        } else {
+            &self.page_number_input
+        };
+        let value = input.read(cx).value().trim().parse::<usize>().ok();
+        if size {
+            let Some(value) =
+                value.filter(|value| (1..=workbench::MAX_GRID_PAGE_SIZE).contains(value))
+            else {
+                crate::feedback::error(t(cx, "grid.pager.invalid_size"), cx);
+                return;
+            };
+            if value != self.options.page_size {
+                self.options.page_size = value;
+                self.offset = 0;
+                self.options.after = None;
+                self.anchors.clear();
+                self.load(cx);
+            }
+        } else if let Some(page) = value {
+            self.jump_page(page, cx);
+        } else {
+            crate::feedback::error(t(cx, "grid.pager.invalid_page"), cx);
+        }
+    }
+    fn data_toolbar(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .h(px(32.))
+            .flex_shrink_0()
+            .min_w_0()
+            .text_xs()
+            .whitespace_nowrap()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                div()
+                    .id("data-toolbar-controls")
+                    .h_flex()
+                    .items_center()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_x_scroll()
+                    .gap_1()
+                    .child(self.toolbar_actions(cx))
+                    .child(self.toolbar_pager(cx))
+                    .child(self.toolbar_highlight(cx)),
+            )
+            .child(self.toolbar_statistics(cx))
+            .into_any_element()
+    }
+    fn toolbar_actions(&self, cx: &Context<Self>) -> AnyElement {
+        let editable = self.target.mode == Mode::Grid
+            && self.notebook.as_ref().is_none_or(|n| n.source.editable);
+        let locked = self.busy || !self.changes.is_empty();
+        div()
+            .h_flex()
+            .gap_1()
+            .flex_shrink_0()
+            .child(
+                Button::new("grid-toolbar-refresh")
+                    .ghost()
+                    .small()
+                    .icon(crate::assets::refresh_icon())
+                    .tooltip(t(cx, "dbwork.refresh"))
+                    .disabled(locked)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.total = None;
+                        this.anchors.clear();
+                        this.options.after = None;
+                        this.load(cx);
+                    })),
+            )
+            .when(self.notebook.is_some() && self.busy, |bar| {
+                bar.child(
+                    Button::new("note-grid-stop")
+                        .ghost()
+                        .small()
+                        .icon(gpui_component::Icon::default().path("icons/stop.svg"))
+                        .tooltip(t(cx, "notes.stop"))
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_result(false, cx))),
+                )
+            })
+            .when(editable, |bar| {
+                bar.child(
+                    Button::new("grid-add")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Plus)
+                        .tooltip(t(cx, "grid.add"))
+                        .disabled(self.busy || !self.can_insert())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_row(false, cx);
+                            this.focus.focus(window);
+                        })),
+                )
+            })
+            .when(editable, |bar| {
+                bar.child(
+                    Button::new("grid-duplicate")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Copy)
+                        .tooltip(t(cx, "grid.duplicate"))
+                        .disabled(self.busy || self.selected.is_none() || !self.can_insert())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_row(true, cx);
+                            this.focus.focus(window);
+                        })),
+                )
                 .child(
-                    div()
-                        .h_flex()
-                        .gap_2()
-                        .child(
-                            Button::new("page-previous")
+                    Button::new("grid-edit")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Settings2)
+                        .tooltip(t(cx, "grid.edit"))
+                        .disabled(
+                            self.busy || self.selected.is_none_or(|(r, _)| !self.can_edit_row(r)),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some((r, c)) = this.selected {
+                                this.edit_cell(r, c, window, cx);
+                            }
+                        })),
+                )
+            })
+            .when(editable, |bar| {
+                bar.child(
+                    Button::new("grid-submit")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Check)
+                        .tooltip(t(cx, "grid.submit"))
+                        .disabled(self.busy || self.changes.is_empty())
+                        .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
+                )
+                .child(
+                    Button::new("grid-rollback")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Undo2)
+                        .tooltip(t(cx, "grid.rollback"))
+                        .disabled(self.busy || self.changes.is_empty())
+                        .on_click(cx.listener(|this, _, window, cx| this.rollback(window, cx))),
+                )
+            })
+            .child(
+                Button::new("grid-export")
+                    .ghost()
+                    .small()
+                    .icon(gpui_component::Icon::default().path("icons/export.svg"))
+                    .tooltip(t(cx, "dbwork.export.page"))
+                    .disabled(self.busy || self.rows.columns.is_empty())
+                    .on_click(cx.listener(|this, _, window, cx| this.export(window, cx))),
+            )
+            .child(
+                div()
+                    .w(px(1.))
+                    .h(px(16.))
+                    .mx_1()
+                    .bg(cx.theme().border)
+                    .flex_shrink_0(),
+            )
+            .into_any_element()
+    }
+    fn toolbar_pager(&self, cx: &Context<Self>) -> AnyElement {
+        let locked = self.busy || !self.changes.is_empty();
+        div()
+            .h_flex()
+            .gap_1()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .id("page-size-tip")
+                    .flex_shrink_0()
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(t(cx, "grid.pager.size"))
+                            .build(window, cx)
+                    })
+                    .child(
+                        Input::new(&self.page_size_input)
+                            .cleanable(!locked)
+                            .small()
+                            .w(px(64.))
+                            .disabled(locked),
+                    ),
+            )
+            .child(
+                Button::new("page-first")
+                    .ghost()
+                    .small()
+                    .icon(gpui_component::Icon::default().path("icons/page-first.svg"))
+                    .tooltip(t(cx, "grid.pager.first"))
+                    .disabled(locked || self.offset == 0)
+                    .on_click(cx.listener(|this, _, _, cx| this.jump_page(1, cx))),
+            )
+            .child(
+                Button::new("page-previous")
+                    .ghost()
+                    .small()
+                    .icon(IconName::ChevronLeft)
+                    .tooltip(t(cx, "grid.toolbar.previous"))
+                    .disabled(locked || self.offset == 0)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        let previous = this.offset / this.options.page_size;
+                        let page = this
+                            .total
+                            .map(|n| {
+                                (n.div_ceil(this.options.page_size as u64).max(1))
+                                    .min(previous as u64) as usize
+                            })
+                            .unwrap_or(previous);
+                        this.jump_page(page, cx)
+                    })),
+            )
+            .child(
+                div()
+                    .id("page-number-tip")
+                    .flex_shrink_0()
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(t(cx, "grid.pager.jump"))
+                            .build(window, cx)
+                    })
+                    .child(
+                        Input::new(&self.page_number_input)
+                            .cleanable(!locked)
+                            .small()
+                            .w(px(64.))
+                            .disabled(locked),
+                    ),
+            )
+            .child(
+                Button::new("page-next")
+                    .ghost()
+                    .small()
+                    .icon(IconName::ChevronRight)
+                    .tooltip(t(cx, "grid.toolbar.next"))
+                    .disabled(locked || !self.more)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.jump_page(this.offset / this.options.page_size + 2, cx)
+                    })),
+            )
+            .child(
+                Button::new("page-last")
+                    .ghost()
+                    .small()
+                    .icon(gpui_component::Icon::default().path("icons/page-last.svg"))
+                    .tooltip(t(
+                        cx,
+                        if self.total.is_none() {
+                            "grid.pager.last_unknown"
+                        } else {
+                            "grid.pager.last"
+                        },
+                    ))
+                    .disabled(
+                        locked
+                            || self.total.is_none()
+                            || self.total.is_some_and(|n| {
+                                self.offset as u64 / self.options.page_size as u64 + 1
+                                    == n.div_ceil(self.options.page_size as u64).max(1)
+                            }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if let Some(n) = this.total
+                            && let Ok(page) =
+                                usize::try_from(n.div_ceil(this.options.page_size as u64).max(1))
+                        {
+                            this.jump_page(page, cx);
+                        }
+                    })),
+            )
+            .into_any_element()
+    }
+    fn toolbar_highlight(&self, cx: &Context<Self>) -> AnyElement {
+        div()
+            .h_flex()
+            .gap_1()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .id("grid-highlight-controls")
+                    .h_flex()
+                    .gap_0()
+                    .child(
+                        Button::new("grid-highlight")
+                            .small()
+                            .ghost()
+                            .selected(self.highlight)
+                            .icon(gpui_component::Icon::default().path("icons/focus-cross.svg"))
+                            .tooltip(t(cx, "grid.highlight"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.highlight = !this.highlight;
+                                this.sync_selection(cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("grid-highlight-color")
+                            .tooltip(|window, cx| {
+                                gpui_component::tooltip::Tooltip::new(t(cx, "grid.highlight.color"))
+                                    .build(window, cx)
+                            })
+                            .child(
+                                ColorPicker::new(&self.color_picker)
+                                    .small()
+                                    .icon(IconName::ChevronDown)
+                                    .anchor(Corner::BottomLeft)
+                                    .featured_colors(
+                                        [
+                                            0xeab308, 0x22c55e, 0x06b6d4, 0x3b82f6, 0xa855f7,
+                                            0xf43f5e,
+                                        ]
+                                        .into_iter()
+                                        .map(|v| rgb(v).into())
+                                        .collect(),
+                                    ),
+                            ),
+                    )
+                    .when(self.highlight_color.is_some(), |el| {
+                        el.child(
+                            Button::new("reset-highlight-color")
+                                .small()
                                 .ghost()
-                                .icon(IconName::ChevronLeft)
-                                .disabled(self.busy || self.offset == 0)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.offset = this.offset.saturating_sub(workbench::PAGE_SIZE);
-                                    this.load(cx);
+                                .icon(IconName::Undo2)
+                                .tooltip(t(cx, "grid.highlight.default"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.highlight_color = None;
+                                    this.color_picker.update(cx, |picker, cx| {
+                                        picker.set_value(default_highlight_color(cx), window, cx)
+                                    });
+                                    this.sync_selection(cx);
                                 })),
                         )
-                        .child(format!(
-                            "{} · {} / {}",
-                            self.offset / workbench::PAGE_SIZE + 1,
-                            self.rows.values.len(),
-                            workbench::PAGE_SIZE
-                        ))
-                        .child(
-                            Button::new("page-next")
-                                .ghost()
-                                .icon(IconName::ChevronRight)
-                                .disabled(self.busy || !self.more)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.offset += workbench::PAGE_SIZE;
-                                    this.load(cx);
-                                })),
+                    }),
+            )
+            .when(!self.changes.is_empty(), |bar| {
+                bar.child(div().flex_shrink_0().text_color(cx.theme().warning).child(
+                    crate::locale::tr(
+                        cx,
+                        "grid.toolbar.pending",
+                        &[("count", &self.changes.len().to_string())],
+                    ),
+                ))
+            })
+            .into_any_element()
+    }
+    fn toolbar_statistics(&self, cx: &Context<Self>) -> AnyElement {
+        let details = format!(
+            "{} / {}\n{}\n{}",
+            self.target.database,
+            self.target.object.name,
+            crate::locale::tr(
+                cx,
+                "grid.status",
+                &[
+                    ("rows", &self.rows.values.len().to_string()),
+                    ("ms", &self.elapsed_ms.to_string()),
+                    (
+                        "cell",
+                        &self
+                            .selected
+                            .map(|(r, c)| format!("{}, {}", self.offset + r + 1, c + 1))
+                            .unwrap_or_else(|| "—".into())
+                    ),
+                    ("pending", &self.changes.len().to_string())
+                ]
+            ),
+            t(
+                cx,
+                if self.keyset {
+                    "grid.paging.cursor"
+                } else {
+                    "grid.paging.offset"
+                }
+            )
+        );
+        div()
+            .h_flex()
+            .items_center()
+            .gap_1()
+            .flex_shrink_0()
+            .child(
+                Button::new("grid-count")
+                    .ghost()
+                    .small()
+                    .icon(gpui_component::Icon::default().path("icons/row-count.svg"))
+                    .tooltip(t(cx, "grid.count"))
+                    .disabled(self.busy)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.request(
+                            Action::Count {
+                                object: this.target.object.clone(),
+                                filter: this.options.filter.clone(),
+                            },
+                            cx,
+                        )
+                    })),
+            )
+            .when(self.busy, |el| {
+                el.child(
+                    div()
+                        .h_flex()
+                        .gap_1()
+                        .child(gpui_component::spinner::Spinner::new().small())
+                        .child(t(
+                            cx,
+                            if self.counting {
+                                "grid.count.loading"
+                            } else {
+                                "dbwork.loading"
+                            },
+                        )),
+                )
+            })
+            .child({
+                let tip = crate::locale::tr(
+                    cx,
+                    "grid.toolbar.rows",
+                    &[
+                        ("rows", &self.rows.values.len().to_string()),
+                        (
+                            "total",
+                            &self
+                                .total
+                                .map(|n| n.to_string())
+                                .unwrap_or_else(|| t(cx, "grid.pager.unknown").to_string()),
                         ),
+                    ],
                 );
-        }
-        body.child(
-            div()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(self.notice.clone()),
-        )
+                div()
+                    .id("grid-row-counts")
+                    .flex_shrink_0()
+                    .child(format!(
+                        "{} / {}",
+                        self.rows.values.len(),
+                        self.total
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "—".into())
+                    ))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                    })
+            })
+            .child(
+                div()
+                    .id("grid-toolbar-details")
+                    .flex_shrink_0()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("{} ms", self.elapsed_ms))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(details.clone()).build(window, cx)
+                    }),
+            )
+            .into_any_element()
+    }
+}
+
+pub(super) fn default_highlight_color(cx: &App) -> Hsla {
+    rgb(if cx.theme().mode.is_dark() {
+        0x7395b8
+    } else {
+        0xeab308
+    })
+    .into()
+}
+
+pub(crate) fn structure_details(
+    database: &str,
+    object: &workbench::Object,
+    schema: &Schema,
+) -> crate::feedback::DetailRequest {
+    crate::feedback::DetailRequest {
+        inspector: false,
+        title: if object.schema.is_empty() {
+            format!("{database}.{}", object.name)
+        } else {
+            format!("{database}.{}.{}", object.schema, object.name)
+        },
+        entries: schema
+            .columns
+            .iter()
+            .map(|c| {
+                let mut value = c.data_type.clone();
+                if c.primary {
+                    value.push_str(" · PRIMARY KEY");
+                }
+                if !c.comment.is_empty() {
+                    value.push_str(" · ");
+                    value.push_str(&c.comment);
+                }
+                (c.name.clone(), value)
+            })
+            .collect(),
+        text: schema.ddl.clone(),
     }
 }
 /// Write only after the native save picker. IO stays off the rendering thread.

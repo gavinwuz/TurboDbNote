@@ -52,6 +52,8 @@ pub struct GeneralPreferences {
     pub language: String,
     pub font_family: String,
     pub font_size: f32,
+    pub note_directory: String,
+    pub note_autosave: bool,
     pub theme: Option<String>,
 }
 impl Default for GeneralPreferences {
@@ -59,7 +61,9 @@ impl Default for GeneralPreferences {
         Self {
             language: "zh-CN".into(),
             font_family: ".SystemUIFont".into(),
-            font_size: 16.,
+            font_size: 14.,
+            note_directory: String::new(),
+            note_autosave: true,
             theme: None,
         }
     }
@@ -106,12 +110,31 @@ impl Default for AgentExtension {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DatabasePreferences {
+    pub page_size: usize,
+    pub sql_wrap: bool,
+    pub sql_enter: bool,
+    pub confirm_destructive: bool,
+}
+impl Default for DatabasePreferences {
+    fn default() -> Self {
+        Self {
+            page_size: 200,
+            sql_wrap: true,
+            sql_enter: false,
+            confirm_destructive: true,
+        }
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     pub dark: Option<bool>,
     pub ai: AiPreferences,
     pub general: GeneralPreferences,
+    pub database: DatabasePreferences,
     pub providers: Vec<ProviderPreferences>,
     #[serde(default = "default_extensions")]
     pub extensions: Vec<AgentExtension>,
@@ -124,6 +147,7 @@ impl Default for Preferences {
             dark: None,
             ai: AiPreferences::default(),
             general: GeneralPreferences::default(),
+            database: DatabasePreferences::default(),
             providers: vec![],
             extensions: default_extensions(),
             load_error: None,
@@ -231,6 +255,8 @@ mod tests {
         let mut prefs = Preferences::default();
         prefs.general.language = "en".into();
         prefs.general.font_size = 20.;
+        prefs.general.note_directory = directory.path().join("notes").display().to_string();
+        prefs.general.note_autosave = false;
         prefs.providers.push(ProviderPreferences {
             api_key: "test-key".into(),
             api_mode: "Anthropic Messages".into(),
@@ -331,5 +357,27 @@ mod tests {
         assert_eq!(loaded.dark, Some(true));
         assert_eq!(loaded.ai.codex.executable, prefs.ai.codex.executable);
         assert_eq!(loaded.ai.codex.model, prefs.ai.codex.model);
+    }
+}
+
+#[cfg(test)]
+mod database_preferences_tests {
+    use super::*;
+    #[test]
+    fn older_settings_receive_safe_database_defaults_and_keep_font_choice() {
+        let legacy: Preferences = serde_json::from_str(r#"{"general":{"font_size":18}}"#).unwrap();
+        assert_eq!(legacy.general.font_size, 18.);
+        assert!(legacy.general.note_autosave);
+        assert!(legacy.general.note_directory.is_empty());
+        assert_eq!(Preferences::default().general.font_size, 14.);
+        assert_eq!(legacy.database, DatabasePreferences::default());
+        let mut changed = legacy;
+        changed.database.page_size = 500;
+        changed.database.sql_wrap = false;
+        let restored: Preferences =
+            serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert_eq!(restored.database, changed.database);
+        assert!(restored.database.confirm_destructive);
+        assert!(!restored.database.sql_enter);
     }
 }

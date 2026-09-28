@@ -3,7 +3,17 @@ use crate::DatabaseKind;
 use serde::{Deserialize, Serialize};
 use std::{future::Future, pin::Pin};
 
+#[path = "grid.rs"]
+pub(super) mod grid;
+pub use grid::{
+    Change, DEFAULT_GRID_PAGE_SIZE, Filter, FilterJoin, FilterSet, MAX_FILTER_CONDITIONS,
+    MAX_GRID_PAGE_SIZE, PageOptions, cell_where, copy_row, edit_preview,
+};
+
 pub const PAGE_SIZE: usize = 100;
+fn legacy_page_size() -> usize {
+    PAGE_SIZE
+}
 pub const MAX_BYTES: usize = 768 * 1024;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Rows {
@@ -44,11 +54,40 @@ pub struct Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Action {
+    NoteGrid {
+        plan: super::notebook_query::Plan,
+        confirmed: bool,
+        action: super::notebook_query::GridAction,
+    },
+    NotePrepare {
+        sql: String,
+    },
+    NoteExecute {
+        plan: super::notebook_query::Plan,
+        confirmed: bool,
+        offset: usize,
+        page_size: usize,
+    },
+    GridPage {
+        object: Object,
+        options: PageOptions,
+    },
+    Count {
+        object: Object,
+        filter: Option<FilterSet>,
+    },
+    Commit {
+        object: Object,
+        ddl: String,
+        changes: Vec<Change>,
+    },
     Catalog,
     Describe(Object),
     Page {
         object: Object,
         offset: usize,
+        #[serde(default = "legacy_page_size")]
+        page_size: usize,
     },
     Execute {
         sql: String,
@@ -57,6 +96,19 @@ pub enum Action {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    NotePrepared(super::notebook_query::Plan),
+    NoteResult(super::notebook_query::ResultPage),
+    GridPage {
+        rows: Rows,
+        schema: Schema,
+        offset: usize,
+        more: bool,
+        sql: String,
+        next: Option<Vec<String>>,
+        elapsed_ms: u64,
+        keyset: bool,
+    },
+    Count(u64),
     Catalog {
         objects: Vec<Object>,
         notice: String,
@@ -154,7 +206,7 @@ async fn catalog(
         notice: notices.join(" · "),
     })
 }
-async fn schema(
+pub(super) async fn schema(
     c: &mut impl Access,
     kind: DatabaseKind,
     db: &str,
@@ -318,9 +370,64 @@ pub async fn run(
     r: &Request,
 ) -> Result<Reply, String> {
     match &r.action {
+        Action::NoteGrid {
+            plan,
+            confirmed,
+            action,
+        } => {
+            super::notebook_query::grid_request(
+                c,
+                kind,
+                &r.database,
+                version,
+                plan,
+                *confirmed,
+                action,
+            )
+            .await
+        }
+        Action::NotePrepare { sql } => {
+            super::notebook_query::prepare(c, kind, &r.database, version, sql)
+                .await
+                .map(Reply::NotePrepared)
+        }
+        Action::NoteExecute {
+            plan,
+            confirmed,
+            offset,
+            page_size,
+        } => super::notebook_query::execute(
+            c,
+            kind,
+            &r.database,
+            version,
+            plan,
+            *confirmed,
+            (*offset, *page_size),
+        )
+        .await
+        .map(Reply::NoteResult),
+        Action::GridPage { object, options } => {
+            grid::page(c, kind, version, &r.database, object, options).await
+        }
+        Action::Count { object, filter } => {
+            grid::count(c, kind, &r.database, object, filter.as_ref()).await
+        }
+        Action::Commit {
+            object,
+            ddl,
+            changes,
+        } => grid::commit(c, kind, &r.database, object, ddl, changes).await,
         Action::Catalog => catalog(c, kind, &r.database, version).await,
         Action::Describe(o) => Ok(Reply::Schema(schema(c, kind, &r.database, o, true).await?)),
-        Action::Page { object, offset } => {
+        Action::Page {
+            object,
+            offset,
+            page_size,
+        } => {
+            if !(1..=MAX_GRID_PAGE_SIZE).contains(page_size) {
+                return Err("每页行数必须在 1–1000 之间".into());
+            }
             if *offset > 10_000_000 {
                 return Err("分页偏移过大，请使用条件查询".into());
             }
@@ -339,14 +446,14 @@ pub async fn run(
                 } else {
                     format!(" ORDER BY {}", order.join(","))
                 },
-                PAGE_SIZE + 1
+                page_size + 1
             );
             let mut rows = c.query(&sql).await?;
             if rows.columns.is_empty() {
                 rows.columns = s.columns.iter().map(|c| c.name.clone()).collect();
             }
-            let more = rows.values.len() > PAGE_SIZE;
-            rows.values.truncate(PAGE_SIZE);
+            let more = rows.values.len() > *page_size;
+            rows.values.truncate(*page_size);
             Ok(Reply::Page {
                 rows,
                 offset: *offset,
@@ -478,12 +585,17 @@ impl Access for sqlx::SqliteConnection {
 pub fn literal_for(kind: DatabaseKind, value: &str) -> String {
     if kind == DatabaseKind::MySql {
         format!(
-            "CONVERT(X'{}' USING utf8)",
+            "CONVERT(X'{}' USING {})",
             value
                 .as_bytes()
                 .iter()
                 .map(|b| format!("{b:02x}"))
-                .collect::<String>()
+                .collect::<String>(),
+            if value.chars().any(|c| c as u32 > 0xffff) {
+                "utf8mb4"
+            } else {
+                "utf8"
+            }
         )
     } else if kind == DatabaseKind::ClickHouse {
         format!(

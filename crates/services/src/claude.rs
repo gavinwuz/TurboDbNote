@@ -185,7 +185,7 @@ fn turn_args(model: &str, session: Option<&str>) -> Vec<String> {
     let mut args=vec!["--print","--output-format","stream-json","--verbose","--include-partial-messages",
         "--input-format","text","--tools","","--permission-mode","dontAsk","--strict-mcp-config","--mcp-config",r#"{"mcpServers":{}}"#,
         "--disable-slash-commands","--setting-sources","user","--settings",r#"{"disableAllHooks":true,"enabledPlugins":{}}"#,
-        "--no-chrome","--system-prompt","You are TurboDbNote's SQL analysis assistant. Explain SQL and propose text only. No tools or database access are available. Do not request credentials."]
+        "--no-chrome","--system-prompt","You are TurboDBNote's SQL analysis assistant. Explain SQL and propose text only. No tools or database access are available. Do not request credentials."]
         .into_iter().map(String::from).collect::<Vec<_>>();
     if model != "default" {
         args.extend(["--model".into(), model.into()]);

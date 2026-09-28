@@ -424,7 +424,7 @@ pub fn worker_main() -> Result<(), String> {
         drop(result_guard);
         let mut databases = Vec::new();
         let mut database_list_error = None;
-        if !request.profile.database.is_empty() {
+        if !request.profile.database.is_empty() && !request.profile.list_all_databases {
             databases.push(request.profile.database.clone());
         } else if query(raw, c("SHOW DATABASES")?.as_ptr()) != 0 {
             database_list_error =
@@ -623,8 +623,30 @@ unsafe fn legacy_operation(
         }
         let encoding = if unicode { "utf8" } else { charset };
         let result = (|| {
-            use crate::database::{objects, quote_mysql, validate_name};
+            use crate::database::{objects, quote_mysql};
             match &op.kind {
+                OperationKind::CopyDatabase {
+                    source,
+                    target,
+                    charset,
+                    include_data,
+                } => {
+                    use futures_util::FutureExt;
+                    let mut access = LegacyAccess {
+                        raw,
+                        library,
+                        charset: encoding,
+                    };
+                    crate::database::copy::mysql(
+                        &mut access,
+                        source,
+                        target,
+                        charset,
+                        *include_data,
+                    )
+                    .now_or_never()
+                    .ok_or("兼容复制意外等待异步操作")?
+                }
                 OperationKind::Workbench(r) => {
                     use futures_util::FutureExt;
                     let mut access = LegacyAccess {
@@ -637,8 +659,8 @@ unsafe fn legacy_operation(
                         .ok_or("兼容驱动意外等待异步操作")?
                         .map(|r| OperationResult::Workbench(Box::new(r)))
                 }
-                OperationKind::Databases => {
-                    Ok(OperationResult::Databases(if p.database.is_empty() {
+                OperationKind::Databases => Ok(OperationResult::Databases(
+                    if p.database.is_empty() || p.list_all_databases {
                         legacy_rows(raw, library, "SHOW DATABASES", encoding)?
                             .into_iter()
                             .take(512)
@@ -646,14 +668,16 @@ unsafe fn legacy_operation(
                             .collect()
                     } else {
                         vec![p.database.clone()]
-                    }))
-                }
-                OperationKind::CreateDatabase { name } => {
-                    validate_name(p.kind, name)?;
+                    },
+                )),
+                OperationKind::CreateDatabase { name, charset } => {
+                    if version.starts_with("4.0") && !charset.is_empty() {
+                        return Err("MySQL 4.0 仅支持服务器默认字符集".into());
+                    }
                     legacy_rows(
                         raw,
                         library,
-                        &format!("CREATE DATABASE {}", quote_mysql(name)),
+                        &crate::database::create_database_sql(p.kind, name, charset)?,
                         encoding,
                     )?;
                     Ok(OperationResult::Created(name.clone()))
@@ -685,6 +709,21 @@ unsafe fn legacy_operation(
                     ))
                 }
                 OperationKind::Details { database, object } => {
+                    if object.kind == "database" {
+                        let rows = legacy_rows(
+                            raw,
+                            library,
+                            "SHOW VARIABLES LIKE 'character_set_database'",
+                            encoding,
+                        )?;
+                        return Ok(OperationResult::Details(vec![(
+                            "charset".into(),
+                            rows.first()
+                                .and_then(|r| r.get(1))
+                                .cloned()
+                                .unwrap_or_else(|| "server-default".into()),
+                        )]));
+                    }
                     let qualified =
                         format!("{}.{}", quote_mysql(database), quote_mysql(&object.name));
                     let mut details = Vec::new();

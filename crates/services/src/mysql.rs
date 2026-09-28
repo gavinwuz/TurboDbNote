@@ -381,36 +381,37 @@ async fn open(profile: &Profile, password: &str) -> Result<(MySqlConnection, Ser
     if profile.tls != TlsMode::Disabled && tls_cipher.is_empty() {
         return Err(TlsIssue::Handshake.message().into());
     }
-    let (databases, database_list_error) = if profile.database.is_empty() {
-        let mut databases = Vec::new();
-        let mut error = None;
-        let mut rows = sqlx::query("SHOW DATABASES").fetch(&mut connection);
-        loop {
-            match rows.try_next().await {
-                Ok(Some(row)) => {
-                    if databases.len() == 512 {
-                        error = Some("数据库超过 512 个，请直接输入库名缩小范围".into());
-                        break;
-                    }
-                    match row.try_get::<String, _>(0) {
-                        Ok(name) => databases.push(name),
-                        Err(_) => {
-                            error = Some("数据库名称解码失败".into());
+    let (databases, database_list_error) =
+        if profile.database.is_empty() || profile.list_all_databases {
+            let mut databases = Vec::new();
+            let mut error = None;
+            let mut rows = sqlx::query("SHOW DATABASES").fetch(&mut connection);
+            loop {
+                match rows.try_next().await {
+                    Ok(Some(row)) => {
+                        if databases.len() == 512 {
+                            error = Some("数据库超过 512 个，请直接输入库名缩小范围".into());
                             break;
                         }
+                        match row.try_get::<String, _>(0) {
+                            Ok(name) => databases.push(name),
+                            Err(_) => {
+                                error = Some("数据库名称解码失败".into());
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(_) => {
+                        error = Some("无法读取数据库列表，请检查账号权限；仍可手动输入库名".into());
+                        break;
                     }
                 }
-                Ok(None) => break,
-                Err(_) => {
-                    error = Some("无法读取数据库列表，请检查账号权限；仍可手动输入库名".into());
-                    break;
-                }
             }
-        }
-        (databases, error)
-    } else {
-        (vec![profile.database.clone()], None)
-    };
+            (databases, error)
+        } else {
+            (vec![profile.database.clone()], None)
+        };
     sqlx::query(&format!("SET character_set_results = {}", profile.charset))
         .execute(&mut connection)
         .await

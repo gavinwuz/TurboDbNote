@@ -60,7 +60,7 @@ pub fn open(window: &mut Window, cx: &mut App) {
                                 .child(
                                     div()
                                         .text_size(rems(crate::typography::BRAND))
-                                        .child("TurboDbNote"),
+                                        .child("TurboDBNote"),
                                 )
                                 .child(
                                     div()

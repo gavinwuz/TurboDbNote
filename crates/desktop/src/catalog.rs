@@ -9,7 +9,7 @@ fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
-        .user_agent(concat!("TurboDbNote/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("TurboDBNote/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|_| "common.error.http_client".into())
 }

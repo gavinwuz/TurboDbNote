@@ -15,11 +15,11 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "FileDescription", "TurboDbNote\0"
+            VALUE "FileDescription", "TurboDBNote\0"
             VALUE "FileVersion", "0.1.0\0"
             VALUE "InternalName", "turbodbnote\0"
             VALUE "OriginalFilename", "turbodbnote.exe\0"
-            VALUE "ProductName", "TurboDbNote\0"
+            VALUE "ProductName", "TurboDBNote\0"
             VALUE "ProductVersion", "0.1.0\0"
         END
     END

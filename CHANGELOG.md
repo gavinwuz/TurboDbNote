@@ -1,13 +1,54 @@
 # Changelog
 
+- Refine Note SQL/MD icons, cell toolbar, database dropdown width, bounded path tooltips, shared project ordering and recent-file home; reduce JSON parsing allocations.
+
+- Move New project to a dedicated folder-plus icon before Open in the database header and remove duplicate add buttons from category rows.
+
+- Standardize the display brand as TurboDBNote and rename database connection groups to projects in navigation and connection forms, preserving stored configuration identities.
+
+- Add export destination choices, copy-to-new validation and source charset, execution transport preflight, bounded persistent operation traces, and explicit connection-draft discard on close/switch.
+
+- Redesign transfers with source/destination columns, timestamped filenames, selectable tables and object categories, grid previews, configurable batches, and guarded append/replace/primary-key upsert for SQLite and modern MySQL.
+
+- Add searchable database selection, default database priority, clearer tree indentation, and unified export/copy/import tasks with preview, progress, cancellation, and same-engine transfers.
+
+- Kept count progress within the single-row grid toolbar, removed the mode eye icon, improved readable copied WHERE predicates, and added bounded cell-preview caching with lazy header tooltips.
+
+- Connection imports can detect databases using temporary credentials and a searchable single selection. Font and size controls now share a row, with all installed fonts searchable and a live preview below.
+
+- Added selective connection imports and DBP support, clickable output title and a dedicated name-generation icon. Settings now include font previews, shortcut reference, database tabs and compact AI configuration lists with dialogs.
+
+- Recent connections show addresses and relative times; environment menu colors match the sidebar. Live connections allow draft editing with explicit disconnection confirmation before saving.
+
 English | [简体中文](CHANGELOG.zh-CN.md)
 
 Version history is maintained here. Release notes are generated from the matching version section; candidate versions are not necessarily publicly released.
 
 ## [Unreleased]
 
+- Replace Note metadata forms with a compact document toolbar, inherited default connection/database scope, sequential run-all/stop-all and collapse/expand actions. Move file operations to Note context menus and save status/project/path to tab indicators and tooltips.
+
+- Redesign Note cells with reading/editing modes, contextual icon toolbars and bottom insertion controls. Reuse the table data grid for SQL results; direct single-table projections with complete keys support guarded edits and filters, while joins and derived results remain read-only.
+
+- Add standalone Note drafts, shared project navigation, recent/open recovery, SQL cell execution with 20-row paging, offline Markdown/tasks, and configurable draft storage and autosave in General settings.
+
 ### Added
 
+- Add charset-aware database creation, guarded MySQL/SQLite copying, recent-connection and NCX/DBeaver import menus in the database header; remove duplicate table/view counts from the database name.
+
+- Add multiple filter conditions with AND/OR, separate date/time fields with a Now action, and a compact cell toolbar for NULL, restore-original and copy-WHERE operations.
+
+- Move filters into a collapsible top condition bar with symbolic comparisons and applied/draft state. Share date-aware inputs between filters and cell editing, preserve timestamp precision/timezones, group edit actions, and support grid Ctrl+C/F2 shortcuts.
+
+- Expose duplicate-row and page-export buttons; add editable page size (default 200), first/previous/page/next/last navigation and an explicit manual row-count button. Unknown totals never trigger automatic counting.
+
+- Consolidate data-grid actions, paging and row statistics into one bottom toolbar; use warm yellow highlighting in light mode and muted blue-gray in dark mode, while preserving custom colors.
+
+- Select connections without opening their editor; edit from the context menu. Combine the database name with connection status or separate table/view counts.
+
+- Refined data-grid headers with visible sorting and colored type markers, menu-based column copying, persistent overflow scrollbars, configurable cross highlighting, and consistent refresh icons.
+
+- Add connection type views, filtering and unique name generation; bound error notifications with full-text copying. Upgrade data tabs with a virtual grid, primary-key pagination, sorting/filtering, staged transactional edits, row copying, inspector and schema views.
 - Follow the selected connection in the object browser, clearing offline targets and ignoring retired metadata responses.
 - Display database connection icons, names and muted addresses on a single row, retaining status and disconnect controls.
 - Enable password saving for new connections with a memory-only warning when disabled; prevent clipped connection rows from opening context menus over the object tree.
@@ -90,3 +131,9 @@ Preview candidate. Public release date has not been set.
 **Edits are stored only in memory and are lost when the application closes. Do not use this preview to retain production work.**
 
 File saving, real database execution, AI integration, full SQL completion and Markdown preview are not available. Theme selection does not persist across restarts. Automatic updates are not included. Performance targets have not undergone formal benchmark acceptance. Candidate binaries are unsigned; clean Windows VM and third-party license review remain release gates.
+
+- Unify Note file and SQL/MD insertion icons with neutral document frames and colored upper-right type badges.
+
+- Reuse fixed preview and packaging workspaces; add guarded cleanup of old binaries and incremental caches while preserving runtime data.
+
+- Use a three-row checkbox list icon for task-cell insertion, shared by the menu and bottom toolbar.

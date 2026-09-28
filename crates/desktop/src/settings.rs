@@ -2,7 +2,7 @@ use crate::chat::ChatView;
 use crate::{configuration::Configuration, locale::t};
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, Selectable, StyledExt,
+    ActiveTheme, Disableable, IconName, Selectable, StyledExt, WindowExt,
     button::Button,
     dock::{Panel, PanelEvent},
 };
@@ -10,6 +10,7 @@ use gpui_component::{
 #[derive(Clone, Copy, PartialEq)]
 pub enum Category {
     General,
+    Shortcuts,
     Database,
     Ai,
     Providers,
@@ -26,6 +27,7 @@ impl EventEmitter<SettingsRequest> for ChatView {}
 pub struct SettingsView {
     drivers: Entity<crate::drivers::DriverManager>,
     category: Category,
+    database_tab: usize,
     configuration: Entity<Configuration>,
     _configuration_observe: Subscription,
     chat: Entity<ChatView>,
@@ -70,6 +72,7 @@ impl SettingsView {
                 })
                 .collect(),
             category: Category::General,
+            database_tab: 0,
             focus: cx.focus_handle(),
             close_prompt: false,
             close_after_save: false,
@@ -196,59 +199,68 @@ impl Panel for SettingsView {
     }
 }
 impl Render for SettingsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ai = self.category == Category::Ai;
         let locked = self.chat.read(cx).settings_saving();
         self.configuration.update(cx, |form, _| {
             form.category = self.category;
             form.locked = locked;
+            form.database_tab = self.database_tab;
         });
         let agent_settings = ai || self.category == Category::Extensions;
         let active_engine = self.chat.read(cx).settings_engine();
         let can_switch = self.chat.read(cx).settings_can_switch(cx);
         let body = if self.category == Category::Database {
-            self.drivers.clone().into_any_element()
-        } else if agent_settings {
-            let mut tabs = div()
-                .h_flex()
-                .gap_2()
-                .flex_wrap()
-                .pb_3()
-                .border_b_1()
-                .border_color(cx.theme().border);
-            for engine in [
-                turbodbn_services::agent::Engine::Codex,
-                turbodbn_services::agent::Engine::Claude,
-            ] {
-                tabs = tabs.child(
-                    Button::new(engine.name())
-                        .icon(IconName::Bot)
-                        .label(engine.name())
-                        .selected(ai && active_engine == engine)
-                        .disabled(active_engine != engine && !can_switch)
-                        .tooltip(t(cx, "agents.switch.tooltip"))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.category = Category::Ai;
-                            this.chat.update(cx, |chat, cx| {
-                                chat.select_settings_engine(engine, window, cx)
-                            });
-                            cx.notify();
-                        })),
-                );
-            }
-            tabs = tabs.child(
-                Button::new("openclaw-tab")
-                    .icon(IconName::Bot)
-                    .label("OpenClaw")
-                    .selected(self.category == Category::Extensions)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.category = Category::Extensions;
-                        cx.notify();
-                    })),
+            let tabs = div().h_flex().gap_2().children(
+                ["settings2.query", "settings2.sql", "settings2.drivers"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, label)| {
+                        Button::new(("database-tab", index))
+                            .label(t(cx, label))
+                            .selected(self.database_tab == index)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.database_tab = index;
+                                cx.notify();
+                            }))
+                    }),
             );
-            let content = if ai {
-                self.chat
-                    .update(cx, |chat, cx| chat.render_ai_settings(window, cx))
+            let content = if self.database_tab == 2 {
+                let mut list = div().v_flex().gap_2();
+                for kind in turbodbn_services::DatabaseKind::ALL {
+                    list = list.child(
+                        div()
+                            .h_flex()
+                            .gap_3()
+                            .p_3()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(kind.label())
+                            .child(div().flex_1())
+                            .child(t(cx, "settings2.builtin")),
+                    );
+                }
+                list.child(
+                    Button::new("legacy-driver-settings")
+                        .icon(IconName::Settings2)
+                        .label(t(cx, "settings2.legacy_driver"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let drivers = this.drivers.clone();
+                            window.open_dialog(cx, move |dialog, _, cx| {
+                                dialog
+                                    .title(t(cx, "settings2.legacy_driver"))
+                                    .w(px(680.))
+                                    .child(drivers.clone())
+                                    .footer(|_, _, _, cx| {
+                                        vec![
+                                            crate::feedback::footer_actions()
+                                                .child(crate::feedback::close_button(cx)),
+                                        ]
+                                    })
+                            });
+                        })),
+                )
+                .into_any_element()
             } else {
                 self.configuration.clone().into_any_element()
             };
@@ -258,6 +270,68 @@ impl Render for SettingsView {
                 .child(tabs)
                 .child(content)
                 .into_any_element()
+        } else if agent_settings {
+            let mut list = div().v_flex().gap_3();
+            for engine in [
+                turbodbn_services::agent::Engine::Codex,
+                turbodbn_services::agent::Engine::Claude,
+            ] {
+                let status = if active_engine == engine {
+                    self.chat.read(cx).connection_status()
+                } else {
+                    "settings2.inactive"
+                };
+                list = list.child(
+                    div()
+                        .h_flex()
+                        .gap_3()
+                        .p_3()
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .rounded_md()
+                        .child(IconName::Bot)
+                        .child(div().flex_1().child(engine.name()))
+                        .child(t(cx, status))
+                        .child(
+                            Button::new(engine.name())
+                                .icon(IconName::Settings2)
+                                .label(t(cx, "settings2.configure"))
+                                .disabled(active_engine != engine && !can_switch)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.chat.update(cx, |chat, cx| {
+                                        chat.select_settings_engine(engine, window, cx)
+                                    });
+                                    let chat = this.chat.clone();
+                                    window.open_dialog(cx, move |dialog, window, cx| {
+                                        let body = chat.update(cx, |chat, cx| {
+                                            chat.render_ai_settings(window, cx)
+                                        });
+                                        dialog
+                                            .title(engine.name())
+                                            .w(px(700.))
+                                            .overlay_closable(false)
+                                            .child(
+                                                div()
+                                                    .id("agent-config-scroll")
+                                                    .max_h(px(480.))
+                                                    .overflow_y_scroll()
+                                                    .child(body),
+                                            )
+                                            .footer(|_, _, _, cx| {
+                                                vec![
+                                                    crate::feedback::footer_actions()
+                                                        .child(crate::feedback::close_button(cx)),
+                                                ]
+                                            })
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                );
+            }
+            self.configuration
+                .update(cx, |form, _| form.category = Category::Extensions);
+            list.child(self.configuration.clone()).into_any_element()
         } else {
             self.configuration.clone().into_any_element()
         };
@@ -372,6 +446,16 @@ impl Render for SettingsView {
                                     .selected(self.category == Category::General)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.category = Category::General;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("shortcut-settings")
+                                    .icon(IconName::Settings2)
+                                    .label(t(cx, "settings2.shortcuts"))
+                                    .selected(self.category == Category::Shortcuts)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.category = Category::Shortcuts;
                                         cx.notify();
                                     })),
                             )

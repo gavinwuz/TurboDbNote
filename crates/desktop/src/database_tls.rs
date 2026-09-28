@@ -90,7 +90,7 @@ impl DatabaseView {
                                     .child(
                                         Button::new("tls-disable-retry")
                                             .primary()
-                                            .icon(IconName::Redo)
+                                            .icon(crate::assets::refresh_icon())
                                             .label(crate::locale::t(cx, "db.tls.retry.action"))
                                             .disabled(issue == TlsIssue::Required)
                                             .on_click(move |_, window, cx| {
