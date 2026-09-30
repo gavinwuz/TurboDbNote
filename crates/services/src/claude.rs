@@ -74,6 +74,13 @@ pub fn models() -> Vec<Model> {
     .collect()
 }
 pub fn start(path: PathBuf, cwd: PathBuf) -> (Connection, Receiver<Event>) {
+    start_with_mcp(path, cwd, None)
+}
+pub fn start_with_mcp(
+    path: PathBuf,
+    cwd: PathBuf,
+    mcp: Option<crate::sql_mcp::Config>,
+) -> (Connection, Receiver<Event>) {
     let (commands, rx) = async_channel::bounded(16);
     let (events, output) = async_channel::bounded(128);
     std::thread::spawn(move || {
@@ -82,7 +89,7 @@ pub fn start(path: PathBuf, cwd: PathBuf) -> (Connection, Receiver<Event>) {
             .build()
         {
             Ok(runtime) => runtime.block_on(async {
-                if let Err(error) = run(path, cwd, rx, events.clone()).await {
+                if let Err(error) = run(path, cwd, rx, events.clone(), mcp).await {
                     let _ = events.send(Event::Error(error)).await;
                 }
                 let _ = events.send(Event::Disconnected).await;
@@ -99,6 +106,7 @@ async fn run(
     cwd: PathBuf,
     commands: Receiver<ClientCommand>,
     events: Sender<Event>,
+    mcp: Option<crate::sql_mcp::Config>,
 ) -> Result<(), String> {
     if !path.is_absolute() || !path.is_file() || !cwd.is_absolute() || !cwd.is_dir() {
         return Err("请选择有效的 Claude 可执行文件和工作目录绝对路径".into());
@@ -173,7 +181,17 @@ async fn run(
                 if prompt.text.trim().is_empty() || prompt.text.len() > 65536 {
                     return Err("Claude 输入必须为 1–65536 字节".into());
                 }
-                if !turn(&path, &cwd, prompt, &mut session, &commands, &events).await? {
+                if !turn(
+                    &path,
+                    &cwd,
+                    prompt,
+                    &mut session,
+                    &commands,
+                    &events,
+                    mcp.as_ref(),
+                )
+                .await?
+                {
                     return Ok(());
                 }
             }
@@ -313,9 +331,23 @@ async fn turn(
     session: &mut Option<String>,
     commands: &Receiver<ClientCommand>,
     events: &Sender<Event>,
+    mcp: Option<&crate::sql_mcp::Config>,
 ) -> Result<bool, String> {
-    let mut child = command(path, cwd)
-        .args(turn_args(&prompt.model, session.as_deref()))
+    let mut command = command(path, cwd);
+    let mut args = turn_args(&prompt.model, session.as_deref());
+    if let Some(mcp) = mcp {
+        mcp.configure_claude(&mut command, &mut args);
+        // Only our guarded MCP tools are allowed; built-in shell/file tools stay disabled.
+        args.extend([
+            "--allowedTools".into(),
+            "mcp__turbodbnote__current_database,mcp__turbodbnote__query_sql".into(),
+        ]);
+        if let Some(i) = args.iter().position(|v| v == "--system-prompt") {
+            args[i+1] = "You are TurboDBNote's SQL assistant. Use the TurboDBNote MCP tools only for database access. The application asks the user before executing SQL or sharing results. Never request credentials.".into();
+        }
+    }
+    let mut child = command
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

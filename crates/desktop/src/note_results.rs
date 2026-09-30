@@ -99,6 +99,9 @@ impl TableView {
         self.busy
     }
     pub(super) fn query_controls(&self) -> bool {
+        if self.target.kind == turbodbn_services::DatabaseKind::Redis {
+            return false;
+        }
         self.notebook
             .as_ref()
             .is_none_or(|note| !note.stale && note.source.object.is_some())
@@ -172,6 +175,28 @@ impl TableView {
                 .is_some_and(|db| db.read(cx).connection_snapshot_current(&note.saved))
         {
             self.receive(Err(t(cx, "notes.results_stale").to_string()), cx);
+            return;
+        }
+        let policy = &cx.global::<crate::preferences::Preferences>().database;
+        let query_allowed = turbodbn_services::database::notebook_query::command_required(
+            note.saved.profile.kind,
+            &note.plan.sql,
+        )
+        .is_some_and(|key| policy.command_enabled(key));
+        let writes_allowed = match &action {
+            Action::Commit { changes, .. } => changes.iter().all(|change| {
+                policy.command_enabled(if change.original.is_none() {
+                    "insert"
+                } else if change.values.is_none() {
+                    "delete"
+                } else {
+                    "update"
+                })
+            }),
+            _ => true,
+        };
+        if !query_allowed || !writes_allowed {
+            self.receive(Err(t(cx, "settings.sql_policy_blocked").to_string()), cx);
             return;
         }
         let columns = self.rows.columns.clone();

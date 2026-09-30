@@ -1,5 +1,31 @@
 # Changelog
 
+- Replace AI SQL modal confirmations with bounded inline chat cards, and add scope-bound read-only/read-write/administrator modes with explicit inline write reconfirmation.
+
+- Fix Codex MCP tool approvals for the two application-guarded SQL tools, wait for the selected saved database connection, and separate AI list headings from prose while preserving unsupported inline markup as visible text.
+
+- Add scoped DDL browsing, automatic Note column metadata, read-only-default SQL command permissions, numeric connection ports and new-connection TLS/auth defaults. Add guarded Redis mutations with expiry preservation, a local authenticated SQL MCP bridge, chat database selectors and bounded rich table rendering.
+
+- Bundle the verified legacy MySQL client with both preview and release builds through shared cached staging; show accurate modern/legacy driver status and preserve license/source materials.
+
+- Add Note SQL extension settings and read-mode AI access; consolidate settings/navigation/Note indexes into connections.db with retained migration sources; select MySQL adapters from the server greeting while preserving TLS and old-auth consent.
+
+- Support bounded MySQL SHOW CREATE TABLE/VIEW and SHOW INDEX/KEYS/COLUMNS/FIELDS results in Notes without pagination rewriting; align MySQL hash-comment highlighting with dash comments while preserving quoted values.
+
+- Correct Note mode-switch icons to show their action: eye while editing, pen while reading.
+
+- Add a colored eye marker for Note reading mode, align Note tools and menu icons, measure JSON overflow using the current font, and hand off SQL plus its scope to the AI draft with append/replace/cancel protection.
+
+- Add colored Note read/edit toggles and a shared read-only JSON/text viewer with table switching, bounded previews, search, folding and full-value copy across Note results, table data and Redis.
+
+- Refine Note plan/insert/delete icons and action order; support explicit EXPLAIN query plans without duplicate prefixes, pagination rewrites or result truncation at the Note page size.
+
+- Automatically ready saved Note SQL connections without replacing connection drafts; queue explicit column loads, add colored Col/F/run icons, and add confirmed recoverable deletion to the Note sidebar.
+
+- Move read-only Note SQL copy actions inside the code frame, reserving space for the icon and removing empty header rows.
+
+- Add bounded Redis prefix browsing and typed read-only value tabs; make SQL export previews optional, add object selection, newline choice and a folder shortcut; use `saved` for new Note drafts and repair folder opening.
+
 - Refine Note SQL/MD icons, cell toolbar, database dropdown width, bounded path tooltips, shared project ordering and recent-file home; reduce JSON parsing allocations.
 
 - Move New project to a dedicated folder-plus icon before Open in the database header and remove duplicate add buttons from category rows.
@@ -137,3 +163,11 @@ File saving, real database execution, AI integration, full SQL completion and Ma
 - Reuse fixed preview and packaging workspaces; add guarded cleanup of old binaries and incremental caches while preserving runtime data.
 
 - Use a three-row checkbox list icon for task-cell insertion, shared by the menu and bottom toolbar.
+
+- Add offline Note SQL completion by driver, quoted table SELECT templates, function signatures and guarded, undoable SQL formatting.
+
+- Refine Note read-only confirmation, add execution plans/shortcuts and result release, automatically load transfer catalogs, and distinguish source export privileges with capability-based dump flags.
+
+- Add scope-aware alias column completion and explicit column metadata loading; remove gaps in row/column grid highlighting.
+
+- Add copy-content actions to reading/collapsed Note cells and register SQL syntax highlighting for editors and previews.

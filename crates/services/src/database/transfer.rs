@@ -1,5 +1,7 @@
 #[path = "transfer_diagnostic.rs"]
 mod diagnostic;
+#[path = "export_text.rs"]
+mod export_text;
 #[path = "transfer_options.rs"]
 mod options;
 #[path = "pg_sql_guard.rs"]
@@ -317,7 +319,26 @@ impl Job {
                 )?;
             }
             control.check()?;
-            staged.persist_noclobber(&self.file).map_err(io_error)?;
+            if self.source.profile.kind != DatabaseKind::Sqlite
+                || self
+                    .file
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+            {
+                let mut normalized = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
+                export_text::write_sql(
+                    File::open(staged.path()).map_err(io_error)?,
+                    BufWriter::new(normalized.as_file_mut()),
+                    self.options.crlf,
+                    self.source.profile.kind,
+                    || control.check().map_err(std::io::Error::other),
+                )
+                .map_err(io_error)?;
+                control.check()?;
+                normalized.persist_noclobber(&self.file).map_err(io_error)?;
+            } else {
+                staged.persist_noclobber(&self.file).map_err(io_error)?;
+            }
             return Ok(());
         }
         let target = self.target.as_mut().ok_or("请选择目标连接")?;
@@ -1018,6 +1039,17 @@ fn wait_child(
         result
     }
 }
+fn dump_compatibility_args(help: &str) -> Vec<&'static str> {
+    [
+        ("column-statistics", "--column-statistics=0"),
+        ("set-gtid-purged", "--set-gtid-purged=OFF"),
+        ("no-tablespaces", "--no-tablespaces"),
+    ]
+    .into_iter()
+    .filter_map(|(name, arg)| help.contains(name).then_some(arg))
+    .collect()
+}
+
 fn mysql_export(
     source: &Endpoint,
     path: &Path,
@@ -1041,12 +1073,26 @@ fn mysql_export(
         .output()
         .map_err(io_error)?;
     let version = String::from_utf8_lossy(&version.stdout);
-    if version.contains("8.0") || version.contains("8.4") {
-        cmd.args([
-            "--column-statistics=0",
-            "--set-gtid-purged=OFF",
-            "--no-tablespaces",
-        ]);
+    // Probe the selected executable's supported options, not a substring of its version.
+    let help = command(&tool(&source.profile, "mysqldump")?)
+        .args(["--no-defaults", "--help"])
+        .output()
+        .map_err(io_error)?;
+    if !help.status.success() {
+        return Err("无法检测导出客户端支持的选项".into());
+    }
+    let help = String::from_utf8_lossy(&help.stdout);
+    cmd.args(dump_compatibility_args(&help));
+    cmd.arg("--skip-lock-tables");
+    for (kind, name) in &options.excluded_objects {
+        if kind == "view" {
+            cmd.arg(format!(
+                "--ignore-table={}.{}",
+                source.profile.database, name
+            ));
+        } else {
+            return Err("当前 MySQL 客户端仅支持按类型筛选触发器/例程/事件".into());
+        }
     }
     if tables_only || !options.views {
         if !options.triggers {
@@ -1289,6 +1335,52 @@ fn query_inner(endpoint: &Endpoint, sql: &str, sample: bool) -> Result<String, S
     let diagnostic = diagnostic.join().unwrap_or_default();
     result.map_err(|error| diagnostic.detail().unwrap_or(error))
 }
+/// Read catalog metadata without sampling table rows or requiring native dump tools.
+pub fn catalog(endpoint: &Endpoint, control: &Control) -> Result<(Preview, String), String> {
+    use crate::database::{
+        OperationKind, OperationResult,
+        workbench::{Action, Reply, Request},
+    };
+    let reply = service_operation(
+        endpoint,
+        OperationKind::Workbench(Box::new(Request {
+            database: endpoint.profile.database.clone(),
+            action: Action::Catalog,
+        })),
+        control,
+    )?;
+    let OperationResult::Workbench(reply) = reply else {
+        return Err("无法读取库对象目录".into());
+    };
+    let Reply::Catalog { objects, notice } = *reply else {
+        return Err("无法读取库对象目录".into());
+    };
+    Ok((
+        Preview {
+            objects: objects
+                .into_iter()
+                .take(2000)
+                .map(|o| ObjectChoice {
+                    name: if endpoint.profile.kind == DatabaseKind::PostgreSql
+                        && !o.schema.is_empty()
+                    {
+                        format!(
+                            "{}.{}",
+                            crate::database::workbench::quote(DatabaseKind::PostgreSql, &o.schema),
+                            crate::database::workbench::quote(DatabaseKind::PostgreSql, &o.name)
+                        )
+                    } else {
+                        o.name
+                    },
+                    kind: o.kind,
+                })
+                .collect(),
+            ..Default::default()
+        },
+        notice,
+    ))
+}
+
 pub fn inventory(endpoint: &Endpoint) -> Result<String, String> {
     if endpoint.profile.kind == DatabaseKind::Sqlite {
         let c = Control::default();
@@ -1604,6 +1696,39 @@ pub fn freeze_file(path: &Path, c: &Control) -> Result<tempfile::NamedTempFile, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_capabilities_are_not_tied_to_version_substrings() {
+        assert_eq!(
+            dump_compatibility_args("no-tablespaces set-gtid-purged"),
+            vec!["--set-gtid-purged=OFF", "--no-tablespaces"]
+        );
+        assert_eq!(
+            dump_compatibility_args("no-tablespaces"),
+            vec!["--no-tablespaces"]
+        );
+        assert!(dump_compatibility_args("legacy options").is_empty());
+    }
+    #[test]
+    fn catalog_lists_objects_without_sampling_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("fixture.db");
+        let db = rusqlite::Connection::open(&file).unwrap();
+        db.execute_batch("CREATE TABLE items(id INTEGER); CREATE VIEW v AS SELECT * FROM items; CREATE TRIGGER t AFTER INSERT ON items BEGIN SELECT 1; END;").unwrap();
+        drop(db);
+        let endpoint = Endpoint {
+            profile: Profile {
+                kind: DatabaseKind::Sqlite,
+                sqlite_path: file.display().to_string(),
+                ..Default::default()
+            },
+            password: String::new(),
+        };
+        let (preview, _) = catalog(&endpoint, &Control::default()).unwrap();
+        for kind in ["table", "view", "trigger"] {
+            assert!(preview.objects.iter().any(|o| o.kind == kind));
+        }
+        assert!(preview.rows.is_empty() && preview.columns.is_empty());
+    }
     #[test]
     fn preflight_reports_existing_new_database_without_writing() {
         let root = tempfile::tempdir().unwrap();

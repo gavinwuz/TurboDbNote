@@ -35,6 +35,16 @@ impl Diagnostic {
                 .ok()
                 .filter(|code| known.contains(code))
         });
+        let code = code.or_else(|| {
+            text.lines().find_map(|line| {
+                let suffix = line.rsplit_once('(')?.1.trim_end();
+                let digits = suffix.strip_suffix(')')?;
+                digits
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|code| known.contains(code))
+            })
+        });
         let option = [
             "secure-auth",
             "ssl-mode",
@@ -61,11 +71,31 @@ impl Diagnostic {
             || text.contains("duplicate key")
         {
             "目标库、表或主键已存在，请选择新目标，或核对已有库的追加/更新模式"
+        } else if text.contains("process")
+            && (text.contains("privilege") || text.contains("access denied"))
+        {
+            "源库 PROCESS 权限不足；请使用支持 --no-tablespaces 的导出客户端，不会自动提升权限"
+        } else if (text.contains("reload") || text.contains("flush_tables"))
+            && (text.contains("denied") || text.contains("privilege"))
+        {
+            "源库刷新/锁定权限不足；请核对客户端 GTID 与单事务选项，不会自动重试或更改服务器权限"
+        } else if (text.contains("mysql.proc") || text.contains("show_routine"))
+            && (text.contains("denied") || text.contains("privilege"))
+        {
+            "源库函数/存储过程读取权限不足；可取消勾选函数/存储过程后重新导出，或由管理员授予对应读取权限"
+        } else if (text.contains("event") || text.contains("trigger") || text.contains("show view"))
+            && (text.contains("denied") || text.contains("privilege"))
+        {
+            "源库视图、触发器或事件读取权限不足；请核对勾选的对象类型及对应读取权限"
+        } else if text.contains("permission denied")
+            && (text.contains("file") || text.contains("directory"))
+        {
+            "客户端无法读写本地文件，请检查文件目录权限"
         } else if matches!(code, Some(1044 | 1142 | 1227))
             || text.contains("permission denied")
             || text.contains("access denied")
         {
-            "客户端权限不足，请检查目标库及相应操作权限"
+            "数据库权限不足，请检查当前任务源库的读取权限或目标库的写入权限"
         } else if matches!(code, Some(1054 | 1064 | 1146 | 1193 | 1267))
             || text.contains("syntax error")
             || text.contains("unknown system variable")
@@ -120,6 +150,14 @@ impl Diagnostic {
         let detail = self.detail().unwrap_or_else(|| {
             "客户端未提供可安全展示的错误类别，请查看输出中的失败阶段并核对客户端版本".into()
         });
+        let detail = if !writing {
+            detail.replace(
+                "当前任务源库的读取权限或目标库的写入权限",
+                "源库及所选对象的读取权限",
+            )
+        } else {
+            detail
+        };
         format!(
             "{detail}；退出码 {exit}。{}",
             if writing {
@@ -134,6 +172,22 @@ impl Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dump_privileges_keep_only_category_and_numeric_code() {
+        let result = Diagnostic::parse(
+            b"mysqldump: Couldn't execute query: Access denied; PROCESS privilege required (1227)",
+        )
+        .failure(2, false);
+        assert!(
+            result.contains("PROCESS")
+                && result.contains("no-tablespaces")
+                && result.contains("1227")
+        );
+        assert!(!result.contains("Couldn't") && !result.contains("目标库"));
+        let result =
+            Diagnostic::parse(b"SELECT command denied on mysql.proc (1142)").failure(2, false);
+        assert!(result.contains("存储过程") && result.contains("1142"));
+    }
     #[test]
     fn exit_two_is_classified_without_echoing_remote_data() {
         let sensitive = uuid::Uuid::new_v4().to_string();

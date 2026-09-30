@@ -10,6 +10,8 @@ pub enum WriteMode {
 }
 #[derive(Clone, Serialize)]
 pub struct Options {
+    pub crlf: bool,
+    pub excluded_objects: Vec<(String, String)>,
     pub tables: Option<Vec<String>>,
     pub views: bool,
     pub triggers: bool,
@@ -21,6 +23,8 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            crlf: false,
+            excluded_objects: vec![],
             tables: None,
             views: true,
             triggers: true,
@@ -33,7 +37,7 @@ impl Default for Options {
 }
 impl Options {
     pub(super) fn full_sqlite(&self) -> bool {
-        self.tables.is_none() && self.views && self.triggers
+        self.tables.is_none() && self.views && self.triggers && self.excluded_objects.is_empty()
     }
     pub(super) fn validate(
         &self,
@@ -41,6 +45,14 @@ impl Options {
         contents: Contents,
         profile: &Profile,
     ) -> Result<(), String> {
+        if !self.excluded_objects.is_empty()
+            && (mode == Mode::ImportFile
+                || profile.kind == DatabaseKind::PostgreSql
+                || (profile.kind == DatabaseKind::MySql
+                    && self.excluded_objects.iter().any(|(kind, _)| kind != "view")))
+        {
+            return Err("当前驱动不支持这些对象的逐项排除，请按类型选择".into());
+        }
         if !(1..=10000).contains(&self.batch_size) {
             return Err("分批行数须为 1–10000".into());
         }
@@ -270,6 +282,12 @@ pub(super) fn sqlite_objects(
     let objects = super::sqlite_objects(db)?;
     let mut result = Vec::new();
     for (kind, name, sql) in objects {
+        if options
+            .excluded_objects
+            .contains(&(kind.clone(), name.clone()))
+        {
+            continue;
+        }
         let include = match kind.as_str() {
             "view" => options.views && options.tables.is_none(),
             "trigger" => options.triggers,
@@ -905,6 +923,27 @@ fn mysql_data(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sqlite_object_exclusions_preserve_other_definitions() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE items(id INTEGER); CREATE VIEW kept AS SELECT * FROM items; CREATE VIEW omitted AS SELECT * FROM items; CREATE TRIGGER omitted_trigger AFTER INSERT ON items BEGIN SELECT 1; END;").unwrap();
+        let options = Options {
+            excluded_objects: vec![
+                ("view".into(), "omitted".into()),
+                ("trigger".into(), "omitted_trigger".into()),
+            ],
+            ..Default::default()
+        };
+        assert!(!options.full_sqlite());
+        let objects = sqlite_objects(&db, &options).unwrap();
+        assert!(objects.iter().any(|(_, name, _)| name == "items"));
+        assert!(objects.iter().any(|(_, name, _)| name == "kept"));
+        assert!(
+            !objects
+                .iter()
+                .any(|(_, name, _)| name.starts_with("omitted"))
+        );
+    }
     #[test]
     fn native_dump_batching_preserves_quoted_identifiers_and_other_statements() {
         let dir = tempfile::tempdir().unwrap();

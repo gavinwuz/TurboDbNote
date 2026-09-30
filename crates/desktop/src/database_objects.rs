@@ -2,6 +2,7 @@ use super::*;
 use gpui_component::WindowExt;
 impl DatabaseView {
     pub(super) fn clear_object_view(&mut self) {
+        self.note_columns.clear();
         self.object_scroll = UniformListScrollHandle::new();
         self.selected_object = None;
         self.object_items.clear();
@@ -38,6 +39,7 @@ impl DatabaseView {
             // Metadata requests are read-only. Retire the request ID without disconnecting;
             // its late result must not populate the newly selected connection's object tree.
             self.active_operation = None;
+            self.ddl.pending = false;
         }
         let names = self.catalog(&profile);
         let database = (!profile.database.is_empty())
@@ -119,8 +121,12 @@ impl DatabaseView {
                 object.kind.clone(),
             ));
         }
+        let columns_only = self.ddl.pending
+            || matches!(&kind, OperationKind::Workbench(request) if matches!(request.action, Action::NoteColumns(_) | Action::Ddl(_) | Action::NotePrepare { .. } | Action::NoteExecute { .. }));
         self.active_operation = Some((id, request, kind));
-        self.object_notice = "正在读取 / 执行…".into();
+        if !columns_only {
+            self.object_notice = "正在读取 / 执行…".into();
+        }
         cx.notify();
         true
     }
@@ -183,13 +189,46 @@ impl DatabaseView {
         if result.is_ok() {
             self.remember_connection(id, cx);
         }
+        if let Some(sender) = self.mcp_target.take() {
+            let _ = sender.try_send(match result {
+                Ok(OperationResult::Workbench(reply)) => Ok(*reply),
+                _ => Err("mcp.failed".into()),
+            });
+            cx.notify();
+            return;
+        }
+        if self.ddl.pending {
+            self.ddl.pending = false;
+            self.receive_ddl(result, cx);
+            return;
+        }
+        if let OperationKind::Workbench(request) = &kind
+            && let Action::NoteColumns(object) = &request.action
+        {
+            match result {
+                Ok(OperationResult::Workbench(reply)) => {
+                    if let Reply::Schema(schema) = *reply {
+                        self.remember_note_columns(id, &request.database, object, &schema.columns);
+                    }
+                }
+                Err(error) => feedback::error(error, cx),
+                _ => {}
+            }
+            cx.emit(NoteColumnsReady(id));
+            cx.notify();
+            return;
+        }
+
         if let Some(target) = self.workbench_target.take() {
             let result = result.and_then(|r| match r {
                 OperationResult::Workbench(r) => Ok(*r),
                 _ => Err("响应类型不匹配".into()),
             });
             let _ = target.update(cx, |view, cx| view.receive(result, cx));
-            self.object_notice = format!("{} 个对象", self.catalog_objects.len());
+            self.object_notice = format!(
+                "{} 个对象",
+                self.catalog_objects.len().max(self.object_items.len())
+            );
             cx.notify();
             return;
         }
@@ -234,12 +273,15 @@ impl DatabaseView {
                     self.object_notice = "SQL 已执行，请刷新对象列表".into();
                     feedback::success(crate::locale::t(cx, "dbwork.executed"), cx);
                     self.schemas.clear();
+                    self.note_columns
+                        .retain(|(connection, _, _, _), _| *connection != id);
                 }
                 Reply::Page { .. }
                 | Reply::GridPage { .. }
                 | Reply::Count(_)
                 | Reply::NotePrepared(_)
-                | Reply::NoteResult(_) => {}
+                | Reply::NoteResult(_)
+                | Reply::RedisValue(_) => {}
             },
             Err(error) => {
                 self.pending_object_action = None;
@@ -259,19 +301,24 @@ impl DatabaseView {
                 cursor,
                 notice,
             }) => {
+                if matches!(kind, OperationKind::Objects { .. }) {
+                    self.redis_pattern = "*".into();
+                }
                 if matches!(
                     kind,
                     OperationKind::Objects {
                         cursor: Some(_),
                         ..
                     }
-                ) {
+                ) || matches!(&kind,OperationKind::Workbench(r) if matches!(r.action,Action::RedisScan {cursor:Some(_),..}))
+                {
                     for item in items {
                         if !self.object_items.iter().any(|old| {
                             old.schema == item.schema
                                 && old.name == item.name
                                 && old.key == item.key
-                        }) {
+                        }) && self.object_items.len() < 5000
+                        {
                             self.object_items.push(item);
                         }
                     }
@@ -670,183 +717,200 @@ impl DatabaseView {
                 })
         });
     }
-    pub fn render_objects(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some((id, database)) = self.selected_database.clone() else {
-            return div()
-                .v_flex()
-                .gap_3()
-                .child("数据库对象")
-                .child("连接后，在左侧选择数据库以浏览表、视图或 Redis Key。列与索引在这里展示。")
-                .into_any_element();
-        };
-        let profile = self.profiles.iter().find(|p| p.id == id).cloned();
+    fn scan_redis(&mut self, id: Uuid, database: String, more: bool, cx: &mut Context<Self>) {
+        if !more {
+            let text = self.object_filter.read(cx).value().trim().to_string();
+            self.redis_pattern = if text.is_empty() { "*".into() } else { text };
+            self.object_items.clear();
+            self.object_cursor = None;
+        }
+        if self.object_items.len() >= 5000 {
+            return;
+        }
+        self.request_operation(
+            id,
+            OperationKind::Workbench(Box::new(workbench::Request {
+                database,
+                action: Action::RedisScan {
+                    cursor: if more {
+                        self.object_cursor.clone()
+                    } else {
+                        None
+                    },
+                    pattern: self.redis_pattern.clone(),
+                },
+            })),
+            cx,
+        );
+    }
+    pub(super) fn render_redis_tree(
+        &self,
+        id: Uuid,
+        database: String,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        use std::collections::BTreeSet;
+        let connected = self.sessions.contains_key(&id);
         let busy = self.active_operation.is_some();
-        let connected = self.states.get(&id).is_some_and(|s| s == "已连接");
-        let reload = database.clone();
-        let back = database.clone();
-        let mut body = div()
+        let mut folders = BTreeSet::new();
+        let mut rows = Vec::<(String, usize, Option<usize>, String)>::new();
+        for (index, item) in self.object_items.iter().enumerate() {
+            let valid = item
+                .key
+                .as_ref()
+                .is_none_or(|key| std::str::from_utf8(key).is_ok());
+            let parts = if valid {
+                item.name.splitn(5, ':').collect::<Vec<_>>()
+            } else {
+                vec![item.name.as_str()]
+            };
+            let mut prefix = String::new();
+            let mut visible = true;
+            for (depth, part) in parts.iter().enumerate().take(parts.len().saturating_sub(1)) {
+                if depth > 0 {
+                    prefix.push(':');
+                }
+                prefix.push_str(part);
+                if !visible {
+                    break;
+                }
+                if folders.insert(prefix.clone()) {
+                    rows.push((prefix.clone(), depth, None, (*part).into()));
+                }
+                visible = self.expanded_objects.contains(&format!("redis:{prefix}"));
+            }
+            if visible {
+                rows.push((
+                    item.name.clone(),
+                    parts.len() - 1,
+                    Some(index),
+                    parts.last().unwrap_or(&"").to_string(),
+                ));
+            }
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.is_some().cmp(&b.2.is_some())));
+        let scan_db = database.clone();
+        let more_db = database.clone();
+        div()
             .v_flex()
             .size_full()
             .min_h_0()
-            .gap_3()
-            .child(div().text_lg().child(format!(
-                "{} / {}",
-                profile.as_ref().map(|p| p.name.as_str()).unwrap_or("连接"),
-                database
-            )))
-            .when(!self.object_details.is_empty(), |el| {
-                el.child(
-                    self.selected_object
-                        .as_ref()
-                        .map(|o| {
-                            if o.schema.is_empty() {
-                                o.name.clone()
-                            } else {
-                                format!("{}.{}", o.schema, o.name)
-                            }
-                        })
-                        .unwrap_or_default(),
-                )
-            })
+            .gap_2()
             .child(
                 div()
                     .h_flex()
-                    .gap_2()
+                    .gap_1()
+                    .child(Input::new(&self.object_filter).cleanable(true).flex_1())
                     .child(
-                        Button::new("refresh-objects")
-                            .icon(crate::assets::refresh_icon())
-                            .label("刷新")
+                        Button::new("redis-filter")
+                            .icon(IconName::Search)
+                            .tooltip(crate::locale::t(cx, "redis.filter"))
                             .disabled(busy || !connected)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.select_database(id, reload.clone(), cx)
+                                this.scan_redis(id, scan_db.clone(), false, cx)
                             })),
-                    )
-                    .when(!self.object_details.is_empty(), |el| {
-                        el.child(
-                            Button::new("back-to-objects")
-                                .icon(IconName::ArrowLeft)
-                                .label("对象列表")
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.object_details.clear();
-                                    this.selected_object = None;
-                                    this.object_notice =
-                                        format!("{} · {} 个对象", back, this.object_items.len());
-                                    cx.notify();
-                                })),
-                        )
+                    ),
+            )
+            .child(
+                uniform_list(
+                    "redis-key-tree",
+                    rows.len(),
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .map(|index| {
+                                let (path, depth, item, label) = rows[index].clone();
+                                let key = format!("redis:{path}");
+                                let expanded = this.expanded_objects.contains(&key);
+                                let db = database.clone();
+                                Button::new(("redis-tree-row", index))
+                                    .ghost()
+                                    .h(px(28.))
+                                    .w_full()
+                                    .justify_start()
+                                    .pl(px(8. + depth as f32 * 12.))
+                                    .icon(if item.is_some() {
+                                        IconName::File
+                                    } else if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .label(label)
+                                    .tooltip(path)
+                                    .disabled(busy || !connected)
+                                    .on_click(cx.listener(
+                                        move |this, event: &ClickEvent, _, cx| {
+                                            if let Some(index) = item {
+                                                if event.click_count() != 2 {
+                                                    return;
+                                                }
+                                                let item = &this.object_items[index];
+                                                let bytes = item
+                                                    .key
+                                                    .as_deref()
+                                                    .unwrap_or(item.name.as_bytes());
+                                                let hex = bytes
+                                                    .iter()
+                                                    .map(|b| format!("{b:02x}"))
+                                                    .collect::<String>();
+                                                cx.emit(OpenTable {
+                                                    connection: id,
+                                                    database: db.clone(),
+                                                    object: Object {
+                                                        schema: hex.clone(),
+                                                        name: item.name.clone(),
+                                                        kind: "redis-key".into(),
+                                                        comment: String::new(),
+                                                        parent: hex,
+                                                    },
+                                                    mode: crate::table_view::Mode::Grid,
+                                                    generation: this.note_generation(id),
+                                                    kind: DatabaseKind::Redis,
+                                                    writable: false,
+                                                });
+                                            } else {
+                                                if !this.expanded_objects.remove(&key) {
+                                                    this.expanded_objects.insert(key.clone());
+                                                }
+                                                cx.notify();
+                                            }
+                                        },
+                                    ))
+                            })
+                            .collect()
                     }),
+                )
+                .flex_1()
+                .min_h_0(),
             )
             .child(
                 div()
-                    .text_sm()
+                    .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(if connected {
-                        self.object_notice.clone()
-                    } else {
-                        "连接已断开，以下为缓存；重连后刷新".into()
-                    }),
-            );
-        if self.object_details.is_empty() {
-            let count = self.object_items.len();
-            let db = database.clone();
-            body = body
-                .child(
-                    uniform_list(
-                        "database-objects",
-                        count,
-                        cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
-                            range
-                                .map(|ix| {
-                                    let object = this.object_items[ix].clone();
-                                    let name = if object.schema.is_empty() {
-                                        object.name.clone()
-                                    } else {
-                                        format!("{}.{}", object.schema, object.name)
-                                    };
-                                    let target = db.clone();
-                                    Button::new(("object", ix))
-                                        .ghost()
-                                        .icon(if object.kind == "Key" {
-                                            IconName::File
-                                        } else {
-                                            IconName::GalleryVerticalEnd
-                                        })
-                                        .label(format!("{name} · {}", object.kind))
-                                        .tooltip(name)
-                                        .justify_start()
-                                        .h(px(32.))
-                                        .w_full()
-                                        .disabled(busy || !connected)
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.request_operation(
-                                                id,
-                                                OperationKind::Details {
-                                                    database: target.clone(),
-                                                    object: object.clone(),
-                                                },
-                                                cx,
-                                            );
-                                        }))
-                                        .into_any_element()
-                                })
-                                .collect::<Vec<_>>()
-                        }),
+                    .h_flex()
+                    .gap_1()
+                    .child(self.object_notice.clone())
+                    .child(
+                        Button::new("redis-scope-info")
+                            .ghost()
+                            .icon(IconName::Info)
+                            .tooltip(crate::locale::t(cx, "redis.scope")),
+                    ),
+            )
+            .child(
+                Button::new("redis-scan-more")
+                    .icon(crate::assets::refresh_icon())
+                    .label(crate::locale::t(cx, "redis.scan_more"))
+                    .disabled(
+                        busy || !connected
+                            || self.object_cursor.is_none()
+                            || self.object_items.len() >= 5000,
                     )
-                    .track_scroll(self.object_scroll.clone())
-                    .h(px(360.))
-                    .w_full(),
-                )
-                .when(count == 0 && !busy, |el| el.child("当前数据库没有可见对象"));
-            if let Some(cursor) = self.object_cursor.clone() {
-                body = body.child(
-                    Button::new("more-keys")
-                        .label("继续扫描 Key")
-                        .disabled(busy || !connected)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.request_operation(
-                                id,
-                                OperationKind::Objects {
-                                    database: database.clone(),
-                                    cursor: Some(cursor.clone()),
-                                },
-                                cx,
-                            );
-                        })),
-                );
-            }
-        } else {
-            body = body.child(
-                uniform_list(
-                    "object-details",
-                    self.object_details.len(),
-                    cx.processor(|this, range: std::ops::Range<usize>, _, _| {
-                        range
-                            .map(|ix| {
-                                let (name, value) = &this.object_details[ix];
-                                div()
-                                    .v_flex()
-                                    .h(px(64.))
-                                    .gap_1()
-                                    .child(name.clone())
-                                    .child(
-                                        div()
-                                            .text_sm()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .child(value.clone()),
-                                    )
-                                    .into_any_element()
-                            })
-                            .collect::<Vec<_>>()
-                    }),
-                )
-                .track_scroll(self.detail_scroll.clone())
-                .h(px(460.))
-                .w_full(),
-            );
-        }
-        body.into_any_element()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.scan_redis(id, more_db.clone(), true, cx)
+                    })),
+            )
+            .into_any_element()
     }
 }
 
@@ -855,9 +919,14 @@ fn is_metadata_read(kind: &OperationKind) -> bool {
         OperationKind::Databases
         | OperationKind::Objects { .. }
         | OperationKind::Details { .. } => true,
-        OperationKind::Workbench(request) => {
-            matches!(request.action, Action::Catalog | Action::Describe(_))
-        }
+        OperationKind::Workbench(request) => matches!(
+            request.action,
+            Action::Catalog
+                | Action::Describe(_)
+                | Action::Ddl(_)
+                | Action::NoteColumns(_)
+                | Action::RedisScan { .. }
+        ),
         OperationKind::CreateDatabase { .. } | OperationKind::CopyDatabase { .. } => false,
     }
 }

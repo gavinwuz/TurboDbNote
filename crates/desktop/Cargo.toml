@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+markdown = "=1.0.0"
 gpui.workspace = true
 gpui-component.workspace = true
 gpui-component-assets.workspace = true
@@ -14,6 +15,10 @@ turbodbn-core.workspace = true
 turbodbn-services.workspace = true
 turbodbn-diagnostics = { path = "../diagnostics" }
 async-channel = "2"
+anyhow = "1"
+lsp-types = "=0.97.0"
+tree-sitter-sequel = "=0.3.8"
+tree-sitter-language = "=0.1.8"
 serde.workspace = true
 serde_json.workspace = true
 dirs = "6"
@@ -26,6 +31,7 @@ semver = "1"
 chrono = "0.4"
 
 [build-dependencies]
+cc = "=1.2.67"
 embed-resource = "=3.0.11"
 serde.workspace = true
 serde_json.workspace = true

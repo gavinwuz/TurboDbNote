@@ -15,6 +15,8 @@ pub struct OpenTable {
 impl EventEmitter<OpenTable> for DatabaseView {}
 impl DatabaseView {
     pub(super) fn cancel_table_request(&mut self, cx: &mut Context<Self>) {
+        self.mcp_target = None;
+        self.ddl.pending = false;
         if let Some(view) = self.workbench_target.take() {
             let _ = view.update(cx, |this, cx| {
                 this.receive(
@@ -390,7 +392,7 @@ impl DatabaseView {
             }
             if p.kind == DatabaseKind::Redis {
                 return body
-                    .child(self.render_objects(window, cx))
+                    .child(self.render_redis_tree(id, database.clone(), cx))
                     .into_any_element();
             }
         }
@@ -796,6 +798,18 @@ impl DatabaseView {
         }
         if action == "export" {
             self.open_table(object, crate::table_view::Mode::Export, cx);
+            return;
+        }
+        if action == "structure" {
+            feedback::ddl_context(
+                feedback::DdlContext {
+                    origin: None,
+                    scope: self.selected_database.clone(),
+                    object: Some(object),
+                    open: true,
+                },
+                cx,
+            );
             return;
         }
         let key = Self::object_key(&object);

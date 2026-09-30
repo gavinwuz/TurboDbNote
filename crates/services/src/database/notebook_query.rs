@@ -65,12 +65,42 @@ fn parse(kind: DatabaseKind, sql: &str) -> Result<Statement, String> {
 #[derive(Default)]
 struct Inspection {
     postgres: bool,
+    functions: bool,
     writes: bool,
     blocked: bool,
     tables: BTreeSet<Vec<String>>,
 }
 impl Visitor for Inspection {
     type Break = ();
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<()> {
+        if let Expr::Function(function) = expr {
+            // These built-ins cannot write data. Unknown/stored/UDF calls on legacy
+            // servers still require confirmation because no read-only transaction exists.
+            self.functions |= !matches!(
+                function.name.to_string().to_ascii_uppercase().as_str(),
+                "COUNT"
+                    | "SUM"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+                    | "ABS"
+                    | "ROUND"
+                    | "COALESCE"
+                    | "IFNULL"
+                    | "NULLIF"
+                    | "LOWER"
+                    | "UPPER"
+                    | "LENGTH"
+                    | "CONCAT"
+                    | "SUBSTRING"
+                    | "TRIM"
+                    | "NOW"
+                    | "CURDATE"
+                    | "DATE_FORMAT"
+            );
+        }
+        ControlFlow::Continue(())
+    }
     fn pre_visit_statement(&mut self, s: &Statement) -> ControlFlow<()> {
         if !matches!(s, Statement::Query(_)) {
             self.writes = true;
@@ -117,6 +147,37 @@ impl Visitor for Inspection {
     }
 }
 fn inspect(s: &Statement, kind: DatabaseKind) -> Result<Inspection, String> {
+    if let Statement::Explain {
+        analyze,
+        statement,
+        options,
+        ..
+    } = s
+    {
+        if *analyze
+            || options.as_ref().is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|option| option.name.value.eq_ignore_ascii_case("ANALYZE"))
+            })
+        {
+            return Err("notes.explain.analyze_unsupported".into());
+        }
+        if !matches!(statement.as_ref(), Statement::Query(_)) {
+            return Err("notes.explain.query_only".into());
+        }
+        if options.as_ref().is_some_and(|options| {
+            options.iter().any(|option| {
+                !matches!(
+                    option.name.value.to_ascii_uppercase().as_str(),
+                    "FORMAT" | "VERBOSE" | "COSTS" | "SETTINGS" | "GENERIC_PLAN"
+                )
+            })
+        }) {
+            return Err("notes.explain.options_unsupported".into());
+        }
+        return inspect(statement, kind);
+    }
     let mut info = Inspection {
         postgres: kind == DatabaseKind::PostgreSql,
         ..Default::default()
@@ -137,7 +198,7 @@ fn inspect(s: &Statement, kind: DatabaseKind) -> Result<Inspection, String> {
             }
     );
     if !supported || info.blocked || info.tables.len() > 16 {
-        return Err("当前笔记支持单条查询及表级 INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/TRUNCATE；不支持会话控制、文件操作或带锁查询".into());
+        return Err("notes.sql_scope_unsupported".into());
     }
     if matches!(s, Statement::Query(_)) && info.writes {
         return Err("分页查询不能包含写入型 CTE".into());
@@ -172,7 +233,7 @@ fn object(kind: DatabaseKind, database: &str, parts: &[String]) -> Result<Object
         parent: String::new(),
     })
 }
-async fn resolved_object(
+pub(super) async fn resolved_object(
     c: &mut impl Access,
     kind: DatabaseKind,
     database: &str,
@@ -230,6 +291,174 @@ async fn stamp(
         workbench::schema(c, kind, database, o, true).await?.ddl,
     ))
 }
+/// Application command categories are not server grants; preparation remains mandatory.
+pub const COMMANDS: &[(&str, &str, bool)] = &[
+    ("select", "SELECT", true),
+    ("explain", "EXPLAIN", true),
+    ("insert", "INSERT", false),
+    ("update", "UPDATE", false),
+    ("delete", "DELETE", false),
+    ("create", "CREATE TABLE", false),
+    ("alter", "ALTER TABLE", false),
+    ("drop", "DROP", false),
+    ("truncate", "TRUNCATE", false),
+    ("show_create", "SHOW CREATE TABLE / VIEW", true),
+    (
+        "show_columns",
+        "SHOW INDEX / INDEXES / KEYS / COLUMNS / FIELDS",
+        true,
+    ),
+    ("show_tables", "SHOW TABLES", true),
+    ("show_status", "SHOW STATUS", true),
+    ("show_variables", "SHOW VARIABLES", true),
+];
+
+pub fn command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
+    if let Some(key) = extension_required(kind, sql) {
+        return Some(key);
+    }
+    if mysql_metadata(kind, sql) {
+        use sqlparser::tokenizer::{Token, Tokenizer};
+        let tokens = Tokenizer::new(&MySqlDialect {}, sql).tokenize().ok()?;
+        return Some(if tokens.iter().filter(|t| !matches!(t, Token::Whitespace(_))).nth(1).is_some_and(|token| matches!(token, Token::Word(w) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("CREATE"))) {
+            "show_create"
+        } else { "show_columns" });
+    }
+    match parse(kind, sql).ok()? {
+        Statement::Query(_) => Some("select"),
+        Statement::Explain { .. } => Some("explain"),
+        Statement::Insert(_) => Some("insert"),
+        Statement::Update { .. } => Some("update"),
+        Statement::Delete(_) => Some("delete"),
+        Statement::CreateTable(_) => Some("create"),
+        Statement::AlterTable { .. } => Some("alter"),
+        Statement::Drop { .. } => Some("drop"),
+        Statement::Truncate { .. } => Some("truncate"),
+        _ => None,
+    }
+}
+
+/// Vetted optional read-only categories. No arbitrary SQL-prefix escape hatch.
+pub fn extension_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
+    if kind != DatabaseKind::MySql {
+        return None;
+    }
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let mut tokens = Tokenizer::new(&MySqlDialect {}, sql)
+        .tokenize()
+        .ok()?
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    if tokens.last() == Some(&Token::SemiColon) {
+        tokens.pop();
+    }
+    if tokens.len() != 2 {
+        return None;
+    }
+    let word = |t: &Token| match t {
+        Token::Word(w) if w.quote_style.is_none() => Some(w.value.to_ascii_uppercase()),
+        _ => None,
+    };
+    if word(&tokens[0]).as_deref() != Some("SHOW") {
+        return None;
+    }
+    match word(&tokens[1]).as_deref() {
+        Some("TABLES") => Some("show_tables"),
+        Some("STATUS") => Some("show_status"),
+        Some("VARIABLES") => Some("show_variables"),
+        _ => None,
+    }
+}
+// MySQL metadata reads have their own bounded result path, never SELECT pagination.
+fn mysql_metadata(kind: DatabaseKind, sql: &str) -> bool {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    if kind != DatabaseKind::MySql
+        || sql.len() > 60_000
+        || sql.contains(['\0'])
+        || sql.contains("/*!")
+        || sql.contains("/*M!")
+    {
+        return false;
+    }
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, sql).tokenize() else {
+        return false;
+    };
+    let mut tokens = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    if tokens.last() == Some(&Token::SemiColon) {
+        tokens.pop();
+    }
+    fn keyword(token: Option<&Token>, word: &str) -> bool {
+        matches!(token, Some(Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word))
+    }
+    if extension_required(kind, sql).is_some() {
+        return true;
+    }
+    if !keyword(tokens.first(), "SHOW") {
+        return false;
+    }
+    let mut i = 1;
+    let create = keyword(tokens.get(i), "CREATE");
+    if create {
+        i += 1;
+        if !["TABLE", "VIEW"].iter().any(|w| keyword(tokens.get(i), w)) {
+            return false;
+        }
+        i += 1;
+    } else {
+        if keyword(tokens.get(i), "FULL") {
+            i += 1;
+        }
+        if !["INDEX", "INDEXES", "KEYS", "COLUMNS", "FIELDS"]
+            .iter()
+            .any(|w| keyword(tokens.get(i), w))
+        {
+            return false;
+        }
+        i += 1;
+        if !["FROM", "IN"].iter().any(|w| keyword(tokens.get(i), w)) {
+            return false;
+        }
+        i += 1;
+    }
+    if !matches!(tokens.get(i), Some(Token::Word(_))) {
+        return false;
+    }
+    i += 1;
+    if tokens.get(i) == Some(&Token::Period) {
+        i += 1;
+        if !matches!(tokens.get(i), Some(Token::Word(_))) {
+            return false;
+        }
+        i += 1;
+    }
+    if !create && ["FROM", "IN"].iter().any(|w| keyword(tokens.get(i), w)) {
+        i += 1;
+        if !matches!(tokens.get(i), Some(Token::Word(_))) {
+            return false;
+        }
+        i += 1;
+    }
+    i == tokens.len()
+}
+async fn metadata_result(c: &mut impl Access, sql: &str) -> Result<ResultPage, String> {
+    let start = Instant::now();
+    let rows = c.query(sql).await?;
+    if rows.columns.len() > 512 || rows.values.len() > 1000 {
+        return Err("notes.metadata.limit".into());
+    }
+    Ok(ResultPage {
+        grid: None,
+        rows,
+        more: false,
+        offset: 0,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        read_only: true,
+    })
+}
 pub async fn prepare(
     c: &mut impl Access,
     kind: DatabaseKind,
@@ -237,6 +466,14 @@ pub async fn prepare(
     version: &str,
     sql: &str,
 ) -> Result<Plan, String> {
+    if mysql_metadata(kind, sql) {
+        return Ok(Plan {
+            sql: sql.trim().into(),
+            read_only: true,
+            confirm: false,
+            guards: vec![],
+        });
+    }
     let stmt = parse(kind, sql)?;
     let info = inspect(&stmt, kind)?;
     let legacy = kind == DatabaseKind::MySql && !crate::mysql::modern_version(version);
@@ -254,10 +491,47 @@ pub async fn prepare(
     Ok(Plan {
         sql: sql.trim().to_owned(),
         read_only: !info.writes,
-        confirm: info.writes || legacy,
+        confirm: info.writes || (legacy && info.functions),
         guards,
     })
 }
+/// Plain EXPLAIN only: ANALYZE is never appended and the original statement must be a query.
+pub async fn explain(
+    c: &mut impl Access,
+    kind: DatabaseKind,
+    sql: &str,
+) -> Result<ResultPage, String> {
+    let statement = parse(kind, sql)?;
+    let info = inspect(&statement, kind)?;
+    if info.writes {
+        return Err("notes.explain.query_only".into());
+    }
+    let start = Instant::now();
+    let prefix = if kind == DatabaseKind::Sqlite {
+        "EXPLAIN QUERY PLAN"
+    } else {
+        "EXPLAIN"
+    };
+    let sql = if matches!(statement, Statement::Explain { .. }) {
+        sql.trim().to_owned()
+    } else {
+        format!("{prefix} {sql}")
+    };
+    let mut rows = c.query(&sql).await?;
+    if rows.columns.len() > 512 || rows.values.len() > 1000 {
+        return Err("执行计划超过显示上限，请简化查询".into());
+    }
+    rows.values.shrink_to_fit();
+    Ok(ResultPage {
+        grid: None,
+        rows,
+        more: false,
+        offset: 0,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        read_only: true,
+    })
+}
+
 fn number(expr: &Expr) -> Result<usize, String> {
     match expr {
         Expr::Value(v) => match &v.value {
@@ -396,14 +670,26 @@ pub async fn execute(
     page: (usize, usize),
 ) -> Result<ResultPage, String> {
     let (offset, size) = page;
+    if mysql_metadata(kind, &plan.sql) {
+        if !plan.read_only || !plan.guards.is_empty() || offset != 0 {
+            return Err("notes.metadata.invalid".into());
+        }
+        return metadata_result(c, &plan.sql).await;
+    }
     let stmt = parse(kind, &plan.sql)?;
     let info = inspect(&stmt, kind)?;
     if info.writes == plan.read_only {
         return Err("SQL 预览状态无效，请重新执行".into());
     }
     let legacy = kind == DatabaseKind::MySql && !crate::mysql::modern_version(version);
-    if (info.writes || legacy) && !confirmed {
+    if (info.writes || (legacy && info.functions)) && !confirmed {
         return Err("此 SQL 必须先预览并确认".into());
+    }
+    if matches!(stmt, Statement::Explain { .. }) {
+        if offset != 0 {
+            return Err("notes.explain.no_paging".into());
+        }
+        return explain(c, kind, &plan.sql).await;
     }
     if !plan.read_only && offset != 0 {
         return Err("写入语句不能分页重放".into());
@@ -483,6 +769,241 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mysql_show_metadata_preserves_comments_without_pagination() {
+        struct Capture(Vec<String>);
+        impl Access for Capture {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                self.0.push(sql.into());
+                Box::pin(async {
+                    Ok(Rows {
+                        columns: vec!["Table".into(), "Create Table".into()],
+                        values: vec![
+                            vec![Some("t".into()), Some("CREATE TABLE t(id INT)".into())];
+                            30
+                        ],
+                    })
+                })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            for sql in ["SHOW CREATE TABLE `seach_works`;\n# 递归方法链\n-- SHOW INDEX FROM `seach_works`;", "SHOW INDEX FROM `t`", "SHOW KEYS IN db.t", "SHOW FULL COLUMNS FROM t FROM db", "SHOW CREATE VIEW db.v"] {
+                let mut db=Capture(vec![]);
+                let plan=prepare(&mut db,DatabaseKind::MySql,"db","5.5",sql).await.unwrap();
+                assert!(plan.read_only && !plan.confirm);
+                let result=execute(&mut db,DatabaseKind::MySql,"db","5.5",&plan,false,(0,20)).await.unwrap();
+                assert_eq!(db.0,vec![sql]); assert_eq!(result.rows.values.len(),30); assert!(result.grid.is_none() && !result.more);
+                db.0.clear();
+                assert!(execute(&mut db,DatabaseKind::MySql,"db","5.5",&plan,false,(20,20)).await.is_err());
+                assert!(db.0.is_empty());
+            }
+            for sql in ["SHOW CREATE TABLE t; DELETE FROM t", "SHOW INDEX FROM t WHERE evil()", "SHOW CREATE PROCEDURE p", "SHOW CREATE TABLE t /*!; DROP TABLE t */"] {
+                assert!(!mysql_metadata(DatabaseKind::MySql,sql));
+            }
+            assert!(!mysql_metadata(DatabaseKind::PostgreSql,"SHOW CREATE TABLE t"));
+        });
+    }
+    #[test]
+    fn line_comments_do_not_execute_or_hide_pagination() {
+        struct Capture(Vec<String>);
+        impl Access for Capture {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                self.0.push(sql.into());
+                Box::pin(async { Ok(Rows::default()) })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let sql = "-- 查询说明\r\n  # DELETE FROM items; 仅注释\r\nSELECT '#原值', '--原值' # 末尾注释";
+            let mut db = Capture(vec![]);
+            let plan = prepare(&mut db, DatabaseKind::MySql, "fixture", "5.5", sql).await.unwrap();
+            assert!(plan.read_only && !plan.confirm);
+            assert_eq!(plan.sql, sql);
+            execute(&mut db, DatabaseKind::MySql, "fixture", "5.5", &plan, false, (0,20)).await.unwrap();
+            assert!(db.0[0].contains("# 末尾注释\nLIMIT 21 OFFSET 0"));
+            assert!(db.0[0].contains("'#原值', '--原值'"));
+            for kind in [DatabaseKind::MySql,DatabaseKind::PostgreSql,DatabaseKind::Sqlite] {
+                let sql="-- DELETE FROM items; 仅注释\nSELECT '--原值' -- 末尾注释";
+                let plan=prepare(&mut db,kind,"fixture","8",sql).await.unwrap();
+                assert!(plan.read_only);
+                assert!(page_sql(kind,sql,0,20).unwrap().contains("-- 末尾注释\nLIMIT"));
+            }
+            use sqlx::Connection;
+            let mut db=sqlx::SqliteConnection::connect("sqlite::memory:").await.unwrap();
+            let sql="-- SELECT 9;\nSELECT '#字符串', '--字符串' -- 末尾";
+            let plan=prepare(&mut db,DatabaseKind::Sqlite,"main","3",sql).await.unwrap();
+            let page=execute(&mut db,DatabaseKind::Sqlite,"main","3",&plan,false,(0,20)).await.unwrap();
+            assert_eq!(page.rows.values[0],vec![Some("#字符串".into()),Some("--字符串".into())]);
+        });
+    }
+    #[test]
+    fn explicit_explain_is_not_paginated_or_prefixed_twice() {
+        struct Capture(Vec<String>);
+        impl Access for Capture {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                self.0.push(sql.into());
+                Box::pin(async {
+                    Ok(Rows {
+                        columns: vec!["plan".into()],
+                        values: vec![vec![Some("scan".into())]; 25],
+                    })
+                })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for (kind, sql) in [
+                    (DatabaseKind::MySql, "EXPLAIN SELECT * FROM items"),
+                    (
+                        DatabaseKind::MySql,
+                        "EXPLAIN FORMAT=JSON SELECT * FROM items",
+                    ),
+                    (
+                        DatabaseKind::PostgreSql,
+                        "-- plan\nexplain (format json, costs false) SELECT * FROM items",
+                    ),
+                    (
+                        DatabaseKind::Sqlite,
+                        "EXPLAIN QUERY PLAN SELECT * FROM items",
+                    ),
+                ] {
+                    let mut db = Capture(vec![]);
+                    let plan = prepare(&mut db, kind, "fixture", "8.4", sql).await.unwrap();
+                    assert!(plan.read_only && !plan.confirm && plan.guards.is_empty());
+                    let result = execute(&mut db, kind, "fixture", "8.4", &plan, false, (0, 20))
+                        .await
+                        .unwrap();
+                    assert_eq!(result.rows.values.len(), 25);
+                    assert!(!result.more && result.grid.is_none());
+                    assert_eq!(db.0, vec![sql]);
+                    db.0.clear();
+                    explain(&mut db, kind, sql).await.unwrap();
+                    assert_eq!(db.0, vec![sql]);
+                    db.0.clear();
+                    assert!(
+                        execute(&mut db, kind, "fixture", "8.4", &plan, false, (20, 20))
+                            .await
+                            .is_err()
+                    );
+                    assert!(db.0.is_empty());
+                }
+                for sql in [
+                    "EXPLAIN ANALYZE SELECT 1",
+                    "EXPLAIN (ANALYZE true) SELECT 1",
+                    "EXPLAIN (ANALYZE false) SELECT 1",
+                    "EXPLAIN DELETE FROM items",
+                    "EXPLAIN SELECT * FROM items FOR UPDATE",
+                    "EXPLAIN SELECT 1; SELECT 2",
+                    "EXPLAIN WITH d AS (DELETE FROM items RETURNING *) SELECT * FROM d",
+                ] {
+                    let mut db = Capture(vec![]);
+                    assert!(
+                        prepare(&mut db, DatabaseKind::PostgreSql, "fixture", "17", sql)
+                            .await
+                            .is_err(),
+                        "{sql}"
+                    );
+                    assert!(
+                        explain(&mut db, DatabaseKind::PostgreSql, sql)
+                            .await
+                            .is_err()
+                    );
+                    assert!(db.0.is_empty());
+                }
+                use sqlx::Connection;
+                let mut db = sqlx::SqliteConnection::connect("sqlite::memory:")
+                    .await
+                    .unwrap();
+                sqlx::raw_sql(
+                    "CREATE TABLE items(id INTEGER PRIMARY KEY); INSERT INTO items VALUES(1)",
+                )
+                .execute(&mut db)
+                .await
+                .unwrap();
+                for sql in [
+                    "EXPLAIN SELECT * FROM items",
+                    "EXPLAIN QUERY PLAN SELECT * FROM items",
+                ] {
+                    let plan = prepare(&mut db, DatabaseKind::Sqlite, "main", "3", sql)
+                        .await
+                        .unwrap();
+                    let result = execute(
+                        &mut db,
+                        DatabaseKind::Sqlite,
+                        "main",
+                        "3",
+                        &plan,
+                        false,
+                        (0, 20),
+                    )
+                    .await
+                    .unwrap();
+                    assert!(
+                        !result.rows.values.is_empty() && !result.more && result.grid.is_none()
+                    );
+                }
+            });
+    }
+    #[test]
+    fn legacy_plain_select_does_not_confirm_and_explain_never_executes_dml() {
+        struct Capture(Vec<String>);
+        impl Access for Capture {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                self.0.push(sql.into());
+                Box::pin(async { Ok(Rows::default()) })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut db = Capture(vec![]);
+                for sql in ["SELECT * FROM items", "SELECT COUNT(*) FROM items"] {
+                    let plan = prepare(&mut db, DatabaseKind::MySql, "fixture", "5.5.62", sql)
+                        .await
+                        .unwrap();
+                    assert!(plan.read_only && !plan.confirm);
+                    execute(
+                        &mut db,
+                        DatabaseKind::MySql,
+                        "fixture",
+                        "5.5.62",
+                        &plan,
+                        false,
+                        (0, 20),
+                    )
+                    .await
+                    .unwrap();
+                }
+                assert!(
+                    prepare(
+                        &mut db,
+                        DatabaseKind::MySql,
+                        "fixture",
+                        "5.5.62",
+                        "SELECT custom_write()"
+                    )
+                    .await
+                    .unwrap()
+                    .confirm
+                );
+                for kind in [
+                    DatabaseKind::MySql,
+                    DatabaseKind::PostgreSql,
+                    DatabaseKind::Sqlite,
+                ] {
+                    db.0.clear();
+                    explain(&mut db, kind, "SELECT * FROM items").await.unwrap();
+                    assert!(db.0[0].starts_with("EXPLAIN ") && !db.0[0].contains("ANALYZE"));
+                    db.0.clear();
+                    assert!(explain(&mut db, kind, "DELETE FROM items").await.is_err());
+                    assert!(db.0.is_empty());
+                }
+            });
+    }
     #[test]
     fn pagination_preserves_original_literals_and_unicode() {
         for (kind, sql, prefix, suffix) in [
@@ -660,5 +1181,38 @@ mod tests {
                 .unwrap();
                 assert_eq!(result.rows.values.len(), 1);
             });
+    }
+}
+
+#[cfg(test)]
+mod command_policy_tests {
+    use super::*;
+    #[test]
+    fn categories_use_parsed_statements_and_metadata_whitelist() {
+        let cases = [
+            ("-- comment\nSELECT 1", Some("select")),
+            ("# comment\nSHOW CREATE TABLE users", Some("show_create")),
+            ("SHOW INDEX FROM users", Some("show_columns")),
+            ("UPDATE users SET name='a'", Some("update")),
+            ("WITH t AS (SELECT 1) SELECT * FROM t", Some("select")),
+            ("SHOW VARIABLES", Some("show_variables")),
+            ("SELECT 1; DROP TABLE users", None),
+            ("/*!50000 DROP TABLE users */", None),
+            ("SET GLOBAL x=1", None),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(
+                command_required(DatabaseKind::MySql, sql),
+                expected,
+                "{sql}"
+            );
+        }
+        assert!(COMMANDS.iter().all(|(key, _, default)| {
+            !*default
+                || ![
+                    "insert", "update", "delete", "drop", "truncate", "create", "alter",
+                ]
+                .contains(key)
+        }));
     }
 }

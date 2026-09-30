@@ -1,0 +1,75 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
+  "name": "mysql_comments",
+  "rules": {
+    "source_file": {
+      "type": "REPEAT",
+      "content": {
+        "type": "CHOICE",
+        "members": [
+          {
+            "type": "SYMBOL",
+            "name": "comment"
+          },
+          {
+            "type": "SYMBOL",
+            "name": "sql"
+          }
+        ]
+      }
+    },
+    "comment": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PATTERN",
+        "value": "#[^\\r\\n]*"
+      }
+    },
+    "sql": {
+      "type": "TOKEN",
+      "content": {
+        "type": "REPEAT1",
+        "content": {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "PATTERN",
+              "value": "[^#'\"`\\/-]+"
+            },
+            {
+              "type": "PATTERN",
+              "value": "'(?:[^'\\\\]|\\\\.|'')*'"
+            },
+            {
+              "type": "PATTERN",
+              "value": "\"(?:[^\"\\\\]|\\\\.|\"\")*\""
+            },
+            {
+              "type": "PATTERN",
+              "value": "`(?:[^`\\\\]|\\\\.|``)*`"
+            },
+            {
+              "type": "PATTERN",
+              "value": "--[^\\r\\n]*"
+            },
+            {
+              "type": "PATTERN",
+              "value": "\\/\\*[^*]*\\*+(?:[^/*][^*]*\\*+)*\\/"
+            },
+            {
+              "type": "PATTERN",
+              "value": "[\\/-]"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "extras": [],
+  "conflicts": [],
+  "precedences": [],
+  "externals": [],
+  "inline": [],
+  "supertypes": [],
+  "reserved": {}
+}

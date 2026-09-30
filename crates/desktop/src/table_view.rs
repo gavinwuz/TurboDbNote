@@ -4,6 +4,8 @@ mod filter_ui;
 mod grid_ui;
 #[path = "note_results.rs"]
 mod note_results;
+#[path = "redis_editor.rs"]
+mod redis_editor;
 #[path = "grid_value.rs"]
 mod value_ui;
 use crate::{
@@ -36,6 +38,14 @@ pub enum Mode {
 }
 pub struct TableView {
     notebook: Option<note_results::NotebookContext>,
+    redis_cursor: String,
+    redis_kind: String,
+    redis_ttl: i64,
+    redis_read_at: std::time::Instant,
+    redis_truncated: bool,
+    redis_clock: Option<Task<()>>,
+    document: Option<Entity<crate::result_document::ResultDocument>>,
+    json_mode: bool,
     key: String,
     source: WeakEntity<DatabaseView>,
     target: OpenTable,
@@ -146,6 +156,14 @@ impl TableView {
             });
         Self {
             notebook: None,
+            redis_cursor: "0".into(),
+            redis_kind: String::new(),
+            redis_ttl: -2,
+            redis_read_at: std::time::Instant::now(),
+            redis_truncated: false,
+            redis_clock: None,
+            document: None,
+            json_mode: false,
             grid_state,
             options: PageOptions {
                 page_size,
@@ -220,7 +238,7 @@ impl TableView {
                     t(cx, "dbwork.loading").to_string()
                 };
             }
-            Ok(Err(e)) => self.notice = e,
+            Ok(Err(e)) => self.notice = crate::locale::message(cx, &e).to_string(),
             Err(_) => self.notice = t(cx, "dbwork.disconnected").to_string(),
         }
         if !self.busy {
@@ -234,6 +252,29 @@ impl TableView {
         cx.notify();
     }
     fn load(&mut self, cx: &mut Context<Self>) {
+        if self.target.kind == turbodbn_services::DatabaseKind::Redis {
+            self.request(
+                Action::RedisValue {
+                    key: self
+                        .target
+                        .object
+                        .parent
+                        .as_bytes()
+                        .chunks(2)
+                        .filter_map(|c| {
+                            std::str::from_utf8(c)
+                                .ok()
+                                .and_then(|s| u8::from_str_radix(s, 16).ok())
+                        })
+                        .collect(),
+                    cursor: self.redis_cursor.clone(),
+                    offset: self.offset,
+                    size: 100,
+                },
+                cx,
+            );
+            return;
+        }
         if matches!(self.target.mode, Mode::Er | Mode::Import) {
             self.request(Action::Describe(self.target.object.clone()), cx);
         } else {
@@ -256,6 +297,54 @@ impl TableView {
         self.busy = false;
         self.counting = false;
         match result {
+            Ok(Reply::RedisValue(page)) => {
+                self.redis_kind = page.kind.clone();
+                self.redis_ttl = page.ttl;
+                self.redis_read_at = std::time::Instant::now();
+                self.redis_truncated = page.truncated;
+                self.redis_clock = if page.ttl > 0 {
+                    Some(cx.spawn(async move |view, cx| {
+                        loop {
+                            gpui::Timer::after(std::time::Duration::from_secs(1)).await;
+                            let Ok(active) = view.update(cx, |this, cx| {
+                                cx.notify();
+                                this.redis_read_at.elapsed().as_secs()
+                                    < this.redis_ttl.max(0) as u64
+                            }) else {
+                                break;
+                            };
+                            if !active {
+                                break;
+                            }
+                        }
+                    }))
+                } else {
+                    None
+                };
+                self.rows = page.rows;
+                self.offset = page.offset;
+                self.more = page.cursor.is_some();
+                self.redis_cursor = page.cursor.unwrap_or_else(|| "0".into());
+                self.sql = page.text.unwrap_or_default();
+                self.notice = crate::locale::tr(
+                    cx,
+                    "redis.value_info",
+                    &[
+                        ("kind", &page.kind),
+                        ("ttl", &page.ttl.to_string()),
+                        (
+                            "scope",
+                            if page.truncated {
+                                "64 KiB / 1000"
+                            } else {
+                                "—"
+                            },
+                        ),
+                    ],
+                )
+                .to_string();
+                self.sync_grid(cx);
+            }
             Ok(Reply::GridPage {
                 rows,
                 schema,
@@ -297,7 +386,7 @@ impl TableView {
                 self.baseline = None;
                 self.committing = false;
                 crate::feedback::error(e.clone(), cx);
-                self.notice = e;
+                self.notice = crate::locale::message(cx, &e).to_string();
             }
             Ok(Reply::Page {
                 rows,
@@ -350,7 +439,11 @@ impl TableView {
                     t(cx, "dbwork.executed").to_string()
                 };
                 crate::feedback::success(self.notice.clone(), cx);
-                if self.committing {
+                if self.committing || self.target.kind == turbodbn_services::DatabaseKind::Redis {
+                    if self.target.kind == turbodbn_services::DatabaseKind::Redis {
+                        self.offset = 0;
+                        self.redis_cursor = "0".into();
+                    }
                     self.committing = false;
                     self.changes.clear();
                     self.insert_count = 0;
@@ -391,7 +484,7 @@ impl TableView {
         match workbench::export_csv(&self.rows) {
             Ok(text) => save_text(text, "data-page.csv", window, cx),
             Err(e) => {
-                self.notice = e;
+                self.notice = crate::locale::message(cx, &e).to_string();
                 cx.notify();
             }
         }
@@ -465,6 +558,29 @@ impl TableView {
         });
     }
     fn grid(&self, cx: &Context<Self>) -> AnyElement {
+        if self.rows.columns.is_empty() && self.rows.values.is_empty() && self.insert_count == 0 {
+            return div()
+                .v_flex()
+                .size_full()
+                .border_1()
+                .border_color(cx.theme().border)
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_3()
+                        .px_2()
+                        .py_1()
+                        .children(self.rows.columns.iter().take(64).cloned()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h_flex()
+                        .justify_center()
+                        .child(t(cx, "notes.empty_result")),
+                )
+                .into_any_element();
+        }
         let state = self.grid_state.read(cx);
         let vertical = state.vertical_scroll_handle.clone();
         let horizontal = state.horizontal_scroll_handle.clone();
@@ -523,7 +639,55 @@ impl TableView {
         }
         rows
     }
+    fn show_document(
+        &mut self,
+        cell: Option<(usize, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut rows = self.display_rows();
+        if let Some((r, c)) = cell {
+            let Some(value) = rows.values.get(r).and_then(|row| row.get(c)).cloned() else {
+                return;
+            };
+            rows = Rows {
+                columns: vec![rows.columns[c].clone()],
+                values: vec![vec![value]],
+            };
+        }
+        self.json_mode = true;
+        self.document =
+            Some(cx.new(|cx| crate::result_document::ResultDocument::new(rows, window, cx)));
+        cx.notify();
+    }
+    fn document_controls(&self, cx: &Context<Self>) -> impl IntoElement {
+        let owner = cx.entity().downgrade();
+        crate::result_document::switches(self.json_mode, self.busy, cx, move |json, window, cx| {
+            let _ = owner.update(cx, |this, cx| {
+                if json {
+                    this.show_document(None, window, cx);
+                } else {
+                    this.json_mode = false;
+                    this.document = None;
+                    cx.notify();
+                }
+            });
+        })
+    }
+    fn result_content(&self, cx: &Context<Self>) -> AnyElement {
+        if self.json_mode
+            && let Some(document) = &self.document
+        {
+            document.clone().into_any_element()
+        } else {
+            self.grid(cx)
+        }
+    }
     fn sync_grid(&mut self, cx: &mut Context<Self>) {
+        if let Some(document) = &self.document {
+            let rows = self.display_rows();
+            document.update(cx, |document, cx| document.set_rows(rows, cx));
+        }
         let data = grid_ui::GridDelegate::snapshot(self, cx.entity().downgrade());
         self.grid_state.update(cx, |table, cx| {
             let columns_changed = table.delegate().column_names() != data.column_names();
@@ -1265,6 +1429,65 @@ impl TableView {
         cx.stop_propagation();
     }
     fn render_grid(&self, cx: &Context<Self>) -> AnyElement {
+        if self.target.kind == turbodbn_services::DatabaseKind::Redis {
+            return div()
+                .v_flex()
+                .size_full()
+                .min_h_0()
+                .gap_2()
+                .p_2()
+                .track_focus(&self.focus)
+                .on_key_down(cx.listener(Self::grid_key))
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(div().flex_1().child(self.redis_kind.clone()))
+                        .child(self.redis_ttl_label(cx)),
+                )
+                .child(div().flex_1().min_h_0().child(self.result_content(cx)))
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(self.document_controls(cx))
+                        .child(self.redis_actions(cx))
+                        .child(
+                            Button::new("redis-refresh")
+                                .icon(crate::assets::refresh_icon())
+                                .label(t(cx, "dbwork.refresh"))
+                                .disabled(self.busy)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.offset = 0;
+                                    this.redis_cursor = "0".into();
+                                    this.load(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("redis-more")
+                                .icon(IconName::ChevronRight)
+                                .label(t(cx, "redis.next"))
+                                .disabled(self.busy || !self.more)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.offset += 100;
+                                    this.load(cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("redis-copy")
+                                .icon(IconName::Copy)
+                                .label(t(cx, "dbwork.copy"))
+                                .disabled(self.sql.is_empty())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        this.sql.clone(),
+                                    ));
+                                })),
+                        ),
+                )
+                .into_any_element();
+        }
         let mut body = div()
             .v_flex()
             .size_full()
@@ -1293,7 +1516,7 @@ impl TableView {
                     )),
             );
         }
-        body.child(div().flex_1().min_h_0().child(self.grid(cx)))
+        body.child(div().flex_1().min_h_0().child(self.result_content(cx)))
             .child(self.data_toolbar(cx))
             .into_any_element()
     }
@@ -1411,7 +1634,7 @@ impl TableView {
             );
         } else {
             body = body
-                .child(div().flex_1().min_h_0().child(self.grid(cx)))
+                .child(div().flex_1().min_h_0().child(self.result_content(cx)))
                 .child(self.data_toolbar(cx));
         }
         body.when(!self.notice.is_empty() && mode != Mode::Grid, |body| {
@@ -1504,6 +1727,7 @@ impl TableView {
                     .min_w_0()
                     .overflow_x_scroll()
                     .gap_1()
+                    .child(self.document_controls(cx))
                     .child(self.toolbar_actions(cx))
                     .child(self.toolbar_pager(cx))
                     .child(self.toolbar_highlight(cx)),

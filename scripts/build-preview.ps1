@@ -1,7 +1,8 @@
-param([string]$CargoPath = 'cargo')
+param([string]$CargoPath = 'cargo', [string]$LegacyDriverArchive, [string]$LegacySourceArchive)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 $root = Split-Path $PSScriptRoot -Parent
+. (Join-Path $PSScriptRoot 'stage-mysql-driver.ps1')
 $target = Join-Path $root 'target'
 $preview = Join-Path $target 'preview'
 New-Item -ItemType Directory -Path $preview -Force | Out-Null
@@ -14,6 +15,7 @@ try {
     if ($running) { throw 'Close the preview application before updating it. Its data will be preserved.' }
     & $CargoPath build --locked -j 1 --target-dir $target -p turbodbnote --bins
     if ($LASTEXITCODE -ne 0) { throw 'Preview build failed' }
+    Stage-MySqlDriver -Destination (Join-Path $preview 'drivers') -CargoPath $CargoPath -LegacyDriverArchive $LegacyDriverArchive -LegacySourceArchive $LegacySourceArchive
     foreach ($name in @('turbodbnote.exe', 'turbodbnote.pdb', 'turbodbnote-mysql-legacy.exe', 'turbodbnote_mysql_legacy.pdb')) {
         Copy-Item -LiteralPath (Join-Path $target "debug/$name") -Destination (Join-Path $preview $name) -Force
     }

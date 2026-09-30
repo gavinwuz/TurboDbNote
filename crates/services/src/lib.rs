@@ -134,3 +134,5 @@ pub trait AiService: Send + Sync {
 }
 
 pub mod note_store;
+
+pub mod sql_mcp;

@@ -66,7 +66,11 @@ fn validate_locales() {
             // Direct t()/tr() lookups are still validated independently below.
             let file_literal = matches!(
                 key.as_str(),
-                "connections.json" | "connections.db" | "database.db" | "settings.json"
+                "connections.json"
+                    | "connections.db"
+                    | "database.db"
+                    | "settings.json"
+                    | "settings.db"
             );
             if !file_literal
                 && locale_catalog::semantic_key(&key)
@@ -171,6 +175,12 @@ fn validate_locales() {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=grammars/mysql-comments/src");
+    cc::Build::new()
+        .include("grammars/mysql-comments/src")
+        .file("grammars/mysql-comments/src/parser.c")
+        .warnings(false)
+        .compile("mysql_comments");
     validate_locales();
     println!("cargo:rerun-if-changed=assets/windows.rc");
     println!("cargo:rerun-if-changed=assets/turbodbnote.ico");

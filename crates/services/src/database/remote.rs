@@ -356,6 +356,148 @@ impl RedisDatabase {
         }
         Ok(())
     }
+    async fn scan(
+        &mut self,
+        database: &str,
+        cursor: Option<&str>,
+        pattern: &str,
+    ) -> Result<OperationResult, String> {
+        if pattern.len() > 512 {
+            return Err("Key 筛选模式超过 512 字节".into());
+        }
+        self.select(database).await?;
+        let (next, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
+            .arg(cursor.unwrap_or("0"))
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(100)
+            .query_async(&mut self.connection)
+            .await
+            .map_err(network)?;
+        let items = keys
+            .into_iter()
+            .take(500)
+            .filter(|key| key.len() <= 4096)
+            .map(|key| ObjectItem {
+                schema: String::new(),
+                name: String::from_utf8(key.clone())
+                    .unwrap_or_else(|_| format!("二进制 Key · {} bytes", key.len())),
+                kind: "Key".into(),
+                key: Some(key),
+            })
+            .collect();
+        Ok(OperationResult::Objects {
+            items,
+            cursor: (next != 0).then(|| next.to_string()),
+            notice: self
+                .cluster
+                .then(|| "Redis 集群：仅当前节点；SCAN 为增量快照，变化中的 Key 可能重复".into()),
+        })
+    }
+    async fn values(
+        &mut self,
+        database: &str,
+        key: &[u8],
+        cursor: &str,
+        offset: usize,
+        size: usize,
+    ) -> Result<super::redis_value::ValuePage, String> {
+        self.select(database).await?;
+        if key.len() > 4096 || cursor.parse::<u64>().is_err() || !(1..=200).contains(&size) {
+            return Err("Redis 读取参数超出上限".into());
+        }
+        let initial_kind: String = redis::cmd("TYPE")
+            .arg(key)
+            .query_async(&mut self.connection)
+            .await
+            .map_err(network)?;
+        let (kind, ttl, next, truncated, data): (String, i64, String, i64, Vec<Vec<Vec<u8>>>) =
+            if initial_kind == "string" {
+                let ttl: i64 = redis::cmd("TTL")
+                    .arg(key)
+                    .query_async(&mut self.connection)
+                    .await
+                    .map_err(network)?;
+                let length: usize = redis::cmd("STRLEN")
+                    .arg(key)
+                    .query_async(&mut self.connection)
+                    .await
+                    .map_err(network)?;
+                let value: Vec<u8> = redis::cmd("GETRANGE")
+                    .arg(key)
+                    .arg(0)
+                    .arg(65535)
+                    .query_async(&mut self.connection)
+                    .await
+                    .map_err(network)?;
+                (
+                    initial_kind,
+                    ttl,
+                    "0".into(),
+                    i64::from(length > 65536),
+                    vec![vec![value]],
+                )
+            } else if initial_kind == "none" {
+                (initial_kind, -2, "0".into(), 0, vec![])
+            } else {
+                redis::cmd("EVAL")
+                    .arg(super::redis_value::READ_PAGE)
+                    .arg(1)
+                    .arg(key)
+                    .arg(cursor)
+                    .arg(size)
+                    .arg(offset)
+                    .query_async(&mut self.connection)
+                    .await
+                    .map_err(|_| {
+                        "Redis 值读取失败：请检查 Key 类型及读取/EVAL 权限；只读脚本未修改数据"
+                            .to_string()
+                    })?
+            };
+        let mut rows = super::workbench::Rows {
+            columns: match kind.as_str() {
+                "hash" => vec!["field".into(), "value".into()],
+                "zset" => vec!["member".into(), "score".into()],
+                "list" => vec!["index".into(), "value".into()],
+                _ => vec!["value".into()],
+            },
+            values: data
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| Some(super::redis_value::display(v)))
+                        .collect()
+                })
+                .collect(),
+        };
+        let text = if kind == "string" {
+            rows.values
+                .first()
+                .and_then(|r| r.first())
+                .and_then(Clone::clone)
+                .map(|s| {
+                    serde_json::from_str::<serde_json::Value>(&s)
+                        .ok()
+                        .and_then(|v| serde_json::to_string_pretty(&v).ok())
+                        .unwrap_or(s)
+                })
+        } else {
+            None
+        };
+        if kind == "none" {
+            rows.values.clear();
+        }
+        Ok(super::redis_value::ValuePage {
+            rows,
+            kind,
+            ttl,
+            cursor: (next != "0").then_some(next),
+            offset,
+            text,
+            truncated: truncated != 0,
+        })
+    }
     pub async fn operation(
         &mut self,
         p: &Profile,
@@ -363,7 +505,47 @@ impl RedisDatabase {
     ) -> Result<OperationResult, String> {
         match &op.kind {
             OperationKind::CopyDatabase { .. } => Err("当前数据库类型不支持直接复制数据库".into()),
-            OperationKind::Workbench(_) => Err("Redis 使用 Key 浏览器，不支持关系表 SQL".into()),
+            OperationKind::Workbench(request) => match &request.action {
+                super::workbench::Action::RedisWrite(change) => {
+                    change.validate()?;
+                    self.select(&request.database).await?;
+                    let applied: i64 = redis::cmd("EVAL")
+                        .arg(super::redis_value::WRITE_VALUE)
+                        .arg(1)
+                        .arg(&change.key)
+                        .arg(&change.kind)
+                        .arg(if change.delete { "delete" } else { "write" })
+                        .arg(&change.member)
+                        .arg(change.expected.as_deref().unwrap_or_default())
+                        .arg(if change.expected.is_some() { "1" } else { "0" })
+                        .arg(&change.value)
+                        .query_async(&mut self.connection)
+                        .await
+                        .map_err(|_| "redis.write_failed")?;
+                    if applied != 1 {
+                        return Err("redis.write_conflict".into());
+                    }
+                    Ok(OperationResult::Workbench(Box::new(
+                        super::workbench::Reply::Executed,
+                    )))
+                }
+                super::workbench::Action::RedisValue {
+                    key,
+                    cursor,
+                    offset,
+                    size,
+                } => self
+                    .values(&request.database, key, cursor, *offset, *size)
+                    .await
+                    .map(|v| {
+                        OperationResult::Workbench(Box::new(super::workbench::Reply::RedisValue(v)))
+                    }),
+                super::workbench::Action::RedisScan { cursor, pattern } => {
+                    self.scan(&request.database, cursor.as_deref(), pattern)
+                        .await
+                }
+                _ => Err("Redis 使用 Key 浏览器，不支持关系表 SQL".into()),
+            },
             OperationKind::Databases => Ok(OperationResult::Databases(
                 if !p.database.is_empty() && !p.list_all_databases {
                     vec![p.database.clone()]
@@ -375,33 +557,7 @@ impl RedisDatabase {
                 Err("Redis 使用已有逻辑库，不支持 CREATE DATABASE".into())
             }
             OperationKind::Objects { database, cursor } => {
-                self.select(database).await?;
-                let (next, keys): (u64, Vec<Vec<u8>>) = redis::cmd("SCAN")
-                    .arg(cursor.as_deref().unwrap_or("0"))
-                    .arg("COUNT")
-                    .arg(100)
-                    .query_async(&mut self.connection)
-                    .await
-                    .map_err(network)?;
-                let items = keys
-                    .into_iter()
-                    .take(500)
-                    .filter(|key| key.len() <= 4096)
-                    .map(|key| ObjectItem {
-                        schema: String::new(),
-                        name: String::from_utf8(key.clone())
-                            .unwrap_or_else(|_| format!("二进制 Key · {} bytes", key.len())),
-                        kind: "Key".into(),
-                        key: Some(key),
-                    })
-                    .collect();
-                Ok(OperationResult::Objects {
-                    items,
-                    cursor: (next != 0).then(|| next.to_string()),
-                    notice: self.cluster.then(|| {
-                        "Redis 集群：仅当前节点；SCAN 为增量快照，变化中的 Key 可能重复".into()
-                    }),
-                })
+                self.scan(database, cursor.as_deref(), "*").await
             }
             OperationKind::Details { database, object } => {
                 self.select(database).await?;

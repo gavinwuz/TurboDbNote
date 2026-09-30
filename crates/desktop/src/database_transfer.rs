@@ -56,6 +56,12 @@ struct TransferView {
     target_db: Entity<InputState>,
     file: Entity<InputState>,
     preview: Preview,
+    catalog: Vec<transfer::ObjectChoice>,
+    catalog_task: Option<Task<()>>,
+    catalog_control: Arc<Control>,
+    catalog_error: bool,
+    catalog_notice: String,
+    folded_objects: std::collections::HashSet<String>,
     options: Options,
     batch: Entity<InputState>,
     table_filter: Entity<InputState>,
@@ -75,6 +81,7 @@ struct TransferView {
 impl Drop for TransferView {
     fn drop(&mut self) {
         self.control.cancel();
+        self.catalog_control.cancel();
     }
 }
 impl DatabaseView {
@@ -87,8 +94,12 @@ impl DatabaseView {
         Ok(Connection {
             baseline: p.clone(),
             profile: {
-                let mut profile = p.clone();
-                if mysql::uses_legacy(&profile)
+                let mut profile = self
+                    .info
+                    .get(&id)
+                    .map(|info| mysql::detected_profile(p.clone(), &info.version))
+                    .unwrap_or_else(|| p.clone());
+                if (mysql::uses_legacy(&profile) || profile.driver == mysql::Driver::Auto)
                     && profile.legacy_library.is_empty()
                     && let Some(path) = self.drivers.read(cx).path()
                 {
@@ -167,10 +178,12 @@ impl DatabaseView {
                 )
                 .footer(move |_, _, _, cx| {
                     let running = buttons.read(cx).running;
-                    let disabled = buttons.read(cx).reviewed.as_ref()
-                        != Some(&buttons.read(cx).signature(cx))
+                    let disabled = (buttons.read(cx).mode != Mode::Export
+                        && buttons.read(cx).reviewed.as_ref()
+                            != Some(&buttons.read(cx).signature(cx)))
                         || running
                         || buttons.read(cx).previewing
+                        || buttons.read(cx).catalog_task.is_some()
                         || buttons.read(cx).result.is_some();
                     let cancel = buttons.clone();
                     let start = buttons.clone();
@@ -272,6 +285,13 @@ impl TransferView {
         })
         .collect::<Vec<_>>();
         subscriptions.push(cx.observe(&table_filter, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.subscribe(&source_db, |this, _, event, cx| {
+            if matches!(event, gpui_component::input::InputEvent::Change) {
+                this.options.tables = None;
+                this.load_catalog(cx);
+            }
+        }));
+        cx.defer_in(window, |this, _, cx| this.load_catalog(cx));
         Self {
             owner,
             mode,
@@ -287,6 +307,12 @@ impl TransferView {
             target_db,
             file,
             preview: Preview::default(),
+            catalog: vec![],
+            catalog_task: None,
+            catalog_control: Arc::default(),
+            catalog_error: false,
+            catalog_notice: String::new(),
+            folded_objects: Default::default(),
             options: Options {
                 views: (mode == Mode::Export && !legacy_source)
                     || source_kind != DatabaseKind::MySql,
@@ -317,6 +343,70 @@ impl TransferView {
             subscriptions,
         }
     }
+    fn load_catalog(&mut self, cx: &mut Context<Self>) {
+        self.catalog_control.cancel();
+        self.catalog_task = None;
+        self.catalog.clear();
+        self.catalog_error = false;
+        self.catalog_notice.clear();
+        self.options.excluded_objects.clear();
+        if self.mode == Mode::ImportFile {
+            return;
+        }
+        let saved = self.choices[self.source].clone();
+        let source = self.source;
+        let snapshot = saved.clone();
+        let database = self.source_db.read(cx).value().trim().to_string();
+        if database.is_empty() {
+            return;
+        }
+        self.catalog_control = Arc::default();
+        let control = self.catalog_control.clone();
+        self.write_log(crate::operation_log::Phase::Preview, None, cx);
+        self.catalog_task = Some(cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(400))
+                .await;
+            let requested = database.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    saved
+                        .endpoint(requested)
+                        .and_then(|endpoint| transfer::catalog(&endpoint, &control))
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                this.catalog_task = None;
+                if this.source != source
+                    || this.source_db.read(cx).value().trim() != database
+                    || this
+                        .owner
+                        .upgrade()
+                        .is_none_or(|owner| !owner.read(cx).connection_snapshot_current(&snapshot))
+                {
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok((preview, notice)) => {
+                        // Metadata failures are advisory: keep Execute available and let the
+                        // user opt out of unreadable categories; never silently omit objects.
+                        this.catalog_notice = notice;
+                        this.catalog = preview.objects;
+                        this.write_log(crate::operation_log::Phase::Succeeded, None, cx);
+                    }
+                    Err(error) => {
+                        this.catalog_error = true;
+                        this.write_log(crate::operation_log::Phase::Failed, Some(&error), cx);
+                        feedback::error(error, cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
     fn uses_page_backup(&self, cx: &App) -> bool {
         self.choices[self.source].profile.kind == DatabaseKind::Sqlite
             && self.schema
@@ -324,6 +414,7 @@ impl TransferView {
             && self.options.tables.is_none()
             && self.options.views
             && self.options.triggers
+            && self.options.excluded_objects.is_empty()
             && (self.mode != Mode::Export
                 || !std::path::Path::new(self.file.read(cx).value().as_str())
                     .extension()
@@ -564,7 +655,7 @@ impl TransferView {
         .detach();
     }
     fn preview(&mut self, cx: &mut Context<Self>) {
-        if self.running || self.previewing {
+        if self.running || self.previewing || self.catalog_task.is_some() {
             return;
         }
         let source = self.choices[self.source].clone();
@@ -708,7 +799,10 @@ impl TransferView {
         cx.notify();
     }
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running || self.previewing || self.reviewed.as_ref() != Some(&self.signature(cx)) {
+        if self.running
+            || self.previewing
+            || (self.mode != Mode::Export && self.reviewed.as_ref() != Some(&self.signature(cx)))
+        {
             return;
         }
         if matches!(self.mode, Mode::Export | Mode::ImportFile)
@@ -1020,6 +1114,19 @@ impl TransferView {
         div()
             .v_flex()
             .gap_3()
+            .when(done && self.mode == Mode::Export, |el| {
+                el.child(
+                    Button::new("export-open-folder")
+                        .icon(IconName::FolderOpen)
+                        .label(crate::locale::t(cx, "transfer.open_folder"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            crate::feedback::reveal_parent(
+                                PathBuf::from(this.file.read(cx).value().as_str()),
+                                cx,
+                            )
+                        })),
+                )
+            })
             .child(format!(
                 "{} → {}",
                 source,
@@ -1336,6 +1443,25 @@ impl Render for TransferView {
             body = body.child(destinations);
         }
         body = body.child(endpoints);
+        if self.mode == Mode::Export {
+            body = body.child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(crate::locale::t(cx, "transfer.line_endings"))
+                    .child(
+                        Button::new("export-line-endings")
+                            .label(if self.options.crlf { "CRLF" } else { "LF" })
+                            .disabled(locked)
+                            .tooltip(crate::locale::t(cx, "transfer.line_endings"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.options.crlf = !this.options.crlf;
+                                this.reviewed = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
         if !file_import {
             let mut params = div()
                 .h_flex()
@@ -1396,16 +1522,18 @@ impl Render for TransferView {
                             || !supported
                             || (index == 0 && self.options.tables.is_some()),
                     )
-                    .on_click(cx.listener(move |this, value, _, cx| {
-                        match index {
-                            0 => this.options.views = *value,
-                            1 => this.options.triggers = *value,
-                            2 => this.options.routines = *value,
-                            _ => this.options.events = *value,
-                        };
-                        this.reviewed = None;
-                        cx.notify();
-                    })),
+                    .on_click(cx.listener(
+                        move |this, value: &bool, _, cx| {
+                            match index {
+                                0 => this.options.views = *value,
+                                1 => this.options.triggers = *value,
+                                2 => this.options.routines = *value,
+                                _ => this.options.events = *value,
+                            };
+                            this.reviewed = None;
+                            cx.notify();
+                        },
+                    )),
                 );
             }
             body = body.child(params);
@@ -1471,8 +1599,7 @@ impl Render for TransferView {
                 );
             }
             let tables = self
-                .preview
-                .objects
+                .catalog
                 .iter()
                 .filter(|o| o.kind == "table")
                 .map(|o| o.name.clone())
@@ -1503,7 +1630,7 @@ impl Render for TransferView {
                                     .label(name.clone())
                                     .checked(selected)
                                     .disabled(locked)
-                                    .on_click(cx.listener(move |this, value, _, cx| {
+                                    .on_click(cx.listener(move |this, value: &bool, _, cx| {
                                         let items =
                                             this.options.tables.get_or_insert_with(|| all.clone());
                                         if *value {
@@ -1553,9 +1680,144 @@ impl Render for TransferView {
                         div()
                             .id("transfer-tables")
                             .max_h(px(110.))
-                            .overflow_y_scroll()
+                            .overflow_scrollbar()
                             .child(list),
                     );
+            }
+        }
+        if !file_import {
+            for (group, label) in [
+                ("view", "transfer.objects.views"),
+                ("trigger", "transfer.objects.triggers"),
+                ("routine", "transfer.objects.routines"),
+                ("event", "transfer.objects.events"),
+            ] {
+                let names = self
+                    .catalog
+                    .iter()
+                    .filter(|o| {
+                        o.kind == group
+                            || (group == "routine"
+                                && matches!(o.kind.as_str(), "function" | "procedure"))
+                    })
+                    .map(|o| (o.kind.clone(), o.name.clone()))
+                    .collect::<Vec<_>>();
+                if names.is_empty() {
+                    continue;
+                }
+                let folded = self.folded_objects.contains(group);
+                let checked = match group {
+                    "view" => self.options.views,
+                    "trigger" => self.options.triggers,
+                    "routine" => self.options.routines,
+                    _ => self.options.events,
+                };
+                let supported = sqlite && matches!(group, "view" | "trigger")
+                    || kind == DatabaseKind::MySql && !legacy && self.mode == Mode::Export;
+                body = body.child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new(SharedString::from(format!("object-fold-{group}")))
+                                .ghost()
+                                .icon(if folded {
+                                    IconName::ChevronRight
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    if !this.folded_objects.remove(group) {
+                                        this.folded_objects.insert(group.into());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            gpui_component::checkbox::Checkbox::new(SharedString::from(format!(
+                                "object-group-{group}"
+                            )))
+                            .label(format!("{} ({})", crate::locale::t(cx, label), names.len()))
+                            .checked(checked && self.schema)
+                            .disabled(
+                                locked
+                                    || !supported
+                                    || !self.schema
+                                    || (group == "view" && self.options.tables.is_some()),
+                            )
+                            .on_click(cx.listener(
+                                move |this, value, _, cx| {
+                                    match group {
+                                        "view" => this.options.views = *value,
+                                        "trigger" => this.options.triggers = *value,
+                                        "routine" => this.options.routines = *value,
+                                        _ => this.options.events = *value,
+                                    };
+                                    this.reviewed = None;
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                );
+                if !folded {
+                    let individual = sqlite || (kind == DatabaseKind::MySql && group == "view");
+                    let checked = checked
+                        && self.schema
+                        && !(group == "view" && self.options.tables.is_some());
+                    let exclusions = self.options.excluded_objects.clone();
+                    let count = names.len();
+                    body = body.child(
+                        uniform_list(
+                            SharedString::from(format!("object-list-{group}")),
+                            count,
+                            cx.processor(move |_, range: std::ops::Range<usize>, _, cx| {
+                                range
+                                    .map(|index| {
+                                        let object = names[index].clone();
+                                        let selected = checked && !exclusions.contains(&object);
+                                        gpui_component::checkbox::Checkbox::new((
+                                            "export-object",
+                                            index,
+                                        ))
+                                        .label(object.1.clone())
+                                        .checked(selected)
+                                        .disabled(locked || !individual || !checked || !supported)
+                                        .on_click(cx.listener(move |this, value: &bool, _, cx| {
+                                            this.options.excluded_objects.retain(|o| o != &object);
+                                            if !*value {
+                                                this.options.excluded_objects.push(object.clone());
+                                            }
+                                            this.reviewed = None;
+                                            cx.notify();
+                                        }))
+                                        .into_any_element()
+                                    })
+                                    .collect()
+                            }),
+                        )
+                        .h(px((count.min(4) * 28) as f32))
+                        .ml_6(),
+                    );
+                }
+            }
+            if !self.catalog_notice.is_empty() {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().warning)
+                        .child(self.catalog_notice.clone()),
+                );
+            }
+            if self.catalog_task.is_some() {
+                body = body.child(crate::locale::t(cx, "transfer.catalog_loading"));
+            }
+            if self.catalog_error {
+                body = body.child(
+                    Button::new("reload-transfer-catalog")
+                        .icon(crate::assets::refresh_icon())
+                        .label(crate::locale::t(cx, "transfer.catalog_retry"))
+                        .on_click(cx.listener(|this, _, _, cx| this.load_catalog(cx))),
+                );
             }
         }
         body = body
@@ -1576,7 +1838,7 @@ impl Render for TransferView {
                 Button::new("transfer-preview")
                     .icon(IconName::Search)
                     .label(crate::locale::t(cx, "transfer.preview"))
-                    .disabled(locked)
+                    .disabled(locked || self.catalog_task.is_some())
                     .on_click(cx.listener(|this, _, _, cx| this.preview(cx))),
             )
             .when(!self.preview.columns.is_empty(), |el| {

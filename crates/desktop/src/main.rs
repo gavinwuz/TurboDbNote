@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod about;
+mod app_store;
 mod assets;
 mod auto_connect;
 mod catalog;
@@ -23,6 +24,7 @@ mod operation_log;
 mod panels;
 mod preferences;
 mod query_grid;
+mod result_document;
 mod settings;
 mod table_view;
 mod tabs;
@@ -41,6 +43,7 @@ fn main() {
         windows_icon::install_guard().expect("Unable to register running application");
     Application::new().with_assets(assets::Assets).run(|cx| {
         gpui_component::init(cx);
+        register_sql_highlighting();
         let diagnostics = diagnostics::start();
         let preferences = preferences::Preferences::load();
         if let Some(dark) = preferences.dark {
@@ -136,4 +139,111 @@ fn main() {
         .expect("Unable to open TurboDBNote window");
         cx.activate(true);
     });
+}
+
+unsafe extern "C" {
+    fn tree_sitter_mysql_comments() -> *const ();
+}
+fn register_sql_highlighting() {
+    use gpui_component::highlighter::{LanguageConfig, LanguageRegistry};
+    LanguageRegistry::singleton().register(
+        "sql",
+        &LanguageConfig::new(
+            "sql",
+            tree_sitter_sequel::LANGUAGE.into(),
+            vec![],
+            tree_sitter_sequel::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+    );
+    let language =
+        unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_mysql_comments) };
+    LanguageRegistry::singleton().register(
+        "mysql",
+        &LanguageConfig::new(
+            "mysql",
+            language.into(),
+            vec!["sql".into()],
+            "(comment) @comment",
+            r#"((sql) @injection.content (#set! injection.language "sql"))"#,
+            "",
+        ),
+    );
+}
+
+#[cfg(test)]
+mod sql_highlighting_tests {
+    #[test]
+    fn mysql_hash_comments_match_dash_without_recoloring_strings() {
+        use gpui_component::{
+            Rope,
+            highlighter::{HighlightTheme, SyntaxHighlighter},
+        };
+        super::register_sql_highlighting();
+        let sql = "SHOW CREATE TABLE `seach_works`;\n# SELECT 不执行\n-- FROM 不执行\nSELECT '#字符串', '--字符串', `hash#column`;\n/* # block */\nSELECT COUNT(*) FROM t;";
+        let mut highlighter = SyntaxHighlighter::new("mysql");
+        highlighter.update(None, &Rope::from(sql));
+        for theme in [
+            HighlightTheme::default_dark(),
+            HighlightTheme::default_light(),
+        ] {
+            let styles = highlighter.styles(&(0..sql.len()), &theme);
+            for text in ["# SELECT 不执行", "-- FROM 不执行"] {
+                let start = sql.find(text).unwrap();
+                assert!(
+                    styles.iter().any(|(r, s)| r.start <= start
+                        && r.end >= start + text.len()
+                        && s.color == theme.style("comment").unwrap().color),
+                    "{text}"
+                );
+            }
+            let start = sql.find("'#字符串'").unwrap();
+            assert!(styles.iter().any(|(r, s)| r.start <= start
+                && r.end >= start + "'#字符串'".len()
+                && s.color == theme.style("string").unwrap().color));
+            let start = sql.rfind("SELECT").unwrap();
+            assert!(styles.iter().any(|(r, s)| r.start <= start
+                && r.end >= start + 6
+                && s.color == theme.style("keyword").unwrap().color));
+        }
+    }
+    #[test]
+    fn sql_keywords_functions_and_strings_receive_theme_styles() {
+        use gpui_component::{
+            Rope,
+            highlighter::{HighlightTheme, SyntaxHighlighter},
+        };
+        super::register_sql_highlighting();
+        let sql = "SELECT COUNT(u.id) FROM users u JOIN other_users o ON u.id=o.id WHERE u.name = 'SELECT' AND u.id > 1 OR u.id = 0 UNION SELECT id FROM other_users; -- FROM";
+        let mut highlighter = SyntaxHighlighter::new("sql");
+        highlighter.update(None, &Rope::from(sql));
+        for theme in [
+            HighlightTheme::default_dark(),
+            HighlightTheme::default_light(),
+        ] {
+            let styles = highlighter.styles(&(0..sql.len()), &theme);
+            for word in ["SELECT", "FROM", "WHERE", "AND", "OR", "JOIN", "UNION"] {
+                let offset = sql.find(word).unwrap();
+                assert!(
+                    styles.iter().any(|(range, style)| range.start <= offset
+                        && range.end >= offset + word.len()
+                        && style.color == theme.style("keyword").unwrap().color),
+                    "missing keyword: {word}"
+                );
+            }
+            let offset = sql.find("COUNT").unwrap();
+            assert!(styles.iter().any(|(range, style)| range.start <= offset
+                && range.end >= offset + 5
+                && style.color == theme.style("function").unwrap().color));
+            let comment = sql.find("-- FROM").unwrap();
+            assert!(styles.iter().any(|(range, style)| range.start <= comment
+                && range.end >= comment + 7
+                && style.color == theme.style("comment").unwrap().color));
+            let offset = sql.find("'SELECT'").unwrap();
+            assert!(styles.iter().any(|(range, style)| range.start <= offset
+                && range.end >= offset + 8
+                && style.color == theme.style("string").unwrap().color));
+        }
+    }
 }

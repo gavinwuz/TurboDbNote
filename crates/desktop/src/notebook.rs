@@ -57,6 +57,7 @@ pub struct NoteView {
     hash: [u8; 32],
     revision: u64,
     saved_revision: u64,
+    deleting: bool,
     saving: bool,
     picking: bool,
     flush_again: bool,
@@ -156,6 +157,7 @@ impl NoteView {
             hash: loaded.hash,
             revision: 0,
             saved_revision: 0,
+            deleting: false,
             saving: false,
             picking: false,
             flush_again: false,
@@ -302,6 +304,19 @@ impl NoteView {
     pub fn dirty(&self) -> bool {
         self.revision != self.saved_revision
     }
+    pub(crate) fn begin_delete(&mut self, cx: &mut Context<Self>) -> Option<[u8; 32]> {
+        if self.deleting || self.pending() || self.running(cx) {
+            return None;
+        }
+        self.deleting = true;
+        self.debounce = None;
+        cx.notify();
+        Some(self.hash)
+    }
+    pub(crate) fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        self.deleting = false;
+        cx.notify();
+    }
     pub fn pending(&self) -> bool {
         self.dirty() || self.saving || self.picking
     }
@@ -321,6 +336,9 @@ impl NoteView {
         }
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
+        if self.deleting {
+            return;
+        }
         self.revision += 1;
         self.error.clear();
         cx.emit(NoteEvent::Changed(self.entry(cx)));
@@ -354,6 +372,9 @@ impl NoteView {
         note
     }
     pub fn save_now(&mut self, cx: &mut Context<Self>) {
+        if self.deleting {
+            return;
+        }
         self.debounce = None;
         if self.picking {
             self.flush_again = true;
@@ -513,6 +534,23 @@ impl NoteView {
     }
 }
 impl Panel for NoteView {
+    fn set_active(&mut self, active: bool, _: &mut Window, cx: &mut Context<Self>) {
+        if active {
+            feedback::ddl_context(
+                feedback::DdlContext {
+                    origin: None,
+                    scope: None,
+                    object: None,
+                    open: false,
+                },
+                cx,
+            );
+        }
+        for cell in &self.cells {
+            cell.update(cx, |cell, cx| cell.set_note_active(active, cx));
+        }
+    }
+
     fn panel_name(&self) -> &'static str {
         "note-editor"
     }
@@ -525,6 +563,12 @@ impl Panel for NoteView {
 }
 impl Render for NoteView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.deleting {
+            return div()
+                .p_3()
+                .child(t(cx, "notes.deleting"))
+                .into_any_element();
+        }
         let mut actions = div()
             .id("note-add-cells")
             .h_flex()
@@ -595,5 +639,6 @@ impl Render for NoteView {
                     }))
                     .child(actions),
             )
+            .into_any_element()
     }
 }

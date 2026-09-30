@@ -6,7 +6,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, Sizable, StyledExt,
+    ActiveTheme, Disableable, IconName, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -26,6 +26,9 @@ use turbodbn_services::{
     mysql::{Event, Session},
 };
 use uuid::Uuid;
+
+#[path = "cell_assist.rs"]
+mod assist;
 
 pub enum CellEvent {
     Changed,
@@ -48,6 +51,11 @@ pub struct CellView {
     inherited_connection: Option<Uuid>,
     inherited_database: String,
     editing: bool,
+    note_active: bool,
+    formatting: Option<Task<()>>,
+    column_auto_attempt: Option<String>,
+    column_wait: Option<Task<()>>,
+    assist_scope: Option<(Option<DatabaseKind>, Option<Uuid>, String)>,
     collapsed: bool,
     batch_locked: bool,
     batch_token: Option<Uuid>,
@@ -74,7 +82,10 @@ pub struct CellView {
     elapsed: u64,
     operation: Option<(Uuid, std::time::Instant)>,
     notice: String,
+    policy_help: bool,
     grid: Entity<TableState<QueryGrid>>,
+    document: Option<Entity<crate::result_document::ResultDocument>>,
+    json_mode: bool,
     results: Option<Entity<crate::table_view::TableView>>,
     _results_observer: Option<Subscription>,
     page_size: Entity<InputState>,
@@ -100,12 +111,15 @@ impl CellView {
             .global::<crate::preferences::Preferences>()
             .database
             .sql_wrap;
+        let provider = std::rc::Rc::new(assist::SqlCompletion(cx.entity().downgrade()));
         let editor = cx.new(|cx| {
             let input = InputState::new(window, cx)
                 .multi_line(true)
                 .default_value(source);
             if sql {
-                input.code_editor("sql").soft_wrap(wrap)
+                let mut input = input.code_editor("sql").soft_wrap(wrap);
+                input.lsp.completion_provider = Some(provider);
+                input
             } else {
                 input
             }
@@ -129,8 +143,19 @@ impl CellView {
                 .iter()
                 .map(|input| {
                     let query_input = input.entity_id() != title.entity_id();
-                    cx.subscribe(input, move |this, _, event, cx| {
+                    let scope_input = input.entity_id() == database.entity_id();
+                    let mut previous = input.read(cx).value();
+                    cx.subscribe(input, move |this, input, event, cx| {
                         if matches!(event, InputEvent::Change) {
+                            let current = input.read(cx).value();
+                            if current == previous {
+                                return;
+                            }
+                            previous = current;
+                            if scope_input {
+                                this.auto_connect(cx);
+                                this.publish_ddl_context(false, cx);
+                            }
                             if query_input {
                                 this.revision += 1;
                                 if let Some(results) = &this.results {
@@ -143,6 +168,20 @@ impl CellView {
                     })
                 })
                 .collect();
+        subscriptions.push(cx.subscribe_in(
+            &connections,
+            window,
+            |this, _, event: &crate::database::NoteColumnsReady, window, cx| {
+                if this.connection_id() == Some(event.0)
+                    && this.editing
+                    && this.editor.read(cx).focus_handle(cx).is_focused(window)
+                {
+                    cx.defer_in(window, |this, window, cx| {
+                        this.trigger_completion(window, cx)
+                    });
+                }
+            },
+        ));
         let database_picker = cx.new(|cx| {
             SelectState::new(
                 SearchableVec::new(Vec::<DatabaseChoice>::new()),
@@ -164,7 +203,11 @@ impl CellView {
                 }
             },
         ));
-        let observed = cx.observe(&connections, |this, db, cx| {
+        let observed = cx.observe_in(&connections, window, |this, db, window, cx| {
+            this.auto_connect(cx);
+            if this.editing {
+                this.prepare_columns(window, cx);
+            }
             if this.discovery.is_none()
                 && this
                     .discovery_snapshot
@@ -203,6 +246,11 @@ impl CellView {
             inherited_connection: None,
             inherited_database: String::new(),
             editing: false,
+            note_active: true,
+            formatting: None,
+            column_auto_attempt: None,
+            column_wait: None,
+            assist_scope: None,
             collapsed: false,
             batch_locked: false,
             batch_token: None,
@@ -228,7 +276,10 @@ impl CellView {
             elapsed: 0,
             operation: None,
             notice: String::new(),
+            policy_help: false,
             grid,
+            document: None,
+            json_mode: false,
             results: None,
             _results_observer: None,
             page_size,
@@ -257,7 +308,11 @@ impl CellView {
                     && self.inherited_database != database);
         self.inherited_connection = connection;
         self.inherited_database = database;
+        self.auto_connect(cx);
         if affected {
+            if self.editing {
+                self.publish_ddl_context(false, cx);
+            }
             self.stop(cx);
             self.database_names.clear();
             self.picker_context = None;
@@ -327,12 +382,129 @@ impl CellView {
             cx.notify();
         }
     }
+    fn ai_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        crate::assets::note_tool("note-send-ai")
+            .icon(
+                gpui_component::Icon::default()
+                    .path("icons/note-ai.svg")
+                    .text_color(crate::assets::note_color(2, cx)),
+            )
+            .tooltip(t(cx, "notes.ai_draft"))
+            .disabled(self.editor.read(cx).value().trim().is_empty())
+            .on_click(cx.listener(|this, _, _, cx| {
+                let (kind, connection, database) = this.assist_context(cx);
+                let name = connection
+                    .and_then(|id| {
+                        this.connections
+                            .read(cx)
+                            .note_profile(id)
+                            .map(|p| p.name.clone())
+                    })
+                    .unwrap_or_default();
+                let request = crate::feedback::SqlDraft {
+                    sql: this.editor.read(cx).value().to_string(),
+                    scope: crate::feedback::SqlScope {
+                        connection,
+                        name,
+                        database,
+                        kind: kind
+                            .map(|kind| kind.label().to_string())
+                            .unwrap_or_default(),
+                    },
+                };
+                let hub = cx.global::<crate::feedback::Hub>().0.clone();
+                cx.defer(move |cx| hub.update(cx, |_, cx| cx.emit(request)));
+            }))
+    }
+    fn mode_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        let editing = self.editing;
+        crate::assets::note_tool("cell-mode")
+            .selected(editing)
+            .icon(
+                gpui_component::Icon::default()
+                    .path(if editing {
+                        "icons/note-read-mode.svg"
+                    } else {
+                        "icons/note-edit-mode.svg"
+                    })
+                    .text_color(crate::assets::note_color(if editing { 1 } else { 0 }, cx)),
+            )
+            .tooltip(t(
+                cx,
+                if editing {
+                    "notes.read_mode"
+                } else {
+                    "notes.edit_mode"
+                },
+            ))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                if editing {
+                    this.set_editing(false, window, cx);
+                } else {
+                    cx.emit(CellEvent::Edit);
+                }
+            }))
+    }
+    fn document_controls(&self, cx: &Context<Self>) -> impl IntoElement {
+        let owner = cx.entity().downgrade();
+        crate::result_document::switches(
+            self.json_mode,
+            self.busy(),
+            cx,
+            move |json, window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    this.json_mode = json;
+                    if json {
+                        let rows = this.grid.read(cx).delegate().rows.clone();
+                        this.document = Some(cx.new(|cx| {
+                            crate::result_document::ResultDocument::new(rows, window, cx)
+                        }));
+                    } else {
+                        this.document = None;
+                    }
+                    cx.notify();
+                });
+            },
+        )
+    }
+    fn copy_source_button(&self, cx: &Context<Self>) -> impl IntoElement {
+        crate::assets::note_tool("copy-note-source")
+            .icon(IconName::Copy)
+            .tooltip(t(cx, "notes.copy_content"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    this.editor.read(cx).value().to_string(),
+                ));
+                feedback::success(t(cx, "feedback.copied"), cx);
+            }))
+    }
+    pub(crate) fn set_note_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if !active && self.note_active && self.editing {
+            feedback::ddl_context(
+                feedback::DdlContext {
+                    origin: Some(self.cell.id),
+                    scope: None,
+                    object: None,
+                    open: false,
+                },
+                cx,
+            );
+        }
+        self.note_active = active;
+        if active && self.editing {
+            self.publish_ddl_context(false, cx);
+        }
+    }
     pub fn set_editing(&mut self, editing: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.editing == editing {
             return;
         }
         self.editing = editing;
+        self.publish_ddl_context(false, cx);
         if editing {
+            self.auto_connect(cx);
             self.collapsed = false;
         }
         if editing {
@@ -378,10 +550,15 @@ impl CellView {
         if self.discovery.is_some() || self.busy() {
             return;
         }
-        let (saved, database) = match self.binding(cx) {
-            Ok(v) => v,
-            Err(e) => {
-                feedback::error(e, cx);
+        let (_, connection, database) = self.assist_context(cx);
+        let Some(connection) = connection else {
+            feedback::error(t(cx, "notes.choose_connection"), cx);
+            return;
+        };
+        let saved = match self.connections.read(cx).saved_connection(connection, cx) {
+            Ok(saved) => saved,
+            Err(error) => {
+                feedback::error(error, cx);
                 return;
             }
         };
@@ -565,6 +742,7 @@ impl CellView {
         Ok((saved, db))
     }
     fn run(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.policy_help = false;
         if self.result_pending(cx) {
             feedback::error(t(cx, "grid.pending"), cx);
             return;
@@ -611,6 +789,30 @@ impl CellView {
             cx,
         );
     }
+    fn explain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.working(cx) || self.batch_locked {
+            return;
+        }
+        if self.result_pending(cx) {
+            feedback::error(t(cx, "grid.pending"), cx);
+            return;
+        }
+        match self.binding(cx) {
+            Ok((saved, db)) => {
+                self.request(
+                    saved,
+                    db,
+                    Action::NoteExplain {
+                        sql: self.editor.read(cx).value().to_string(),
+                    },
+                    0,
+                    window,
+                    cx,
+                );
+            }
+            Err(error) => feedback::error(error, cx),
+        }
+    }
     fn request(
         &mut self,
         saved: SavedConnection,
@@ -626,6 +828,21 @@ impl CellView {
             .connection_snapshot_current(&saved)
         {
             feedback::error(t(cx, "transfer.connection_changed"), cx);
+            self.finish_batch(false, cx);
+            return;
+        }
+        if let Action::NoteExecute { plan, .. } = &action
+            && turbodbn_services::database::notebook_query::command_required(
+                saved.profile.kind,
+                &plan.sql,
+            )
+            .is_none_or(|key| {
+                !cx.global::<crate::preferences::Preferences>()
+                    .database
+                    .command_enabled(key)
+            })
+        {
+            feedback::error(t(cx, "settings.sql_policy_blocked"), cx);
             self.finish_batch(false, cx);
             return;
         }
@@ -752,31 +969,55 @@ impl CellView {
                                             this.elapsed = result.elapsed_ms;
                                             this.operation = None;
                                             let rows = result.rows.values.len() as u64;
+                                            let read_only = result.read_only;
+                                            let elapsed_ms = result.elapsed_ms;
+                                            if let Some(meta) = &result.grid
+                                                && let Some(object) = &meta.object
+                                            {
+                                                this.connections.update(cx, |db, _| {
+                                                    db.remember_note_columns(
+                                                        saved.profile.id,
+                                                        &database,
+                                                        object,
+                                                        &meta.schema.columns,
+                                                    )
+                                                });
+                                            }
                                             if result.read_only
+                                                && result.grid.is_some()
                                                 && let Some((plan, confirmed)) = &execution
                                             {
                                                 let view = cx.new(|cx| {
                                                     crate::table_view::TableView::from_note(
                                                         this.connections.downgrade(),
                                                         (saved.clone(), database.clone()),
-                                                        (plan.clone(), *confirmed, result.clone()),
+                                                        (plan.clone(), *confirmed, result),
                                                         window,
                                                         cx,
                                                     )
                                                 });
                                                 this._results_observer =
                                                     Some(cx.observe(&view, |_, _, cx| cx.notify()));
+                                                this.grid.update(cx, |grid, cx| {
+                                                    *grid.delegate_mut() =
+                                                        QueryGrid::new(Rows::default(), 0);
+                                                    grid.refresh(cx);
+                                                });
+                                                this.document = None;
+                                                this.json_mode = false;
                                                 this.results = Some(view);
                                             } else {
                                                 this.results = None;
                                                 this._results_observer = None;
+                                                this.json_mode = result.read_only && crate::result_document::single_json(&result.rows);
+                                                this.document = if this.json_mode { Some(cx.new(|cx| crate::result_document::ResultDocument::new(result.rows.clone(), window, cx))) } else { None };
                                                 this.grid.update(cx, |grid, cx| {
                                                     *grid.delegate_mut() =
                                                         QueryGrid::new(result.rows, result.offset);
                                                     grid.refresh(cx);
                                                 });
                                             }
-                                            this.notice = if result.read_only {
+                                            this.notice = if read_only {
                                                 crate::locale::tr(
                                                     cx,
                                                     "notes.query_rows",
@@ -789,7 +1030,7 @@ impl CellView {
                                             this.log(
                                                 token.request_id,
                                                 crate::operation_log::Phase::Succeeded,
-                                                result.elapsed_ms,
+                                                elapsed_ms,
                                                 rows,
                                                 None,
                                                 cx,
@@ -830,6 +1071,8 @@ impl CellView {
         cx.notify();
     }
     fn failed(&mut self, token: turbodbn_core::QueryToken, error: String, cx: &mut Context<Self>) {
+        self.policy_help = error == "notes.sql_scope_unsupported";
+        let error = crate::locale::message(cx, &error).to_string();
         if !self.query.complete(token, Err(error.clone())) {
             return;
         }
@@ -862,6 +1105,33 @@ impl CellView {
             self.finish_batch(false, cx);
             return;
         }
+
+        if let Some(extension) = turbodbn_services::database::notebook_query::command_required(
+            saved.profile.kind,
+            &plan.sql,
+        ) && !cx
+            .global::<crate::preferences::Preferences>()
+            .database
+            .command_enabled(extension)
+        {
+            self.policy_help = true;
+            self.notice = t(cx, "settings.sql_policy_title").to_string();
+            self.finish_batch(false, cx);
+            feedback::confirm_labels(
+                t(cx, "settings.sql_policy_title"),
+                t(cx, "settings.sql_policy_blocked"),
+                t(cx, "feedback.close"),
+                t(cx, "settings.sql_policy_open"),
+                window,
+                cx,
+                |_, cx| {
+                    let hub = cx.global::<feedback::Hub>().0.clone();
+                    cx.defer(move |cx| hub.update(cx, |_, cx| cx.emit(feedback::OpenSqlSettings)));
+                },
+            );
+            return;
+        }
+
         if !plan.read_only
             && saved.profile.sqlite_read_only
             && saved.profile.kind == DatabaseKind::Sqlite
@@ -986,16 +1256,7 @@ impl CellView {
             .gap_1()
             .flex_1()
             .min_w(px(220.))
-            .child(
-                Button::new("read-note-cell")
-                    .small()
-                    .ghost()
-                    .icon(IconName::Eye)
-                    .tooltip(t(cx, "notes.read_mode"))
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.set_editing(false, window, cx)),
-                    ),
-            )
+            .child(self.mode_button(cx))
             .child(
                 Input::new(&self.title)
                     .cleanable(!locked)
@@ -1044,44 +1305,34 @@ impl CellView {
                         for profile in &profiles {
                             let owner = owner.clone();
                             let profile = profile.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(profile.name.clone())
-                                    .disabled(!matches!(
-                                        profile.kind,
-                                        DatabaseKind::MySql
-                                            | DatabaseKind::PostgreSql
-                                            | DatabaseKind::Sqlite
-                                    ))
-                                    .on_click(move |_, window, cx| {
-                                        owner.update(cx, |this, cx| {
-                                            if this.busy() {
-                                                return;
-                                            }
-                                            if let CellContent::Sql { connection_id, .. } =
-                                                &mut this.cell.content
-                                            {
-                                                *connection_id = Some(profile.id);
-                                            }
-                                            if let Some(results) = &this.results {
-                                                results.update(cx, |results, cx| {
-                                                    results.stale_result(cx)
-                                                });
-                                            }
-                                            this.database_names.clear();
-                                            this.picker_context = None;
-                                            this.database.update(cx, |input, cx| {
-                                                input.set_value(
-                                                    profile.database.clone(),
-                                                    window,
-                                                    cx,
-                                                )
-                                            });
-                                            this.revision += 1;
-                                            cx.emit(CellEvent::Changed);
-                                            cx.notify();
-                                        })
-                                    }),
-                            );
+                            menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(
+                                move |_, window, cx| {
+                                    owner.update(cx, |this, cx| {
+                                        if this.busy() {
+                                            return;
+                                        }
+                                        if let CellContent::Sql { connection_id, .. } =
+                                            &mut this.cell.content
+                                        {
+                                            *connection_id = Some(profile.id);
+                                        }
+                                        if let Some(results) = &this.results {
+                                            results
+                                                .update(cx, |results, cx| results.stale_result(cx));
+                                        }
+                                        this.database_names.clear();
+                                        this.picker_context = None;
+                                        this.database.update(cx, |input, cx| {
+                                            input.set_value(profile.database.clone(), window, cx)
+                                        });
+                                        this.revision += 1;
+                                        this.auto_connect(cx);
+                                        this.publish_ddl_context(false, cx);
+                                        cx.emit(CellEvent::Changed);
+                                        cx.notify();
+                                    })
+                                },
+                            ));
                         }
                         menu.scrollable(true).max_h(px(300.))
                     }),
@@ -1137,16 +1388,61 @@ impl CellView {
         let mut right = div().h_flex().gap_1().flex_shrink_0();
         if sql {
             right = right.child(
-                Button::new("run-note-sql")
-                    .small()
-                    .ghost()
-                    .icon(gpui_component::Icon::default().path(if busy {
-                        "icons/stop.svg"
-                    } else {
-                        "icons/note-run.svg"
-                    }))
-                    .tooltip(t(cx, if busy { "notes.stop" } else { "notes.run" }))
-                    .disabled(!busy && (self.batch_locked || self.connection_id().is_none()))
+                crate::assets::note_tool("load-note-columns")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path("icons/note-columns.svg")
+                            .text_color(crate::assets::note_color(0, cx)),
+                    )
+                    .tooltip(t(cx, "sql_assist.load_columns"))
+                    .loading(self.column_wait.is_some())
+                    .disabled(
+                        locked || self.column_wait.is_some() || self.connection_id().is_none(),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.load_columns(window, cx))),
+            );
+        }
+
+        if sql {
+            right = right.child(
+                crate::assets::note_tool("format-note-sql")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path("icons/note-format.svg")
+                            .text_color(crate::assets::note_color(2, cx)),
+                    )
+                    .tooltip(t(cx, "sql_assist.format"))
+                    .disabled(
+                        locked
+                            || self.formatting.is_some()
+                            || self.assist_context(cx).0 == Some(DatabaseKind::Redis),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.format_sql(window, cx))),
+            );
+            right = right.child(
+                crate::assets::note_tool("run-note-sql")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path(if busy {
+                                "icons/stop.svg"
+                            } else {
+                                "icons/note-run.svg"
+                            })
+                            .text_color(if busy {
+                                cx.theme().danger
+                            } else {
+                                crate::assets::note_color(1, cx)
+                            }),
+                    )
+                    .tooltip(t(
+                        cx,
+                        if busy {
+                            "notes.stop"
+                        } else {
+                            "notes.run_shortcut"
+                        },
+                    ))
+                    .disabled(!busy && (self.batch_locked || !self.assist_execution_supported(cx)))
                     .on_click(cx.listener(|this, _, window, cx| {
                         if this.working(cx) {
                             this.stop(cx)
@@ -1156,30 +1452,65 @@ impl CellView {
                     })),
             );
         }
+        if sql {
+            right = right.child(
+                crate::assets::note_tool("explain-note-sql")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path("icons/note-plan.svg")
+                            .text_color(crate::assets::note_color(0, cx)),
+                    )
+                    .tooltip(t(cx, "notes.explain"))
+                    .disabled(locked || !self.assist_execution_supported(cx))
+                    .on_click(cx.listener(|this, _, window, cx| this.explain(window, cx))),
+            );
+        }
+        if sql {
+            right = right
+                .child(
+                    crate::assets::note_tool("note-ddl")
+                        .icon(
+                            gpui_component::Icon::default()
+                                .path("icons/note-ddl.svg")
+                                .text_color(crate::assets::note_color(0, cx)),
+                        )
+                        .tooltip(t(cx, "ddl.open"))
+                        .on_click(cx.listener(|this, _, _, cx| this.publish_ddl_context(true, cx))),
+                )
+                .child(self.ai_button(cx));
+        }
         for (id, icon, key, action) in [
             ("copy-note-cell", IconName::Copy, "notes.cell_copy", 0),
-            ("move-note-up", IconName::ArrowUp, "notes.cell_up", 1),
-            ("move-note-down", IconName::ArrowDown, "notes.cell_down", 2),
             ("insert-note-before", IconName::Plus, "notes.cell_before", 3),
             ("insert-note-after", IconName::Plus, "notes.cell_after", 4),
+            ("move-note-up", IconName::ArrowUp, "notes.cell_up", 1),
+            ("move-note-down", IconName::ArrowDown, "notes.cell_down", 2),
             ("delete-note-cell", IconName::Delete, "notes.cell_remove", 5),
         ] {
             let at_start = self.position.0 == 0;
             let at_end = self.position.0 + 1 >= self.position.1;
             let at_limit = self.position.1 >= turbodbn_services::note_store::MAX_CELLS;
-            let icon = if action == 3 {
-                gpui_component::Icon::default().path("icons/note-insert-before.svg")
+            let icon = if action == 0 {
+                gpui_component::Icon::default()
+                    .path("icons/note-copy-insert.svg")
+                    .text_color(crate::assets::note_color(1, cx))
+            } else if action == 3 {
+                gpui_component::Icon::default()
+                    .path("icons/note-insert-before.svg")
+                    .text_color(crate::assets::note_color(0, cx))
             } else if action == 4 {
-                gpui_component::Icon::default().path("icons/note-insert-after.svg")
+                gpui_component::Icon::default()
+                    .path("icons/note-insert-after.svg")
+                    .text_color(crate::assets::note_color(2, cx))
             } else if action == 5 {
-                gpui_component::Icon::default().path("icons/note-delete.svg")
+                gpui_component::Icon::default()
+                    .path("icons/note-delete.svg")
+                    .text_color(crate::assets::note_color(3, cx))
             } else {
                 icon.into()
             };
             right = right.child(
-                Button::new(id)
-                    .small()
-                    .ghost()
+                crate::assets::note_tool(id)
                     .icon(icon)
                     .tooltip(t(cx, key))
                     .disabled(
@@ -1223,6 +1554,26 @@ impl CellView {
 impl Render for CellView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sql = matches!(self.cell.content, CellContent::Sql { .. });
+        if sql {
+            let context = self.assist_context(cx);
+            if self.assist_scope.as_ref() != Some(&context) {
+                let language = if context.0 == Some(DatabaseKind::MySql) {
+                    "mysql"
+                } else {
+                    "sql"
+                };
+                self.assist_scope = Some(context);
+                self.reading = None;
+                self.editor.update(cx, |input, cx| {
+                    input.set_highlighter(language, cx);
+                    input.handle_action_for_context_menu(
+                        Box::new(gpui_component::input::Escape),
+                        window,
+                        cx,
+                    );
+                });
+            }
+        }
         let md = matches!(self.cell.content, CellContent::Markdown { .. });
         let busy = self.working(cx);
         let wrap = cx
@@ -1265,7 +1616,37 @@ impl Render for CellView {
                         .bg(marker),
                 )
             })
+            .capture_action(cx.listener(
+                |this, action: &gpui_component::input::Enter, window, cx| {
+                    this.assist_enter(action, window, cx)
+                },
+            ))
+            .capture_action(
+                cx.listener(|this, _: &gpui_component::input::Escape, window, cx| {
+                    this.assist_escape(window, cx)
+                }),
+            )
+            .capture_action(cx.listener(
+                |this, _: &gpui_component::input::IndentInline, window, cx| {
+                    if this.assist_accept(window, cx) {
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            ))
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key.eq_ignore_ascii_case("f5")
+                    && matches!(this.cell.content, CellContent::Sql { .. })
+                    && this.focus.contains_focused(window, cx)
+                {
+                    this.run(0, window, cx);
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.assist_key(event, window, cx) {
+                    return;
+                }
                 if event.keystroke.key == "f2"
                     && !this
                         .results
@@ -1274,26 +1655,6 @@ impl Render for CellView {
                 {
                     cx.emit(CellEvent::Edit);
                     cx.stop_propagation();
-                    return;
-                }
-                if event.keystroke.key == "escape" && this.editing {
-                    this.set_editing(false, window, cx);
-                    cx.stop_propagation();
-                    return;
-                }
-                let enter = cx
-                    .global::<crate::preferences::Preferences>()
-                    .database
-                    .sql_enter;
-                if this.editing
-                    && matches!(this.cell.content, CellContent::Sql { .. })
-                    && event.keystroke.key == "enter"
-                    && !event.keystroke.modifiers.shift
-                    && (event.keystroke.modifiers.control || enter)
-                    && this.editor.read(cx).focus_handle(cx).is_focused(window)
-                {
-                    cx.stop_propagation();
-                    this.run(0, window, cx);
                 }
             }))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -1321,28 +1682,61 @@ impl Render for CellView {
                 label.to_string()
             };
             return body.child(
-                Button::new("expand-note-cell")
-                    .ghost()
-                    .small()
-                    .justify_start()
-                    .icon(IconName::ChevronRight)
-                    .label(if label.is_empty() {
-                        t(cx, "notes.empty_cell")
-                    } else {
-                        label.into()
-                    })
-                    .tooltip(t(cx, "notes.expand_cell"))
-                    .on_click(cx.listener(|this, _, _, cx| this.set_collapsed(false, cx))),
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("expand-note-cell")
+                            .ghost()
+                            .small()
+                            .justify_start()
+                            .icon(IconName::ChevronRight)
+                            .flex_1()
+                            .min_w_0()
+                            .label(if label.is_empty() {
+                                t(cx, "notes.empty_cell")
+                            } else {
+                                label.into()
+                            })
+                            .tooltip(t(cx, "notes.expand_cell"))
+                            .on_click(cx.listener(|this, _, _, cx| this.set_collapsed(false, cx))),
+                    )
+                    .when(sql, |bar| bar.child(self.ai_button(cx)))
+                    .child(self.copy_source_button(cx)),
             );
         }
         if editing {
             body = body.child(self.toolbar(window, cx));
-        } else if !self.title.read(cx).value().trim().is_empty() {
+            if sql
+                && matches!(
+                    self.assist_context(cx).0,
+                    Some(DatabaseKind::ClickHouse | DatabaseKind::Redis)
+                )
+            {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t(cx, "sql_assist.edit_only")),
+                );
+            }
+        } else if !sql || !self.title.read(cx).value().is_empty() {
             body = body.child(
                 div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(self.title.read(cx).value()),
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(self.title.read(cx).value()),
+                    )
+                    .when(!sql, |row| row.child(self.copy_source_button(cx))),
             );
         }
         if editing {
@@ -1356,7 +1750,8 @@ impl Render for CellView {
             );
         } else {
             let source = self.editor.read(cx).value();
-            let content: AnyElement = if source.is_empty() {
+            let empty = source.is_empty();
+            let content: AnyElement = if empty {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
@@ -1373,42 +1768,83 @@ impl Render for CellView {
                             .max(2)
                             + 1;
                         let fence = "~".repeat(count);
-                        format!("{fence}sql\n{source}\n{fence}").into()
+                        let language = if self.assist_context(cx).0 == Some(DatabaseKind::MySql) {
+                            "mysql"
+                        } else {
+                            "sql"
+                        };
+                        format!("{fence}{language}\n{source}\n{fence}").into()
                     } else {
                         source.clone()
                     };
                     self.reading = Some((source.clone(), rendered));
                 }
                 TextView::markdown(
-                    SharedString::from(format!("note-reading-{}", self.cell.id)),
+                    SharedString::from(format!(
+                        "note-reading-{}-{}",
+                        self.cell.id,
+                        cx.theme().mode.is_dark()
+                    )),
                     self.reading.as_ref().unwrap().1.clone(),
                     window,
                     cx,
                 )
                 .selectable(true)
+                .when(sql, |view| {
+                    view.style(
+                        gpui_component::text::TextViewStyle::default()
+                            .code_block(StyleRefinement::default().pr(px(76.)).pl(px(40.))),
+                    )
+                })
                 .into_any_element()
             } else {
                 div().whitespace_normal().child(source).into_any_element()
             };
+            let reading = div()
+                .id("note-reading-content")
+                .min_h(px(36.))
+                .w_full()
+                .capture_any_mouse_down(cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    if event.button != MouseButton::Left {
+                        return;
+                    }
+                    if event.click_count == 2 {
+                        cx.emit(CellEvent::Edit);
+                        cx.stop_propagation();
+                    } else {
+                        this.focus.focus(window);
+                    }
+                }))
+                .when(sql && empty, |el| el.pr(px(76.)))
+                .when(!sql || empty, |el| el.pl(px(40.)))
+                .child(content);
             body = body.child(
                 div()
-                    .id("note-reading-content")
-                    .min_h(px(36.))
-                    .w_full()
-                    .capture_any_mouse_down(cx.listener(
-                        |this, event: &MouseDownEvent, window, cx| {
-                            if event.button != MouseButton::Left {
-                                return;
-                            }
-                            if event.click_count == 2 {
-                                cx.emit(CellEvent::Edit);
-                                cx.stop_propagation();
-                            } else {
-                                this.focus.focus(window);
-                            }
-                        },
-                    ))
-                    .child(content),
+                    .relative()
+                    .child(reading)
+                    .child(
+                        div()
+                            .id("reading-mode-toggle")
+                            .occlude()
+                            .absolute()
+                            .top_2()
+                            .left_1()
+                            .child(self.mode_button(cx)),
+                    )
+                    .when(sql, |el| {
+                        el.child(
+                            div()
+                                .id("note-reading-copy")
+                                .occlude()
+                                .absolute()
+                                .top_2()
+                                .right_2()
+                                .h_flex()
+                                .gap_1()
+                                .child(self.ai_button(cx))
+                                .child(self.copy_source_button(cx)),
+                        )
+                    }),
             );
         }
         if let CellContent::Task { status, .. } = self.cell.content {
@@ -1447,13 +1883,44 @@ impl Render for CellView {
         if let Some(results) = &self.results {
             body = body.child(div().h(px(380.)).min_w_0().child(results.clone()));
         }
+        if self.results.is_some() || !self.grid.read(cx).delegate().rows.columns.is_empty() {
+            body = body.child(
+                Button::new("clear-note-results")
+                    .small()
+                    .ghost()
+                    .icon(IconName::Close)
+                    .label(t(cx, "notes.clear_results"))
+                    .disabled(busy || self.batch_locked)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.result_pending(cx) {
+                            feedback::error(t(cx, "grid.pending"), cx);
+                            return;
+                        }
+                        this.results = None;
+                        this._results_observer = None;
+                        this.grid.update(cx, |grid, cx| {
+                            *grid.delegate_mut() = QueryGrid::new(Rows::default(), 0);
+                            grid.refresh(cx);
+                        });
+                        this.document = None;
+                        this.json_mode = false;
+                        this.notice.clear();
+                        this.more = false;
+                        cx.notify();
+                    })),
+            );
+        }
         if self.results.is_none()
             && sql
             && (!self.notice.is_empty()
                 || busy
                 || !self.grid.read(cx).delegate().rows.columns.is_empty())
         {
-            if !self.grid.read(cx).delegate().rows.columns.is_empty() {
+            if self.json_mode
+                && let Some(document) = &self.document
+            {
+                body = body.child(div().h(px(300.)).w_full().child(document.clone()));
+            } else if !self.grid.read(cx).delegate().rows.columns.is_empty() {
                 let vertical = self.grid.read(cx).vertical_scroll_handle.clone();
                 let horizontal = self.grid.read(cx).horizontal_scroll_handle.clone();
                 body = body.child(
@@ -1495,6 +1962,7 @@ impl Render for CellView {
                 div()
                     .h_flex()
                     .gap_2()
+                    .child(self.document_controls(cx))
                     .when(busy && !editing, |el| {
                         el.child(
                             Button::new("read-stop-query")
@@ -1550,6 +2018,18 @@ impl Render for CellView {
                     ),
             );
         }
-        body
+        body.when(self.policy_help, |body| {
+            body.child(
+                Button::new("sql-policy-settings")
+                    .icon(IconName::Settings2)
+                    .label(t(cx, "settings.sql_policy_open"))
+                    .on_click(|_, _, cx| {
+                        let hub = cx.global::<feedback::Hub>().0.clone();
+                        cx.defer(move |cx| {
+                            hub.update(cx, |_, cx| cx.emit(feedback::OpenSqlSettings))
+                        });
+                    }),
+            )
+        })
     }
 }

@@ -3,6 +3,31 @@ use serde::{Deserialize, Serialize};
 use std::{io::Read, path::PathBuf};
 use turbodbn_services::agent::Engine;
 
+impl DatabasePreferences {
+    pub fn command_enabled(&self, key: &str) -> bool {
+        self.sql_commands.as_ref().map_or_else(
+            || {
+                self.sql_extensions.iter().any(|v| v == key)
+                    || turbodbn_services::database::notebook_query::COMMANDS
+                        .iter()
+                        .any(|(id, _, enabled)| *id == key && *enabled)
+            },
+            |commands| commands.iter().any(|v| v == key),
+        )
+    }
+    pub fn set_command(&mut self, key: &str, enabled: bool) {
+        let mut commands = turbodbn_services::database::notebook_query::COMMANDS
+            .iter()
+            .filter(|(id, _, _)| self.command_enabled(id))
+            .map(|(id, _, _)| (*id).to_owned())
+            .collect::<Vec<_>>();
+        commands.retain(|v| v != key);
+        if enabled {
+            commands.push(key.into());
+        }
+        self.sql_commands = Some(commands);
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnginePreferences {
@@ -117,6 +142,8 @@ pub struct DatabasePreferences {
     pub sql_wrap: bool,
     pub sql_enter: bool,
     pub confirm_destructive: bool,
+    pub sql_extensions: Vec<String>,
+    pub sql_commands: Option<Vec<String>>,
 }
 impl Default for DatabasePreferences {
     fn default() -> Self {
@@ -125,6 +152,8 @@ impl Default for DatabasePreferences {
             sql_wrap: true,
             sql_enter: false,
             confirm_destructive: true,
+            sql_extensions: vec![],
+            sql_commands: None,
         }
     }
 }
@@ -164,10 +193,10 @@ impl Preferences {
         if let Some(directory) = exe.parent()
             && directory.join("portable.flag").is_file()
         {
-            return Ok(directory.join("data/settings.db"));
+            return Ok(directory.join("data/connections.db"));
         }
         dirs::config_dir()
-            .map(|dir| dir.join("TurboDbNote/settings.db"))
+            .map(|dir| dir.join("TurboDbNote/connections.db"))
             .ok_or_else(|| std::io::Error::other("无法定位用户设置目录"))
     }
     pub fn load() -> Self {
@@ -199,6 +228,9 @@ impl Preferences {
         Ok(connection)
     }
     fn load_from(path: &std::path::Path) -> Result<Self, String> {
+        if path.file_name().is_some_and(|n| n == "connections.db") {
+            return crate::app_store::settings(path);
+        }
         use rusqlite::OptionalExtension;
         let connection = Self::connection(path)?;
         let json: Option<String> = connection
@@ -237,6 +269,14 @@ impl Preferences {
         self.save_to(&Self::path().map_err(|e| e.to_string())?)
     }
     fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        if path.file_name().is_some_and(|n| n == "connections.db") {
+            return crate::app_store::save(
+                &path.with_file_name("settings.json"),
+                "settings",
+                self,
+                1_048_576,
+            );
+        }
         let mut connection = Self::connection(path)?;
         let transaction = connection.transaction().map_err(|e| e.to_string())?;
         let json = serde_json::to_string(self).map_err(|e| e.to_string())?;
@@ -379,5 +419,23 @@ mod database_preferences_tests {
         assert_eq!(restored.database, changed.database);
         assert!(restored.database.confirm_destructive);
         assert!(!restored.database.sql_enter);
+    }
+}
+
+#[cfg(test)]
+mod command_permissions_tests {
+    #[test]
+    fn safe_defaults_and_explicit_choices_round_trip() {
+        let mut prefs = super::DatabasePreferences::default();
+        assert!(prefs.command_enabled("select"));
+        assert!(prefs.command_enabled("show_create"));
+        assert!(!prefs.command_enabled("delete"));
+        prefs.set_command("select", false);
+        prefs.set_command("update", true);
+        let saved = serde_json::to_string(&prefs).unwrap();
+        let loaded: super::DatabasePreferences = serde_json::from_str(&saved).unwrap();
+        assert!(!loaded.command_enabled("select"));
+        assert!(loaded.command_enabled("update"));
+        assert!(!loaded.command_enabled("delete"));
     }
 }

@@ -52,15 +52,26 @@ impl GridDelegate {
     pub fn snapshot(view: &TableView, owner: WeakEntity<TableView>) -> Self {
         let mut columns = vec![
             GridColumn::new("__row_number", "#")
+                .p_0()
                 .width(px(ROW_NUMBER_WIDTH))
                 .resizable(false)
                 .fixed_left(),
         ];
-        columns.extend(
-            view.rows.columns.iter().enumerate().map(|(i, name)| {
-                GridColumn::new(format!("data-{i}"), name.clone()).width(px(220.))
-            }),
-        );
+        columns.extend(view.rows.columns.iter().enumerate().map(|(i, name)| {
+            GridColumn::new(format!("data-{i}"), name.clone())
+                .p_0()
+                .width(px(
+                    if view.target.kind == turbodbn_services::DatabaseKind::Redis {
+                        if view.rows.columns.len() == 1 {
+                            720.
+                        } else {
+                            360.
+                        }
+                    } else {
+                        220.
+                    },
+                ))
+        }));
         Self {
             owner: Some(owner),
             columns,
@@ -156,7 +167,12 @@ impl TableDelegate for GridDelegate {
         cx: &mut Context<TableState<Self>>,
     ) -> impl IntoElement {
         if index == 0 {
-            return div().child("#").into_any_element();
+            return div()
+                .size_full()
+                .h_flex()
+                .px_2()
+                .child("#")
+                .into_any_element();
         }
         let col = index - 1;
         let name = self.rows.columns[col].clone();
@@ -181,7 +197,11 @@ impl TableDelegate for GridDelegate {
         div()
             .id(("column-head", index))
             .h_flex()
-            .size_full()
+            .px_2()
+            .h(gpui_component::Size::Medium.table_row_height() - px(1.))
+            .flex_1()
+            .min_w_0()
+            .mr(-gpui_component::Size::Medium.table_cell_padding().right)
             .gap_1()
             .when(selected, |el| {
                 el.bg(self
@@ -318,6 +338,18 @@ impl TableDelegate for GridDelegate {
     ) -> impl IntoElement {
         if index == 0 {
             return div()
+                .size_full()
+                .h_flex()
+                .px_2()
+                .when(
+                    self.highlight && self.selection.is_some_and(|(r, _)| r == row),
+                    |el| {
+                        el.bg(self
+                            .highlight_color
+                            .unwrap_or_else(|| default_highlight_color(cx))
+                            .opacity(0.18))
+                    },
+                )
                 .text_color(cx.theme().muted_foreground)
                 .child(format!(
                     "{}{}",
@@ -368,7 +400,8 @@ impl TableDelegate for GridDelegate {
         let cell = div()
             .id(("data-cell", row * 513 + index))
             .size_full()
-            .px_1()
+            .h_flex()
+            .px_2()
             .overflow_hidden()
             .whitespace_nowrap()
             .text_ellipsis()
@@ -404,7 +437,7 @@ impl TableDelegate for GridDelegate {
                 }
                 cx.stop_propagation();
             });
-        crate::context_menu::scoped(
+        crate::context_menu::cell(
             SharedString::from(format!("cell-menu-{row}-{col}")),
             cell,
             move |mut menu, window, cx| {
@@ -448,6 +481,18 @@ impl TableDelegate for GridDelegate {
                             }),
                     );
                 }
+                let document_owner = menu_owner.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t(cx, "result.full_value"))
+                        .icon(IconName::File)
+                        .on_click(move |_, window, cx| {
+                            if let Some(owner) = &document_owner {
+                                let _ = owner.update(cx, |this, cx| {
+                                    this.show_document(Some((row, col)), window, cx)
+                                });
+                            }
+                        }),
+                );
                 let owner = menu_owner.clone();
                 menu.submenu(
                     t(cx, "grid.copy.advanced"),

@@ -91,7 +91,7 @@ Windows 资源还包含 VERSIONINFO，提供 FileDescription / ProductName（Tur
 
 左侧数据库图标可新建、搜索连接，在中心标签页编辑项目、地址、账号、默认库、驱动/版本提示、UTF-8 会话字符集、TLS 证书和超时。测试完成释放连接，“连接”保留管理会话直至断开；建立持久连接前需先保存配置。双击连接名连接；右键统一连接/断开、编辑、复制、记录和删除。复制配置不复制密码，删除需要确认。
 
-现代适配器使用 SQLx 0.8.6，目标为 MySQL 5.6/5.7/8.0；4.0/4.1/5.0–5.5 使用 Legacy 兼容路由，由独立辅助进程加载预装/托管客户端，或明确指定的 MySQL 5.1–5.6 x64 `libmysql.dll`。自动路由依据所选目标版本，不会在认证失败后降级重试。实际检测版本与目标提示分别显示。TLS 默认验证身份，不静默降级。密码只留当前内存，或选择保存到 Windows DPAPI 加密存储；`connections.db` 保存连接配置及创建、修改、最近使用时间，密码仅以密文保存；首次导入旧 `connections.json` 并保留原文件。管理连接现支持表、字段及索引浏览；Notebook SQL 使用独立后台会话，写入需要预览并确认。详见[实现方案](docs/plans/2026-09-17-mysql-connections.md)。
+现代适配器使用 SQLx 0.8.6，目标为 MySQL 5.6/5.7/8.0；4.0/4.1/5.0–5.5 使用 Legacy 兼容路由，由独立辅助进程加载预装/托管客户端，或明确指定的 MySQL 5.1–5.6 x64 `libmysql.dll`。默认先读取有界握手识别版本，再自动选择适配器；手工覆盖放在高级设置，不会在认证失败后降级重试。实际检测版本与目标提示分别显示。TLS 默认验证身份，不静默降级。密码只留当前内存，或选择保存到 Windows DPAPI 加密存储；`connections.db` 保存连接配置及创建、修改、最近使用时间，密码仅以密文保存；首次导入旧 `connections.json` 并保留原文件。管理连接现支持表、字段及索引浏览；Notebook SQL 使用独立后台会话，写入需要预览并确认。详见[实现方案](docs/plans/2026-09-17-mysql-connections.md)。
 
 连接存储位置：安装版为 `%APPDATA%\TurboDbNote\connections.db`，绿色版为程序旁的 `data/connections.db`。编辑时密码框留空表示沿用，替换与清除明确区分；启用 Windows DPAPI 加密存储可在重启后继续使用，修改主机、端口或用户名则需重新输入密码。对话框操作栏统一右对齐，删除及 SQL 风险写入需二次确认。详见[连接存储与交互设计](docs/connection-storage-and-feedback.md)。
 
@@ -117,7 +117,7 @@ Windows 资源还包含 VERSIONINFO，提供 FileDescription / ProductName（Tur
 pwsh -File scripts/package-windows.ps1 -FxcPath 'C:\SDK\x64\fxc.exe' -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
 ```
 
-同一份 Release 程序生成 `*-portable.zip`、`*-setup.exe` 和 SHA256。安装版默认安装到当前用户 Programs 目录，提供中英文向导、开始菜单快捷方式、可选桌面快捷方式及卸载入口。安装/升级前需自行退出程序，不会自动关闭。绿色 ZIP 包含 portable.flag，设置保存到程序旁 data/settings.db；安装版使用用户配置目录。包内双语发布说明从根目录 CHANGELOG 生成；标签流水线上传两种候选制品，不公开发布。完整方案见[打包发布方案](docs/plans/2026-09-11-release-v0.1.0.md)。
+同一份 Release 程序生成 `*-portable.zip`、`*-setup.exe` 和 SHA256。安装版默认安装到当前用户 Programs 目录，提供中英文向导、开始菜单快捷方式、可选桌面快捷方式及卸载入口。安装/升级前需自行退出程序，不会自动关闭。绿色 ZIP 包含 portable.flag，设置保存到程序旁 data/connections.db；安装版使用用户配置目录。包内双语发布说明从根目录 CHANGELOG 生成；标签流水线上传两种候选制品，不公开发布。完整方案见[打包发布方案](docs/plans/2026-09-11-release-v0.1.0.md)。
 
 下载后解压到独立目录，运行 `turbodbnote.exe`，保留许可证及说明，不要在程序运行时覆盖 EXE。使用 `Get-FileHash <下载文件> -Algorithm SHA256` 对照 `SHA256SUMS.txt`。当前候选版本未签名；若系统阻止运行，不要关闭系统保护，请先确认来源。反馈问题时提供 Windows 版本、GPU、复现步骤和 `BUILD-INFO.json`，不要附带密码、连接串或敏感查询。
 
@@ -205,9 +205,9 @@ ClickHouse 使用 HTTP 端口（常见不加密 8123 / TLS 8443），不使用�
 
 AI 提供商可保存多套具名配置，支持 OpenAI、Gemini、DeepSeek、Qwen、Ollama、Custom。可选 Chat Completions、Responses、Anthropic Messages，填写 API 基地址（例如 `/v1`）、遮罩 API Key、模型 ID 与高级 JSON 参数。获取模型列表只在点击时请求对应 `/models`，也可手填模型 ID。这些配置尚未作为直接 API 聊天通道使用。切换厂商会清除前一厂商的密钥和模型；除本机回环地址外要求 HTTPS，不跟随重定向，请求超时五秒。
 
-配置改为 SQLite `settings.db`，通过事务保存完整设置文档。首次使用导入同目录旧 `settings.json`，保留原文件作备份；便携版路径为 `data/settings.db`，安装版使用用户配置目录。API Key 在界面遮罩显示，但本地数据库未加密。聊天快照仍单独使用 JSON。
+设置、连接、数据库导航与 Note 索引统一使用 SQLite `connections.db` 的独立命名空间，事务保存。旧 `settings.db`／JSON 一次迁移后保留，不再双写；便携版路径为 `data/connections.db`，安装版使用用户配置目录。API Key 在界面遮罩显示，但本地数据库未加密。聊天快照仍单独使用 JSON。
 
-独立语言包位于 `crates/desktop/assets/locales/`。将兼容 JSON 包放到 `settings.db` 同目录的 `locales/`，重启后可新增或覆盖语言，再到通用中选择。格式为 `schema_version: 2`、`id`、`name` 与扁平 `strings` 字典，键采用稳定英文语义标识；缺失项依次回退同语言内置包、内置英文。本次迁移保留旧原文键兼容，详见[多语言规范与校验](docs/i18n.md)。扩展主题使用 GPUI Component 的 ThemeSet JSON 格式，放入相邻 `themes/` 目录后在“扩展主题”选择。
+独立语言包位于 `crates/desktop/assets/locales/`。将兼容 JSON 包放到 `connections.db` 同目录的 `locales/`，重启后可新增或覆盖语言，再到通用中选择。格式为 `schema_version: 2`、`id`、`name` 与扁平 `strings` 字典，键采用稳定英文语义标识；缺失项依次回退同语言内置包、内置英文。本次迁移保留旧原文键兼容，详见[多语言规范与校验](docs/i18n.md)。扩展主题使用 GPUI Component 的 ThemeSet JSON 格式，放入相邻 `themes/` 目录后在“扩展主题”选择。
 
 帮助提供关于、GitHub 与后台检查最新稳定版。关于以信息卡展示版本、发布日期、通道、平台和许可，发布元数据维护在 `crates/desktop/assets/release.json`；当前预览版尚未正式发布，因此不虚构发布日期。更新通过 GitHub latest-release API 和语义版本比较检查，不自动下载或安装。详见[设计方案与验收](docs/layout-settings.md)。
 
@@ -232,3 +232,43 @@ SDK 缺失不影响应用运行，仅保留固定类型的启动/动作等本地
 导出支持文件、新库及已有库；复制至新库遇到重名即停止，预检核对实际执行通道。底部输出有界跟踪操作，并分卷保存结构化日志。关闭或切换未保存连接编辑页时，明确选择继续编辑或放弃修改。
 
 开发预览复用 `target/debug` 与 `target/preview`：执行 `pwsh -File scripts/build-preview.ps1`。使用 `pwsh -File scripts/clean-target.ps1` 查看可清理空间，加 `-Apply` 清理旧二进制和增量缓存，保留笔记、数据库及配置；发行打包复用带互斥锁的隔离源码目录。
+
+Note SQL 单元支持离线方言关键词/函数提示、表名 SELECT 模板和可撤销格式化（Ctrl+Shift+F，100 字符软行宽）。Redis 提供命令提示；ClickHouse/Redis 的编辑辅助不代表已支持 Note 执行。详见 [笔记工作台](docs/note-workbench.md)。
+
+Note 单元支持 F5 执行、Ctrl+E 查看执行计划和主动清除结果。传输窗口自动加载对象目录而不读取样本行，MySQL 导出兼容参数按客户端能力检测。
+
+SQL 单元支持 `u.` 等原表别名字段提示，复用字段缓存并可显式从已连接会话读取字段；结果网格高亮铺满单元格，文字保留内边距。
+
+Note 阅读态与折叠单元提供复制正文图标；SQL 编辑与阅读代码块统一按主题高亮关键词、函数、字符串和注释。
+
+
+Redis 库对象支持冒号前缀树（最多四层）、显式 SCAN/MATCH 筛选，以及 String／JSON／十六进制、Hash、Set、ZSet、List 的只读值页。目录最多保留 5,000 个 KEY，每批值预览最多 64 KiB 原始内容和 1,000 行；集合预览需要 EVAL 权限，脚本仅执行读取，暂不支持 Stream。集群仍限当前连接节点。导出 SQL 文件无需先读取样本，支持 LF／CRLF（保留字面量原始内容）。新建未命名 Note 默认保存在应用数据目录的 saved 下，旧草稿目录继续发现。
+
+
+Note SQL 按有效连接／数据库自动连接已保存配置，不自动执行 SQL；Col 等待连接与当前操作结束，自动失败或手动断开后不循环重连。笔记侧栏可确认删除至原目录的 `.turbodbnote-trash`，支持手动移回恢复；删除前须保存并处理运行任务、暂存结果修改。
+
+
+Note 支持直接执行 EXPLAIN 查询计划，也可使用计划按钮；不改写分页、不重复添加前缀。EXPLAIN ANALYZE 和写入语句的执行计划暂不支持。
+
+
+Note 结果、数据库表格与 Redis 共用表格／只读 JSON 文本切换，支持搜索、折叠和完整原值复制；大内容预览有明确上限，不自动读取未加载页面。
+
+
+Note SQL 单元可携带实际连接／数据库范围填入 AI 分析草稿，不自动发送或执行；已有草稿提供追加／替换／取消，不同范围不能混合追加。
+
+
+Note 支持 MySQL SHOW CREATE TABLE/VIEW 与 SHOW INDEX/KEYS/COLUMNS/FIELDS 有界只读查询；MySQL # 注释在编辑、阅读态与 -- 着色一致，引号内原值保持不变。
+
+
+设置、连接、数据库导航与 Note 索引现统一存入 `connections.db`，旧 settings.db／JSON 一次迁移并保留，不再双写。.note 正文仍为独立文件，默认 saved；旧 notes/drafts 继续发现，不自动搬移。MySQL 默认先检测握手版本再选适配器，手工驱动／版本覆盖收进高级；TLS 和旧认证保护不自动放宽。
+
+
+预览与发行统一把已校验的 MySQL 5.1.73 x64 兼容客户端放在主 EXE 同级 `drivers/mysql-5.1.73-winx64/`，同时携带独立辅助程序、许可、来源信息与配套源码归档。共用 `scripts/stage-mysql-driver.ps1`，复用 `target/tools/mysql-bundle` 的校验缓存，缓存完整后可离线构建。DLL 仅依赖 Windows 系统库；不把完整下载 ZIP 或数据库服务端打进成品。请完整解压／安装整个目录，不要只复制主 EXE。设置分别显示现代驱动与旧版客户端／辅助程序的真实可用状态。
+
+### SQL 上下文与 AI 工具
+
+进入 SQL Note 编辑态会检查已保存连接并按需读取列元数据。右侧“表定义”优先跟随当前编辑单元，否则采用已连接的库对象范围，提供表筛选与可选择复制的高亮 DDL。设置列出支持的 SQL 命令，默认仅开启只读命令，写入需启用并在执行时确认。新建连接默认禁用 TLS、MySQL 默认允许旧密码认证；已有配置不变。
+
+AI 聊天可以选择连接和数据库。本机 MCP 接口通过临时令牌鉴权的回环地址向 Codex／Claude 提供 `current_database`、`query_sql`，不向模型提供连接凭据。每次执行和分享结果均通过聊天内卡片确认，写入在同一卡片内再确认一次。输入工具栏提供只读（默认）／读写／管理员模式，绑定当前聊天和数据库，并与 SQL 设置及服务器权限共同限制。结果限制为 20 行、64 列、每值 512 字符（单值 JSON 计划等可使用完整的 32 KiB 值预算），按常见敏感列名遮蔽内容；列名遮蔽不能保证任意查询结果完全匿名，分享前仍需核对数据。聊天表格支持单元格换行与 TSV 复制，独立图片提供打开原图入口。
+
+Redis 数据页支持新建 String Key、添加成员、原值校验的文本编辑及整个 Key 删除。替换时保留剩余 TTL，倒计时为本地估算。二进制／截断预览不允许覆盖编辑；写入需要服务器 EVAL 与相应写权限，失败不自动重试。

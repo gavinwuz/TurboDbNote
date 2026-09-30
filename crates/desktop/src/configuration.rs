@@ -363,11 +363,11 @@ impl Configuration {
     }
 }
 impl Configuration {
-    fn render_form(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         match self.category {
             Category::Database => self.render_database(cx),
             Category::Shortcuts => self.render_shortcuts(cx),
-            Category::General => self.render_general(cx),
+            Category::General => self.render_general(window, cx),
             Category::Providers => self.render_providers(cx),
             _ => self.render_extensions(cx),
         }
@@ -449,6 +449,22 @@ impl Configuration {
                 );
         }
 
+        if self.database_tab == 1 {
+            body = body.child(t(cx, "settings.sql_policy_default"));
+            for &(key, label, _) in turbodbn_services::database::notebook_query::COMMANDS {
+                body = body.child(
+                    gpui_component::checkbox::Checkbox::new(key)
+                        .label(label)
+                        .checked(self.database.command_enabled(key))
+                        .disabled(self.locked)
+                        .on_click(cx.listener(move |this, checked: &bool, _, cx| {
+                            this.database.set_command(key, *checked);
+                            cx.notify();
+                        })),
+                );
+            }
+            body = body.child(t(cx, "settings.sql_policy_hint"));
+        }
         body.into_any_element()
     }
     fn render_shortcuts(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -476,7 +492,7 @@ impl Configuration {
 
         body.into_any_element()
     }
-    fn render_general(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_general(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let mut body = div().v_flex().gap_4().w_full().max_w(px(760.));
         let dark = cx.theme().mode.is_dark();
         let languages = cx
@@ -583,7 +599,7 @@ impl Configuration {
                         }
                     }),
             )
-            .child(self.typography_controls(cx));
+            .child(self.typography_controls(window, cx));
 
         body = body.child(
             div()
@@ -666,7 +682,7 @@ impl Configuration {
         );
         body.into_any_element()
     }
-    fn typography_controls(&self, cx: &Context<Self>) -> AnyElement {
+    fn typography_controls(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         div().v_flex().gap_3().child(t(cx,"settings.font.family"))
             .child(div().h_flex().gap_3()
                 .child(Input::new(&self.font).cleanable(true).disabled(self.locked).flex_1().suffix(
@@ -675,7 +691,7 @@ impl Configuration {
                 .child(Button::new("font-size").icon(IconName::ALargeSmall).label(format!("{} px",self.general.font_size)).w(px(112.)).disabled(self.locked).dropdown_caret(true).dropdown_menu({
                     let view=cx.entity();move |mut menu,_,_| {for size in [12,13,14,16,18,20,24] {let view=view.clone();menu=menu.item(PopupMenuItem::new(format!("{size} px")).on_click(move |_,_,cx| view.update(cx,|this,cx| {this.general.font_size=size as f32;cx.notify();})));}menu}
                 })))
-            .child(div().p_3().border_1().border_color(cx.theme().border).rounded_md().font_family(self.font.read(cx).value().to_string()).text_size(px(self.general.font_size)).child("SELECT id, name FROM users WHERE status = '启用';\n中文字体预览 · Database 0123456789"))
+            .child(div().p_3().border_1().border_color(cx.theme().border).rounded_md().font_family(self.font.read(cx).value().to_string()).text_size(px(self.general.font_size)).child(gpui_component::text::TextView::markdown(SharedString::from(format!("font-sql-preview-{}-{}-{}", self.font.read(cx).value(), self.general.font_size, cx.theme().mode.is_dark())), format!("```sql\nSELECT id, name FROM users WHERE status = '启用';\n{}\n```", t(cx, "settings.font_comment")), window, cx).selectable(true).style(gpui_component::text::TextViewStyle::default().code_block(StyleRefinement::default().font_family(self.font.read(cx).value().to_string()).text_size(px(self.general.font_size))))))
             .into_any_element()
     }
     fn render_providers(&mut self, cx: &mut Context<Self>) -> AnyElement {

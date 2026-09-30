@@ -817,9 +817,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.4.5"
+version = "1.2.67"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "005ec2760ca554fae18df7a11195552ec576cd665632a881bc011d5bb2fd4d80"
+checksum = "e17dd265a7d0f31ef544e1b20e03add05d3b45b491b633b10d67145d2acc1a38"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -2843,6 +2843,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "httpdate"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
+
+[[package]]
 name = "hybrid-array"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2865,6 +2871,7 @@ dependencies = [
  "http",
  "http-body",
  "httparse",
+ "httpdate",
  "itoa",
  "pin-project-lite",
  "smallvec",
@@ -6862,6 +6869,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca0d1bf6fdd806e43ae5198f82f527056d359def39e54e67a0f478ac09dac081"
 
 [[package]]
+name = "tree-sitter-sequel"
+version = "0.3.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f2550ddbfd7f52da6d7fd4bb145e20dc67f3a0cdfdae068034a2a16101e668b"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "triomphe"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6931,6 +6948,9 @@ dependencies = [
  "dunce",
  "encoding_rs",
  "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libloading",
  "redis",
  "reqwest",
@@ -6955,13 +6975,17 @@ dependencies = [
 name = "turbodbnote"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-channel 2.5.0",
+ "cc",
  "chrono",
  "dirs 6.0.0",
  "embed-resource",
  "gpui",
  "gpui-component",
  "gpui-component-assets",
+ "lsp-types",
+ "markdown",
  "raw-window-handle",
  "reqwest",
  "rusqlite",
@@ -6970,6 +6994,8 @@ dependencies = [
  "serde_json",
  "syn 2.0.119",
  "tempfile",
+ "tree-sitter-language",
+ "tree-sitter-sequel",
  "turbodbn-core",
  "turbodbn-diagnostics",
  "turbodbn-services",

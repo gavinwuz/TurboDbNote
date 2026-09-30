@@ -5,7 +5,9 @@ use turbodbn_services::{
     mysql::{Driver, Event, Profile, Session, TlsMode},
 };
 fn main() {
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    let redis_values = args.iter().any(|a| a == "--redis-values");
+    args.retain(|a| a != "--redis-values");
     let kind = match args[0].as_str() {
         "pg" => DatabaseKind::PostgreSql,
         "redis" => DatabaseKind::Redis,
@@ -73,6 +75,67 @@ fn main() {
         } => assert!(!rows.is_empty()),
         Event::Operation { result: Err(e), .. } => panic!("{e}"),
         _ => panic!("details expected"),
+    }
+    if kind == DatabaseKind::Redis && redis_values {
+        use turbodbn_services::database::workbench::{Action, Reply, Request};
+        session
+            .request(Operation {
+                id: 22,
+                kind: OperationKind::Workbench(Box::new(Request {
+                    database: database.clone(),
+                    action: Action::RedisScan {
+                        cursor: None,
+                        pattern: "app:*".into(),
+                    },
+                })),
+            })
+            .unwrap();
+        assert!(matches!(
+            events.recv_blocking().unwrap(),
+            Event::Operation {
+                result: Ok(OperationResult::Objects { .. }),
+                ..
+            }
+        ));
+        for (i, key) in [
+            "app:json",
+            "app:hash",
+            "app:set",
+            "app:zset",
+            "app:list",
+            "app:binary",
+            "app:large",
+        ]
+        .iter()
+        .enumerate()
+        {
+            session
+                .request(Operation {
+                    id: 30 + i as u64,
+                    kind: OperationKind::Workbench(Box::new(Request {
+                        database: database.clone(),
+                        action: Action::RedisValue {
+                            key: key.as_bytes().to_vec(),
+                            cursor: "0".into(),
+                            offset: 0,
+                            size: 100,
+                        },
+                    })),
+                })
+                .unwrap();
+            let Event::Operation {
+                result: Ok(OperationResult::Workbench(reply)),
+                ..
+            } = events.recv_blocking().unwrap()
+            else {
+                panic!("Redis value fixture failed")
+            };
+            let Reply::RedisValue(page) = *reply else {
+                panic!("Redis value reply expected")
+            };
+            assert!(!page.rows.values.is_empty());
+        }
+        println!("Redis bounded values and filtered scan verified");
     }
     if kind.can_create_database() {
         let name = format!("probe_{}", uuid::Uuid::new_v4().simple());

@@ -1,9 +1,6 @@
 use super::*;
 use serde::{Deserialize, Serialize};
-use std::{
-    io::{Read, Write},
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Navigation {
@@ -46,20 +43,9 @@ impl GroupMode {
     }
 }
 pub(super) fn load(path: &Path) -> Result<Navigation, String> {
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Navigation::default()),
-        Err(e) => return Err(e.to_string()),
-    };
-    let mut bytes = Vec::new();
-    file.take(65537)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() > 65536 {
-        return Err("导航文件过大".into());
-    }
-    serde_json::from_slice(&bytes).map_err(|_| "导航文件格式无效".into())
+    crate::app_store::load(path, "navigation", 65536, |_: &Navigation| true)
 }
+
 pub(super) fn writer(
     path: PathBuf,
 ) -> (
@@ -70,17 +56,7 @@ pub(super) fn writer(
     let (errors, out) = async_channel::unbounded();
     std::thread::spawn(move || {
         while let Ok(state) = receive.recv_blocking() {
-            let result = (|| -> Result<(), String> {
-                let parent = path.parent().ok_or("导航路径无效")?;
-                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-                let mut file =
-                    tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-                file.write_all(&serde_json::to_vec(&state).map_err(|e| e.to_string())?)
-                    .map_err(|e| e.to_string())?;
-                file.as_file().sync_all().map_err(|e| e.to_string())?;
-                file.persist(&path).map_err(|e| e.to_string())?;
-                Ok(())
-            })();
+            let result = crate::app_store::save(&path, "navigation", &state, 65536);
             if let Err(error) = result {
                 let _ = errors.try_send(format!("导航排序保存失败：{error}"));
             }
@@ -136,6 +112,9 @@ pub(super) fn type_icon(kind: DatabaseKind) -> gpui_component::Icon {
 }
 impl DatabaseView {
     pub(super) fn persist_navigation(&self) {
+        if self.navigation_error {
+            return;
+        }
         let _ = self.nav_writer.force_send(self.navigation.clone());
     }
     fn group_key(&self, p: &Profile) -> String {

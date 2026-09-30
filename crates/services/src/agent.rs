@@ -23,13 +23,22 @@ impl Engine {
         }
     }
 }
+pub fn connect_with_mcp(
+    engine: Engine,
+    path: PathBuf,
+    cwd: PathBuf,
+    mcp: Option<crate::sql_mcp::Config>,
+) -> (Connection, async_channel::Receiver<Event>) {
+    match engine {
+        Engine::Codex => Connection::start_with_mcp(path, cwd, mcp),
+        Engine::Claude => crate::claude::start_with_mcp(path, cwd, mcp),
+    }
+}
+
 pub fn connect(
     engine: Engine,
     path: PathBuf,
     cwd: PathBuf,
 ) -> (Connection, async_channel::Receiver<Event>) {
-    match engine {
-        Engine::Codex => Connection::start(path, cwd),
-        Engine::Claude => crate::claude::start(path, cwd),
-    }
+    connect_with_mcp(engine, path, cwd, None)
 }

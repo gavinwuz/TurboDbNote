@@ -190,6 +190,51 @@ impl Render for WorkbenchPanel {
             .text_color(cx.theme().foreground)
             .bg(cx.theme().background);
         if let Some(detail) = self.detail.clone() {
+            if !detail.inspector {
+                let fence = "~".repeat(
+                    detail
+                        .text
+                        .lines()
+                        .map(|line| line.chars().take_while(|c| *c == '~').count())
+                        .max()
+                        .unwrap_or(0)
+                        .max(2)
+                        + 1,
+                );
+                let markdown = format!("{fence}sql\n{}\n{fence}", detail.text);
+                let copy = detail.text.clone();
+                return content
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().child(detail.title))
+                            .child(
+                                Button::new("ddl-copy")
+                                    .ghost()
+                                    .icon(IconName::Copy)
+                                    .tooltip(crate::locale::t(cx, "dbwork.copy.ddl"))
+                                    .on_click(move |_, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            copy.clone(),
+                                        ));
+                                        crate::feedback::success(
+                                            crate::locale::t(cx, "feedback.copied"),
+                                            cx,
+                                        );
+                                    }),
+                            ),
+                    )
+                    .child(
+                        gpui_component::text::TextView::markdown(
+                            "ddl-definition",
+                            markdown,
+                            window,
+                            cx,
+                        )
+                        .selectable(true),
+                    );
+            }
             let input = self.detail_input.clone().unwrap();
             let text = detail.text.clone();
             return content

@@ -10,8 +10,23 @@ pub struct Message {
     pub kind: NotificationType,
     pub text: SharedString,
 }
+#[derive(Clone, PartialEq, Eq)]
+pub struct SqlScope {
+    pub connection: Option<uuid::Uuid>,
+    pub name: String,
+    pub database: String,
+    pub kind: String,
+}
+#[derive(Clone)]
+pub struct SqlDraft {
+    pub sql: String,
+    pub scope: SqlScope,
+}
+pub struct OpenSqlSettings;
 pub struct Events;
+impl EventEmitter<OpenSqlSettings> for Events {}
 impl EventEmitter<Message> for Events {}
+impl EventEmitter<SqlDraft> for Events {}
 pub struct Hub(pub Entity<Events>);
 impl Global for Hub {}
 pub fn init(cx: &mut App) {
@@ -306,6 +321,40 @@ pub fn editable_multiline(
         })
 }
 
+/// Open the containing directory explicitly; some native reveal implementations are no-ops.
+pub fn reveal_parent(path: std::path::PathBuf, cx: &mut gpui::App) {
+    #[cfg(windows)]
+    {
+        let job = cx.background_executor().spawn(async move {
+            let directory = if path.is_dir() {
+                path
+            } else {
+                path.parent().ok_or(())?.to_path_buf()
+            };
+            if !directory.is_dir() {
+                return Err(());
+            }
+            let explorer = std::path::PathBuf::from(
+                std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into()),
+            )
+            .join("explorer.exe");
+            std::process::Command::new(explorer)
+                .arg(directory)
+                .spawn()
+                .map(|_| ())
+                .map_err(|_| ())
+        });
+        cx.spawn(async move |cx| {
+            if job.await.is_err() {
+                let _ = cx.update(|cx| error(crate::locale::t(cx, "files.open_folder_failed"), cx));
+            }
+        })
+        .detach();
+    }
+    #[cfg(not(windows))]
+    cx.reveal_path(&path);
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -332,4 +381,17 @@ mod tests {
         assert!(preview.contains('\u{200b}') && preview.ends_with('…'));
         assert_eq!(super::message_preview("first\nsecond"), "first\nsecond");
     }
+}
+
+#[derive(Clone)]
+pub struct DdlContext {
+    pub origin: Option<uuid::Uuid>,
+    pub scope: Option<(uuid::Uuid, String)>,
+    pub object: Option<turbodbn_services::database::workbench::Object>,
+    pub open: bool,
+}
+impl EventEmitter<DdlContext> for Events {}
+pub fn ddl_context(event: DdlContext, cx: &mut App) {
+    let hub = cx.global::<Hub>().0.clone();
+    cx.defer(move |cx| hub.update(cx, |_, cx| cx.emit(event)));
 }

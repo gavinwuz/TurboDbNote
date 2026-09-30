@@ -55,6 +55,8 @@ pub struct Workspace {
     schema: Entity<WorkbenchPanel>,
     properties: Entity<WorkbenchPanel>,
     _detail_subscription: Subscription,
+    _sql_draft_subscription: Subscription,
+    _sql_settings_subscription: Subscription,
     _objects_subscription: Subscription,
     _table_subscription: Subscription,
     table_panels: std::collections::HashMap<String, Entity<crate::table_view::TableView>>,
@@ -148,6 +150,7 @@ impl Workspace {
         let output = cx.new(AiLog::new);
         database.update(cx, |database, _| database.output = Some(output.clone()));
         let ai = cx.new(|cx| ChatView::new(output.clone(), window, cx));
+        ai.update(cx, |chat, _| chat.databases = Some(database.downgrade()));
         let settings =
             cx.new(|cx| SettingsView::new(ai.clone(), database.read(cx).drivers(), window, cx));
         let properties = cx.new(|cx| {
@@ -331,6 +334,62 @@ impl Workspace {
                 }
                 cx.notify();
             });
+        let sql_settings_subscription = cx.subscribe_in(
+            &events,
+            window,
+            |this, _, _: &crate::feedback::OpenSqlSettings, window, cx| {
+                this.open_settings(Some(crate::settings::Category::Database), window, cx);
+                this.settings
+                    .update(cx, |settings, cx| settings.select_sql(cx));
+            },
+        );
+        let sql_draft_subscription = cx.subscribe_in(
+            &events,
+            window,
+            |this, _, request: &crate::feedback::SqlDraft, window, cx| {
+                this.leave_focus(window, cx);
+                this.dock
+                    .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
+                this.ai.update(cx, |chat, cx| chat.sync_zoom(false, cx));
+                this.right_tabs.update(cx, |tabs, cx| {
+                    let panel: Arc<dyn PanelView> = Arc::new(this.ai.clone());
+                    tabs.remove_panel(panel.clone(), window, cx);
+                    tabs.add_panel(panel, window, cx);
+                });
+                if !this.dock.read(cx).is_dock_open(DockPlacement::Right, cx) {
+                    this.dock.update(cx, |dock, cx| {
+                        dock.toggle_dock(DockPlacement::Right, window, cx)
+                    });
+                }
+                this.ai.update(cx, |chat, cx| {
+                    chat.accept_sql_draft(request.clone(), window, cx)
+                });
+                cx.notify();
+            },
+        );
+        cx.subscribe_in(
+            &events,
+            window,
+            |this, _, event: &crate::feedback::DdlContext, window, cx| {
+                this.database
+                    .update(cx, |db, cx| db.set_ddl_context(event.clone(), cx));
+                this.schema.update(cx, |panel, cx| panel.clear_detail(cx));
+                if event.open {
+                    this.leave_focus(window, cx);
+                    this.right_tabs.update(cx, |tabs, cx| {
+                        let panel: Arc<dyn PanelView> = Arc::new(this.schema.clone());
+                        tabs.remove_panel(panel.clone(), window, cx);
+                        tabs.add_panel(panel, window, cx);
+                    });
+                    if !this.dock.read(cx).is_dock_open(DockPlacement::Right, cx) {
+                        this.dock.update(cx, |dock, cx| {
+                            dock.toggle_dock(DockPlacement::Right, window, cx)
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
         let detail_subscription = cx.subscribe_in(
             &events,
             window,
@@ -427,6 +486,12 @@ impl Workspace {
             &notes,
             window,
             |this, _, event: &crate::note_library::LibraryEvent, window, cx| match event {
+                crate::note_library::LibraryEvent::Removed { key } => {
+                    let key = key.clone();
+                    cx.defer_in(window, move |this, window, cx| {
+                        this.close_names(&[key], window, cx)
+                    });
+                }
                 crate::note_library::LibraryEvent::Open { key, view } => {
                     let panel: Arc<dyn PanelView> = Arc::new(view.clone());
                     this.center_tabs.update(cx, |tabs, cx| {
@@ -481,6 +546,8 @@ impl Workspace {
             schema,
             properties,
             _detail_subscription: detail_subscription,
+            _sql_draft_subscription: sql_draft_subscription,
+            _sql_settings_subscription: sql_settings_subscription,
             table_panels: std::collections::HashMap::new(),
             _table_subscription: table_subscription,
             _objects_subscription: objects_subscription,

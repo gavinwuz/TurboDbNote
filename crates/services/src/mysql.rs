@@ -1,4 +1,6 @@
 use crate::DatabaseKind;
+#[path = "mysql_auto.rs"]
+mod automatic;
 use async_channel::{Receiver, Sender};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -209,6 +211,22 @@ pub fn uses_legacy(profile: &Profile) -> bool {
             || (profile.driver == Driver::Auto
                 && ["4.0", "4.1", "5.0", "5.1", "5.5", "5.0–5.5"]
                     .contains(&profile.target_version.as_str())))
+}
+pub fn detected_profile(mut profile: Profile, version: &str) -> Profile {
+    if profile.kind == DatabaseKind::MySql && profile.driver == Driver::Auto {
+        if let Some(target) = automatic::legacy_target(version) {
+            profile.driver = Driver::Legacy;
+            profile.target_version = target.into();
+            if target == "4.0" {
+                profile.charset = "server-default".into();
+            } else if profile.charset == "utf8mb4" {
+                profile.charset = "utf8".into();
+            }
+        } else {
+            profile.driver = Driver::Modern;
+        }
+    }
+    profile
 }
 pub fn route(profile: &Profile) -> Result<(), String> {
     if profile.kind != DatabaseKind::MySql {
@@ -451,6 +469,9 @@ impl Session {
     pub fn start(profile: Profile, password: String, test_only: bool) -> (Self, Receiver<Event>) {
         if profile.kind != DatabaseKind::MySql {
             return crate::database::start(profile, password, test_only);
+        }
+        if profile.driver == Driver::Auto && profile.target_version == "自动检测" {
+            return automatic::start(profile, password, test_only);
         }
         if uses_legacy(&profile) {
             return crate::mysql_legacy::start(profile, password, test_only);

@@ -1,3 +1,11 @@
+#[path = "chat_authorization.rs"]
+mod authorization;
+#[path = "chat_markup.rs"]
+mod markup;
+#[path = "chat_mcp.rs"]
+mod mcp_ui;
+#[path = "chat_sql.rs"]
+mod sql_draft;
 use crate::chat_history::{HistoryWriter, LastChat, SavedMessage};
 use crate::preferences::EnginePreferences;
 use crate::{preferences::Preferences, settings::Category};
@@ -300,11 +308,22 @@ impl Render for AiLog {
 }
 
 struct EngineDraft {
+    scope: Option<crate::feedback::SqlScope>,
     preferences: EnginePreferences,
     input: String,
 }
 
 pub struct ChatView {
+    sql_access: authorization::AccessMode,
+    access_scope: Option<crate::feedback::SqlScope>,
+    access_generation: usize,
+    access_connection_generation: Option<u64>,
+    sql_reviews: Vec<authorization::SqlReview>,
+    markup_cache: std::cell::RefCell<VecDeque<(SharedString, Vec<markup::Block>)>>,
+    mcp_server: Option<turbodbn_services::sql_mcp::Server>,
+    mcp_task: Option<Task<()>>,
+    pub(crate) databases: Option<WeakEntity<crate::database::DatabaseView>>,
+    sql_scope: Option<crate::feedback::SqlScope>,
     automatic: crate::auto_connect::AutoConnect,
     auto_connect: bool,
     restore_last_session: bool,
@@ -430,12 +449,14 @@ impl ChatView {
                     effort: self.effort.clone().or(self.restored_effort.clone()),
                 },
                 input: self.input.read(cx).value().to_string(),
+                scope: self.sql_scope.clone(),
             },
         );
         self.disconnect(cx);
         self.discovery_task = None;
         self.detecting = false;
         self.candidates.clear();
+        self.sql_reviews.clear();
         self.engine = engine;
         turbodbn_diagnostics::track(match engine {
             Engine::Codex => turbodbn_diagnostics::Event::AgentCodex,
@@ -469,7 +490,9 @@ impl ChatView {
         let saved = self.drafts.remove(&engine).unwrap_or_else(|| EngineDraft {
             preferences: cx.global::<Preferences>().ai.get(engine).clone(),
             input: String::new(),
+            scope: None,
         });
+        self.sql_scope = saved.scope;
         self.auto_connect = saved.preferences.auto_connect;
         self.restore_last_session = saved.preferences.restore_last_session;
         self.history_notice = if !last.messages.is_empty() {
@@ -713,6 +736,16 @@ impl ChatView {
             engine,
             sessions: HashMap::new(),
             drafts: HashMap::new(),
+            sql_access: Default::default(),
+            access_scope: None,
+            access_generation: 0,
+            access_connection_generation: None,
+            sql_reviews: vec![],
+            sql_scope: None,
+            databases: None,
+            markup_cache: Default::default(),
+            mcp_server: None,
+            mcp_task: None,
             account_status: String::new(),
             input_observer: None,
             locale_observer: None,
@@ -944,6 +977,9 @@ impl ChatView {
         .detach();
     }
     fn disconnect(&mut self, cx: &mut Context<Self>) {
+        self.reset_sql_access();
+        self.mcp_server = None;
+        self.mcp_task = None;
         self.automatic.suppress(self.engine);
         self.history_interrupted |= self.busy;
         if !self.messages.is_empty() {
@@ -968,10 +1004,12 @@ impl ChatView {
         self.disconnect(cx);
         self.connecting = true;
         self.status = "agents.status.connecting".into();
-        let (connection, events) = agent::connect(
+        let mcp = self.start_sql_mcp(cx);
+        let (connection, events) = agent::connect_with_mcp(
             self.engine,
             PathBuf::from(self.path.read(cx).value().trim()),
             PathBuf::from(self.cwd.read(cx).value().trim()),
+            mcp,
         );
         let executable = self.path.read(cx).value().trim().to_string();
         let cwd = self.cwd.read(cx).value().trim().to_string();
@@ -1114,6 +1152,9 @@ impl ChatView {
                 self.persist_history(true, cx);
             }
             Event::Disconnected => {
+                self.reset_sql_access();
+                self.mcp_server = None;
+                self.mcp_task = None;
                 self.finish_timing();
                 self.connection = None;
                 self.ready = false;
@@ -1645,37 +1686,63 @@ impl ChatView {
                     .min_w_0()
                     .child(
                         Button::new("chat-connection")
+                            .disabled(self.busy)
+                            .dropdown_caret(true)
                             .ghost()
                             .icon(IconName::Globe)
                             .flex_1()
                             .min_w_0()
                             .px_1()
                             .child(
-                                div()
-                                    .max_w(rems(3.))
-                                    .truncate()
-                                    .child(crate::locale::t(cx, "chat.context.connection")),
+                                div().max_w(px(220.)).truncate().child(
+                                    self.sql_scope
+                                        .as_ref()
+                                        .filter(|s| !s.name.is_empty())
+                                        .map(|s| s.name.clone().into())
+                                        .unwrap_or_else(|| {
+                                            crate::locale::t(cx, "chat.context.connection")
+                                        }),
+                                ),
                             )
-                            .dropdown_caret(true)
-                            .tooltip(crate::locale::t(cx, "chat.context.unavailable"))
-                            .disabled(true),
+                            .tooltip(
+                                self.sql_scope
+                                    .as_ref()
+                                    .map(|s| s.name.clone().into())
+                                    .unwrap_or_else(|| {
+                                        crate::locale::t(cx, "chat.context.connection")
+                                    }),
+                            )
+                            .dropdown_menu(self.sql_connection_menu(cx)),
                     )
                     .child(
                         Button::new("chat-database")
+                            .disabled(self.busy)
+                            .dropdown_caret(true)
                             .ghost()
                             .icon(Icon::default().path("icons/database.svg"))
                             .flex_1()
                             .min_w_0()
                             .px_1()
                             .child(
-                                div()
-                                    .max_w(rems(3.))
-                                    .truncate()
-                                    .child(crate::locale::t(cx, "chat.context.database")),
+                                div().max_w(px(220.)).truncate().child(
+                                    self.sql_scope
+                                        .as_ref()
+                                        .filter(|s| !s.database.is_empty())
+                                        .map(|s| s.database.clone().into())
+                                        .unwrap_or_else(|| {
+                                            crate::locale::t(cx, "chat.context.database")
+                                        }),
+                                ),
                             )
-                            .dropdown_caret(true)
-                            .tooltip(crate::locale::t(cx, "chat.context.select_connection"))
-                            .disabled(true),
+                            .tooltip(
+                                self.sql_scope
+                                    .as_ref()
+                                    .map(|s| s.database.clone().into())
+                                    .unwrap_or_else(|| {
+                                        crate::locale::t(cx, "chat.context.database")
+                                    }),
+                            )
+                            .dropdown_menu(self.sql_database_menu(cx)),
                     ),
             )
             .child(
@@ -1688,11 +1755,11 @@ impl ChatView {
                     .border_color(cx.theme().border)
                     .bg(cx.theme().muted)
                     .child(
-                        Input::new(&self.input)
+                        crate::feedback::editable_multiline(&self.input, false, cx)
                             .text_size(rems(crate::typography::BODY))
                             .appearance(false)
                             .min_h(rems(5.))
-                            .max_h(rems(10.)),
+                            .overflow_hidden(),
                     )
                     .child(
                         div()
@@ -1762,14 +1829,7 @@ impl ChatView {
                                         menu
                                     }),
                             )
-                            .child(
-                                Button::new("read-only-mode")
-                                    .ghost()
-                                    .w(px(32.))
-                                    .h(px(32.))
-                                    .icon(IconName::Eye)
-                                    .tooltip(crate::locale::t(cx, "chat.mode.tooltip")),
-                            )
+                            .child(self.sql_access_control(cx))
                             .child(self.engine_control(true, cx))
                             .child(div().flex_1().min_w_0().child(self.composer_model(cx)))
                             .child(
@@ -2140,6 +2200,8 @@ impl Render for ChatView {
                                     cx.notify();
                                     return;
                                 }
+                                this.reset_sql_access();
+                                this.sql_reviews.clear();
                                 this.messages.clear();
                                 this.history_notice = None;
                                 this.thread_id = None;
@@ -2298,9 +2360,10 @@ impl Render for ChatView {
                                 ),
                         )
                     })
+                    .children(self.review_cards(0, window, cx))
                     .children(self.messages.iter().enumerate().map(|(index, message)| {
                         let text = message.visible.clone();
-                        div()
+                        let message_body = div()
                             .v_flex()
                             .gap_2()
                             .min_w_0()
@@ -2324,52 +2387,14 @@ impl Render for ChatView {
                                         self.engine.name().into()
                                     }),
                             )
-                            .child(
-                                div()
-                                    .id(("message-body", index))
-                                    .w_full()
-                                    .overflow_x_scroll()
-                                    .child(
-                                        TextView::markdown(
-                                            ("ai-message", index),
-                                            message.visible.clone(),
-                                            window,
-                                            cx,
-                                        )
-                                        .selectable(true)
-                                        .code_block_actions(move |block, _, cx| {
-                                            let code = block.code().to_string();
-                                            let pointer_code = code.clone();
-                                            div().id(("code-actions", index)).occlude().child(
-                                                Button::new(("copy-code", index))
-                                                    .ghost()
-                                                    .icon(IconName::Copy)
-                                                    .tooltip(crate::locale::t(
-                                                        cx,
-                                                        "chat.action.copy_code",
-                                                    ))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        move |_, window, cx| {
-                                                            window.prevent_default();
-                                                            cx.stop_propagation();
-                                                            cx.write_to_clipboard(
-                                                                ClipboardItem::new_string(
-                                                                    pointer_code.clone(),
-                                                                ),
-                                                            );
-                                                        },
-                                                    )
-                                                    .on_click(move |_, _, cx| {
-                                                        cx.stop_propagation();
-                                                        cx.write_to_clipboard(
-                                                            ClipboardItem::new_string(code.clone()),
-                                                        )
-                                                    }),
-                                            )
-                                        }),
-                                    ),
-                            )
+                            .child(div().id(("message-body", index)).w_full().min_w_0().child(
+                                self.rich_message(
+                                    index,
+                                    message.visible.clone().into(),
+                                    window,
+                                    cx,
+                                ),
+                            ))
                             .child(
                                 div().h_flex().child(
                                     Button::new(("copy", index))
@@ -2382,7 +2407,13 @@ impl Render for ChatView {
                                             ))
                                         }),
                                 ),
-                            )
+                            );
+                        div()
+                            .v_flex()
+                            .gap_3()
+                            .min_w_0()
+                            .child(message_body)
+                            .children(self.review_cards(index + 1, window, cx))
                     })),
             )
             .when_some(self.selection_menu.clone(), |el, (position, focus)| {

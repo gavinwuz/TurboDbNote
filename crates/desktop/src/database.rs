@@ -1,3 +1,5 @@
+#[path = "database_ddl.rs"]
+mod ddl_ui;
 #[path = "database_import.rs"]
 mod import_ui;
 #[path = "database_navigation.rs"]
@@ -55,7 +57,10 @@ impl SelectItem for DatabaseChoice {
 
 pub struct OpenDatabase;
 pub struct OpenObjects;
+pub(crate) struct NoteColumnsReady(pub Uuid);
 pub struct DatabaseView {
+    ddl: ddl_ui::DdlState,
+    mcp_target: Option<async_channel::Sender<Result<Reply, String>>>,
     pub(crate) output: Option<Entity<crate::chat::AiLog>>,
     operation_started: HashMap<Uuid, std::time::Instant>,
     focus: FocusHandle,
@@ -67,6 +72,8 @@ pub struct DatabaseView {
     _object_filter: Subscription,
     catalog_objects: Vec<Object>,
     schemas: HashMap<String, Schema>,
+    note_auto_attempts: HashMap<Uuid, Profile>,
+    note_columns: HashMap<(Uuid, u64, String, String), Vec<workbench::Column>>,
     expanded_objects: std::collections::HashSet<String>,
     pending_object_action: Option<(Object, String)>,
     workbench_target: Option<WeakEntity<crate::table_view::TableView>>,
@@ -75,10 +82,12 @@ pub struct DatabaseView {
     type_grid: bool,
     typed_drafts: HashMap<DatabaseKind, (Profile, String)>,
     navigation: Navigation,
+    navigation_error: bool,
     nav_writer: async_channel::Sender<Navigation>,
     selected_database: Option<(Uuid, String)>,
     object_items: Vec<ObjectItem>,
     object_cursor: Option<String>,
+    redis_pattern: String,
     object_details: Vec<(String, String)>,
     selected_object: Option<ObjectItem>,
     detail_scroll: UniformListScrollHandle,
@@ -90,6 +99,7 @@ pub struct DatabaseView {
     _nav_task: Task<()>,
     tab: usize,
     connection_details: bool,
+    driver_override: bool,
     pending_tls: Option<TlsPrompt>,
     drivers: Entity<crate::drivers::DriverManager>,
     connect_after_save: bool,
@@ -141,6 +151,192 @@ const FIELDS: [(&str, &str); 16] = [
     ("key", "客户端私钥路径"),
 ];
 impl DatabaseView {
+    /// Connect saved Note scopes without touching the connection editor or sidebar selection.
+    /// An explicit field-read may retry; automatic scope activation only attempts each profile once.
+    pub(crate) fn mcp_request(
+        &mut self,
+        id: Uuid,
+        generation: u64,
+        database: String,
+        action: Action,
+        cx: &mut Context<Self>,
+    ) -> async_channel::Receiver<Result<Reply, String>> {
+        let (sender, receiver) = async_channel::bounded(1);
+        if self.note_generation(id) != generation
+            || self.note_connection_state(id) != Some(true)
+            || self.active_operation.is_some()
+        {
+            let _ = sender.try_send(Err("mcp.stale".into()));
+        } else if self.request_operation(
+            id,
+            OperationKind::Workbench(Box::new(workbench::Request { database, action })),
+            cx,
+        ) {
+            self.mcp_target = Some(sender);
+        } else {
+            let _ = sender.try_send(Err("mcp.failed".into()));
+        }
+        receiver
+    }
+    pub(crate) fn ensure_note_connection(&mut self, id: Uuid, retry: bool, cx: &mut Context<Self>) {
+        if self.sessions.contains_key(&id)
+            || self.states.get(&id).is_some_and(|s| s.ends_with("中…"))
+        {
+            return;
+        }
+        let Some(profile) = self.note_profile(id).cloned() else {
+            return;
+        };
+        if !retry && self.note_auto_attempts.get(&id) == Some(&profile) {
+            return;
+        }
+        self.note_auto_attempts.insert(id, profile.clone());
+        if let Some(key) = required_connection_field(&profile, false) {
+            feedback::error(crate::locale::t(cx, key), cx);
+            return;
+        }
+        if let Err(error) = profile.validate() {
+            feedback::error(error, cx);
+            return;
+        }
+        if self
+            .states
+            .values()
+            .filter(|s| s.as_str() == "已连接" || s.ends_with("中…"))
+            .count()
+            >= 8
+        {
+            feedback::error(crate::locale::t(cx, "notes.connection_limit"), cx);
+            return;
+        }
+        self.start_profile(false, false, None, Some(profile), cx);
+    }
+    pub(crate) fn note_connection_state(&self, id: Uuid) -> Option<bool> {
+        match self.states.get(&id).map(String::as_str) {
+            Some("已连接") => Some(true),
+            Some("连接中…") => None,
+            _ => Some(false),
+        }
+    }
+    pub(crate) fn note_generation(&self, id: Uuid) -> u64 {
+        self.generation.get(&id).copied().unwrap_or_default()
+    }
+    pub(crate) fn note_column_object(
+        &self,
+        id: Uuid,
+        database: &str,
+        table: &turbodbn_services::database::sql_assist::TableName,
+    ) -> Option<Object> {
+        let profile = self.note_profile(id)?;
+        let schema = match profile.kind {
+            DatabaseKind::PostgreSql => table.schema.clone(),
+            DatabaseKind::Sqlite
+                if table.schema.is_empty() || table.schema.eq_ignore_ascii_case("main") =>
+            {
+                String::new()
+            }
+            DatabaseKind::MySql | DatabaseKind::ClickHouse
+                if table.schema.is_empty() || table.schema == database =>
+            {
+                String::new()
+            }
+            _ => return None,
+        };
+        Some(Object {
+            schema,
+            name: table.name.clone(),
+            kind: "table".into(),
+            comment: String::new(),
+            parent: String::new(),
+        })
+    }
+    pub(crate) fn cached_note_columns(
+        &self,
+        id: Uuid,
+        database: &str,
+        object: &Object,
+    ) -> Option<Vec<workbench::Column>> {
+        if self
+            .selected_database
+            .as_ref()
+            .is_some_and(|(selected, db)| *selected == id && db == database)
+            && let Some(schema) = self.schemas.get(&Self::object_key(object))
+        {
+            return Some(schema.columns.clone());
+        }
+        self.note_columns
+            .get(&(
+                id,
+                self.note_generation(id),
+                database.into(),
+                Self::object_key(object),
+            ))
+            .cloned()
+    }
+    pub(crate) fn request_note_columns(
+        &mut self,
+        id: Uuid,
+        database: String,
+        object: Object,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.active_operation.is_some() {
+            return false;
+        }
+        self.request_operation(
+            id,
+            OperationKind::Workbench(Box::new(workbench::Request {
+                database,
+                action: Action::NoteColumns(object),
+            })),
+            cx,
+        )
+    }
+    pub(crate) fn remember_note_columns(
+        &mut self,
+        id: Uuid,
+        database: &str,
+        object: &Object,
+        columns: &[workbench::Column],
+    ) {
+        if self.note_columns.len() >= 32 {
+            self.note_columns.clear();
+        }
+        self.note_columns.insert(
+            (
+                id,
+                self.note_generation(id),
+                database.into(),
+                Self::object_key(object),
+            ),
+            columns.iter().take(1024).cloned().collect(),
+        );
+    }
+    pub(crate) fn note_tables(
+        &self,
+        id: Uuid,
+        database: &str,
+    ) -> Vec<turbodbn_services::database::sql_assist::TableName> {
+        if !self.sessions.contains_key(&id)
+            || self.states.get(&id).is_none_or(|s| s != "已连接")
+            || self
+                .selected_database
+                .as_ref()
+                .is_none_or(|(selected, db)| *selected != id || db != database)
+            || !self.object_catalog_loaded
+        {
+            return vec![];
+        }
+        self.catalog_objects
+            .iter()
+            .filter(|o| matches!(o.kind.as_str(), "table" | "view"))
+            .take(2000)
+            .map(|o| turbodbn_services::database::sql_assist::TableName {
+                schema: o.schema.clone(),
+                name: o.name.clone(),
+            })
+            .collect()
+    }
     pub(crate) fn note_databases(&self, id: Uuid) -> Vec<String> {
         self.profiles
             .iter()
@@ -155,6 +351,9 @@ impl DatabaseView {
                 names
             })
             .unwrap_or_default()
+    }
+    pub(crate) fn note_profile(&self, id: Uuid) -> Option<&Profile> {
+        self.profiles.iter().find(|profile| profile.id == id)
     }
     pub(crate) fn note_profiles(&self) -> Vec<Profile> {
         self.profiles.clone()
@@ -272,6 +471,12 @@ impl DatabaseView {
                         });
                         if *key == "password" {
                             input.masked(true)
+                        } else if *key == "port" {
+                            input.validate(|value, _| {
+                                value.is_empty()
+                                    || (value.bytes().all(|b| b.is_ascii_digit())
+                                        && value.parse::<u16>().is_ok_and(|port| port > 0))
+                            })
                         } else {
                             input
                         }
@@ -284,7 +489,13 @@ impl DatabaseView {
             .map(|input| cx.observe(input, |_, _, cx| cx.notify()))
             .collect();
         let nav_path = file.with_file_name("database-navigation.json");
-        let navigation = navigation::load(&nav_path).unwrap_or_default();
+        let loaded_navigation = navigation::load(&nav_path);
+        let navigation_error = loaded_navigation.is_err();
+        if let Err(error) = &loaded_navigation {
+            let error = error.clone();
+            cx.defer(move |cx| feedback::error(error, cx));
+        }
+        let navigation = loaded_navigation.unwrap_or_default();
         let (nav_writer, nav_errors) = navigation::writer(nav_path);
         let nav_task = cx.spawn(async move |view, cx| {
             while let Ok(error) = nav_errors.recv().await {
@@ -314,18 +525,24 @@ impl DatabaseView {
             object_database_subscription: None,
             catalog_objects: Vec::new(),
             schemas: HashMap::new(),
+            note_auto_attempts: HashMap::new(),
+            note_columns: HashMap::new(),
             expanded_objects: std::collections::HashSet::new(),
             workbench_target: None,
+            ddl: Default::default(),
+            mcp_target: None,
             pending_object_action: None,
             focus: cx.focus_handle(),
             choosing_type: false,
             type_grid: true,
             typed_drafts: HashMap::new(),
             navigation,
+            navigation_error,
             nav_writer,
             selected_database: None,
             object_items: Vec::new(),
             object_cursor: None,
+            redis_pattern: "*".into(),
             object_details: Vec::new(),
             selected_object: None,
             detail_scroll: UniformListScrollHandle::new(),
@@ -337,6 +554,7 @@ impl DatabaseView {
             _nav_task: nav_task,
             tab: 0,
             connection_details: false,
+            driver_override: false,
             pending_tls: None,
             drivers: cx.new(crate::drivers::DriverManager::new),
             connect_after_save: false,
@@ -534,6 +752,8 @@ impl DatabaseView {
         let mut p = turbodbn_services::database::defaults(kind);
         p.name.clear();
         p.remember_password = kind != DatabaseKind::Sqlite;
+        p.tls = TlsMode::Disabled;
+        p.allow_old_auth = kind == DatabaseKind::MySql;
         if kind == DatabaseKind::Redis {
             p.database = "0".into();
         }
@@ -607,6 +827,9 @@ impl DatabaseView {
         }
     }
     fn disconnect(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if let Some(profile) = self.note_profile(id).cloned() {
+            self.note_auto_attempts.insert(id, profile);
+        }
         if self.sessions.contains_key(&id) {
             self.operation_log(
                 id,
@@ -618,6 +841,8 @@ impl DatabaseView {
         }
 
         *self.generation.entry(id).or_default() += 1;
+        self.note_columns
+            .retain(|(connection, _, _, _), _| *connection != id);
         self.tasks.remove(&id);
         self.sessions.remove(&id);
         if self
@@ -729,9 +954,25 @@ impl DatabaseView {
         trial: Option<(TlsMode, bool)>,
         cx: &mut Context<Self>,
     ) {
-        self.pending_tls = None;
-        self.validation_requested = !test;
-        let mut profile = match self.draft_for(test || discover, cx) {
+        self.start_profile(test, discover, trial, None, cx);
+    }
+    fn start_profile(
+        &mut self,
+        test: bool,
+        discover: bool,
+        trial: Option<(TlsMode, bool)>,
+        saved: Option<Profile>,
+        cx: &mut Context<Self>,
+    ) {
+        let background = saved.is_some();
+        if !background {
+            self.pending_tls = None;
+            self.validation_requested = !test;
+        }
+        let mut profile = match saved
+            .map(Ok)
+            .unwrap_or_else(|| self.draft_for(test || discover, cx))
+        {
             Ok(p) => p,
             Err(e) => {
                 feedback::error(e.clone(), cx);
@@ -762,7 +1003,7 @@ impl DatabaseView {
         if discover && profile.kind != DatabaseKind::PostgreSql {
             profile.database.clear();
         }
-        if mysql::uses_legacy(&profile)
+        if (mysql::uses_legacy(&profile) || profile.driver == Driver::Auto)
             && profile.legacy_library.is_empty()
             && let Some(path) = self.drivers.read(cx).path()
         {
@@ -787,14 +1028,36 @@ impl DatabaseView {
             return;
         }
         let id = profile.id;
-        if !test && !self.follow_connection(id, false, cx) {
+        if !test && !background && !self.follow_connection(id, false, cx) {
             return;
         }
         self.disconnect(id, cx);
         self.catalog_source.insert(id, catalog_source);
         self.info.remove(&id);
         let generation = self.generation[&id];
-        let password = match self.password_input(&snapshot, cx) {
+        let password = match if background {
+            Ok(
+                if let Some(value) = self
+                    .temporary_passwords
+                    .get(&id)
+                    .and_then(|s| s.value_for(&snapshot))
+                {
+                    connection_secret::Input::Value(value)
+                } else if snapshot.remember_password
+                    && self
+                        .history
+                        .get(&id)
+                        .and_then(|h| h.credential_id)
+                        .is_some()
+                {
+                    connection_secret::Input::Stored
+                } else {
+                    connection_secret::Input::Value(String::new())
+                },
+            )
+        } else {
+            self.password_input(&snapshot, cx)
+        } {
             Ok(p) => p,
             Err(error) => {
                 self.status = error.clone();
@@ -1118,6 +1381,8 @@ impl DatabaseView {
                                 history.last_used_at = previous.last_used_at.clone();
                             }
                             this.history.insert(id, history);
+                            this.note_columns
+                                .retain(|(connection, _, _, _), _| *connection != id);
                             if let Some(saved) = this.profiles.iter_mut().find(|p| p.id == id) {
                                 *saved = profile.clone();
                             } else {
@@ -1618,7 +1883,11 @@ impl DatabaseView {
             .gap_1()
             .w_full()
             .child(label)
-            .child(Input::new(&self.fields[key]).disabled(self.saving))
+            .child(
+                Input::new(&self.fields[key])
+                    .cleanable(true)
+                    .disabled(self.saving),
+            )
             .into_any_element()
     }
     fn sync_database_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1852,6 +2121,7 @@ impl DatabaseView {
 }
 impl EventEmitter<OpenDatabase> for DatabaseView {}
 impl EventEmitter<OpenObjects> for DatabaseView {}
+impl EventEmitter<NoteColumnsReady> for DatabaseView {}
 impl EventEmitter<PanelEvent> for DatabaseView {}
 impl Focusable for DatabaseView {
     fn focus_handle(&self, _: &App) -> FocusHandle {
@@ -1963,15 +2233,18 @@ impl Render for DatabaseView {
                 .on_click(cx.listener(|this,v:&bool,_,cx|{this.editing.redis_cluster = *v;cx.notify();}))))
             .when(self.editing.kind!=DatabaseKind::Sqlite,|el|el
             .child(div().h_flex().gap_2().items_end()
-                .child(self.combo("database","数据库 *",self.raw_draft(cx).ok().map(|p|self.catalog(&p)).unwrap_or_default(),cx))
-                .child(Button::new("detect-databases").icon(IconName::Search).label("检测")
+                .child(div().flex_1().min_w_0().child(self.combo("database","数据库 *",self.raw_draft(cx).ok().map(|p|self.catalog(&p)).unwrap_or_default(),cx)))
+                .child(Button::new("detect-databases").flex_shrink_0().icon(IconName::Search).label("检测")
                     .tooltip("使用当前连接信息获取账号可见的数据库，不保存草稿")
                     .disabled(self.saving||running).on_click(cx.listener(|this,_,_,cx|this.start_request(true,true,cx)))))
             )
             )
             .when(self.tab==2,|el|el
             .when(self.editing.kind==DatabaseKind::MySql,|el|el
-            .child(
+            .child(Button::new("driver-override").ghost().icon(IconName::Settings2).label(crate::locale::t(cx,"dbwork.driver_override"))
+                  .on_click(cx.listener(|this,_,_,cx|{this.driver_override = !this.driver_override;cx.notify();})))
+              .when(self.driver_override, |el| el
+.child(
                 div()
                     .h_flex()
                     .gap_2()
@@ -2008,12 +2281,12 @@ impl Render for DatabaseView {
                         cx,
                     ))
                     ,
-            )
-            .child(self.combo("charset","字符集（可自定义）",["utf8mb4","utf8","gb2312","gbk","latin1","server-default"].into_iter().map(String::from).collect(),cx))
-            .when(mysql::uses_legacy(&self.editing),|el|el
-                .child(self.field("legacy","自定义 DLL 路径（留空使用已安装驱动）"))
+            ))
+              .child(self.combo("charset","字符集（可自定义）",["utf8mb4","utf8","gb2312","gbk","latin1","server-default"].into_iter().map(String::from).collect(),cx))
+            .when(mysql::uses_legacy(&self.editing) || self.editing.driver == Driver::Auto,|el|el
+                .when(self.driver_override, |el| el.child(self.field("legacy","自定义 DLL 路径（留空使用已安装驱动）"))
                 .child(Button::new("browse-legacy-driver").label("浏览驱动库").disabled(self.saving)
-                    .on_click(cx.listener(|this,_,window,cx|this.browse_legacy(window,cx))))
+                    .on_click(cx.listener(|this,_,window,cx|this.browse_legacy(window,cx)))))
                 .child(Switch::new("allow-old-auth").label("允许 pre-4.1 旧密码认证（仅兼容连接）")
                     .checked(self.editing.allow_old_auth).disabled(self.saving)
                     .on_click(cx.listener(|this,checked:&bool,window,cx|{
@@ -2021,10 +2294,10 @@ impl Render for DatabaseView {
                         let view=cx.entity().downgrade();let id=this.editing.id;
                         feedback::confirm(crate::locale::t(cx,"feedback.auth.confirm"),crate::locale::t(cx,"feedback.auth.warning"),window,cx,move|_,cx|{let _=view.update(cx,|this,cx|{if this.editing.id==id&&!this.saving{this.editing.allow_old_auth=true;cx.notify();}});});
                     })))
-                .child("兼容驱动运行于独立进程。当前需显式禁用 TLS；4.0 使用服务器默认字符集。请选择可信驱动库。"))
+                .when(self.driver_override, |el| el.child("兼容驱动运行于独立进程。当前需显式禁用 TLS；4.0 使用服务器默认字符集。请选择可信驱动库。")))
             )
             .child(self.field("timeout", "连接/测试总超时（1–60 秒）"))
-            .when(self.editing.kind==DatabaseKind::MySql,|el|el.child(self.drivers.clone()))
+            .when(self.editing.kind==DatabaseKind::MySql && self.driver_override,|el|el.child(self.drivers.clone()))
             )
             .when(self.tab==1,|el|el
             .child(self.choices(
@@ -2217,5 +2490,18 @@ mod connection_form_tests {
             }
             assert_eq!(required_connection_field(&profile, false), None);
         }
+    }
+}
+
+#[cfg(test)]
+mod new_connection_defaults_tests {
+    #[test]
+    fn new_drafts_have_requested_defaults_without_changing_legacy_decode() {
+        let new = super::DatabaseView::empty_profile(turbodbn_services::DatabaseKind::MySql);
+        assert_eq!(new.tls, turbodbn_services::mysql::TlsMode::Disabled);
+        assert!(new.allow_old_auth);
+        let old: turbodbn_services::mysql::Profile = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.tls, turbodbn_services::mysql::TlsMode::VerifyIdentity);
+        assert!(!old.allow_old_auth);
     }
 }

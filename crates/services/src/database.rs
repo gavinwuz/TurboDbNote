@@ -13,7 +13,9 @@ use std::{
 pub mod connection_import;
 pub mod copy;
 pub mod notebook_query;
+pub mod redis_value;
 mod remote;
+pub mod sql_assist;
 pub mod transfer;
 pub mod workbench;
 use remote::{HttpDatabase, RedisDatabase};

@@ -120,6 +120,18 @@ pub fn install(
     cancel: &AtomicBool,
     mut progress: impl FnMut(String),
 ) -> Result<PathBuf, String> {
+    cancelled(cancel)?;
+    // Reuse a complete verified client when no explicit replacement archive was selected.
+    let target = root.join(ID);
+    if archive.is_none()
+        && validate_pinned(&installed(root)).is_ok()
+        && ["COPYING", "README.mysql", "provenance.json"]
+            .iter()
+            .all(|name| target.join(name).is_file())
+    {
+        progress("复用已校验的兼容客户端".into());
+        return Ok(installed(root));
+    }
     fs::create_dir_all(root).map_err(err)?;
     let stage = tempfile::Builder::new()
         .prefix(".mysql-install-")
@@ -161,7 +173,11 @@ pub fn install(
     cancelled(cancel)?;
     let target = root.join(ID);
     if target.exists() {
-        if validate_pinned(&installed(root)).is_ok() {
+        if validate_pinned(&installed(root)).is_ok()
+            && ["COPYING", "README.mysql", "provenance.json"]
+                .iter()
+                .all(|name| target.join(name).is_file())
+        {
             return Ok(installed(root));
         }
         // Preserve a damaged installation until the replacement can be committed.
@@ -186,22 +202,29 @@ pub fn install(
 /// Source accompanies binary redistribution in release packages.
 pub fn prepare_source(root: &Path, local: Option<&Path>) -> Result<(), String> {
     let target = root.join(ID).join("mysql-5.1.73-source.tar.gz");
+    if local.is_none() && hash_file(&target).is_ok_and(|hash| hash == SOURCE_SHA) {
+        return Ok(());
+    }
+    let parent = target.parent().ok_or("源码目录无效")?;
+    let stage = tempfile::NamedTempFile::new_in(parent).map_err(err)?;
     if let Some(source) = local {
         if hash_file(source)? != SOURCE_SHA {
             return Err("MySQL 源码包校验失败".into());
         }
-        fs::copy(source, target).map_err(err)?;
+        fs::copy(source, stage.path()).map_err(err)?;
     } else {
         download(
             SOURCE_URL,
             SOURCE_SHA,
-            &target,
+            stage.path(),
             &AtomicBool::new(false),
             &mut |_| {},
         )?;
     }
+    stage.persist(target).map_err(err)?;
     Ok(())
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;

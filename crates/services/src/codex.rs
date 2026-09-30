@@ -13,6 +13,7 @@ use tokio::{
     process::{Child, Command},
 };
 
+const SQL_INSTRUCTIONS: &str = "You are TurboDBNote's SQL analysis assistant. Explain or propose SQL and Markdown. Only use TurboDBNote MCP tools for database access; the application validates scope and asks the user before execution and sharing results. Never access credential files, use a shell to query databases, or request credentials.";
 const FRAME_LIMIT: usize = 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -118,6 +119,13 @@ impl Connection {
         Self { commands }
     }
     pub fn start(executable: PathBuf, cwd: PathBuf) -> (Self, Receiver<Event>) {
+        Self::start_with_mcp(executable, cwd, None)
+    }
+    pub fn start_with_mcp(
+        executable: PathBuf,
+        cwd: PathBuf,
+        mcp: Option<crate::sql_mcp::Config>,
+    ) -> (Self, Receiver<Event>) {
         let (commands, receiver) = async_channel::bounded(16);
         let (events, output) = async_channel::bounded(128);
         std::thread::spawn(move || {
@@ -126,7 +134,7 @@ impl Connection {
                 .build();
             match runtime {
                 Ok(runtime) => runtime.block_on(async {
-                    if let Err(error) = run(executable, cwd, receiver, events.clone()).await {
+                    if let Err(error) = run(executable, cwd, receiver, events.clone(), mcp).await {
                         let _ = events.send(Event::Error(error)).await;
                     }
                     let _ = events.send(Event::Disconnected).await;
@@ -252,6 +260,7 @@ async fn run(
     cwd: PathBuf,
     commands: Receiver<ClientCommand>,
     events: Sender<Event>,
+    mcp: Option<crate::sql_mcp::Config>,
 ) -> Result<(), String> {
     if !executable.is_absolute() || !executable.is_file() {
         return Err("请选择 Codex 可执行文件的绝对路径".into());
@@ -267,6 +276,9 @@ async fn run(
         return Err("工作目录不存在，请输入绝对路径".into());
     }
     let mut command = Command::new(&executable);
+    if let Some(mcp) = mcp {
+        mcp.configure_codex(&mut command);
+    }
     command
         .arg("app-server")
         .arg("--listen")
@@ -346,11 +358,11 @@ async fn drive(
                     if s.thread.is_none() {
                         if let Some(id)=restore_thread.take(){
                             s.request("thread/resume",json!({"threadId":id,"cwd":s.cwd,"model":prompt.model,
-                                "approvalPolicy":"never","sandbox":"read-only"}),RpcKind::Thread(prompt)).await?;
+                                "approvalPolicy":"never","sandbox":"read-only","baseInstructions":SQL_INSTRUCTIONS}),RpcKind::Thread(prompt)).await?;
                         } else {
                         s.request("thread/start", json!({"cwd":s.cwd,"model":prompt.model,
                             "approvalPolicy":"never","sandbox":"read-only",
-                            "baseInstructions":"You are TurboDBNote's SQL analysis assistant. Explain or propose SQL and Markdown. Never modify files or execute database statements. Do not request credentials."}), RpcKind::Thread(prompt)).await?;
+                            "baseInstructions":SQL_INSTRUCTIONS}), RpcKind::Thread(prompt)).await?;
                         }
                     } else { s.start_turn(prompt).await?; }
                     events.send(Event::Log("开始只读分析".into())).await.map_err(|e| e.to_string())?;

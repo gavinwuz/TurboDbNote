@@ -20,6 +20,7 @@ use turbodbn_core::{Cell, CellContent, Note};
 use turbodbn_services::note_store::{self, Entry, Index, Loaded};
 
 pub enum LibraryEvent {
+    Removed { key: String },
     Open { key: String, view: Entity<NoteView> },
     Settled { key: String, success: bool },
 }
@@ -32,6 +33,7 @@ pub struct NoteLibrary {
     subscriptions: HashMap<String, Subscription>,
     search: Entity<InputState>,
     collapsed: HashSet<String>,
+    deleting: HashSet<PathBuf>,
     loading: bool,
     opening: bool,
     pending_file_action: Option<(PathBuf, crate::notebook::FileAction)>,
@@ -58,8 +60,8 @@ impl NoteLibrary {
     pub fn default_directory() -> PathBuf {
         Preferences::path()
             .ok()
-            .and_then(|p| p.parent().map(|p| p.join("notes/drafts")))
-            .unwrap_or_else(|| std::env::temp_dir().join("TurboDBNote/notes/drafts"))
+            .and_then(|p| p.parent().map(|p| p.join("saved")))
+            .unwrap_or_else(|| std::env::temp_dir().join("TurboDBNote/saved"))
     }
     pub fn new(
         database: Entity<DatabaseView>,
@@ -84,7 +86,14 @@ impl NoteLibrary {
                 let destination = destination.clone();
                 let result = cx
                     .background_executor()
-                    .spawn(async move { note_store::save_index(&destination, &index) })
+                    .spawn(async move {
+                        crate::app_store::save(
+                            &destination,
+                            "note-library",
+                            &index,
+                            note_store::MAX_NOTE_BYTES as usize,
+                        )
+                    })
                     .await;
                 let _ = view.update(cx, |this, cx| {
                     match result {
@@ -120,6 +129,7 @@ impl NoteLibrary {
             subscriptions: HashMap::new(),
             search: search.clone(),
             collapsed: HashSet::new(),
+            deleting: HashSet::new(),
             loading: false,
             opening: false,
             pending_file_action: None,
@@ -166,10 +176,22 @@ impl NoteLibrary {
         let snapshot = self.index.clone();
         let work = cx.background_executor().spawn(async move {
             let mut index = if initial {
-                note_store::load_index(&path)?
+                crate::app_store::load(
+                    &path,
+                    "note-library",
+                    note_store::MAX_NOTE_BYTES as usize,
+                    |index: &Index| index.version == 1 && index.entries.len() <= 2000,
+                )?
             } else {
                 snapshot
             };
+            // Keep old draft roots discoverable; never move or delete existing documents.
+            if let Some(base) = path.parent() {
+                let legacy = base.join("notes/drafts");
+                if legacy.is_dir() && !index.roots.contains(&legacy) {
+                    index.roots.push(legacy);
+                }
+            }
             note_store::discover(&mut index, &directory)?;
             let opened = if initial {
                 index
@@ -334,8 +356,11 @@ impl NoteLibrary {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.deleting.contains(&path) {
+            return;
+        }
         if matches!(action, crate::notebook::FileAction::Reveal) {
-            cx.reveal_path(&path);
+            crate::feedback::reveal_parent(path, cx);
             return;
         }
         if let Some(view) = self
@@ -349,6 +374,114 @@ impl NoteLibrary {
             self.pending_file_action = Some((path.clone(), action));
             self.open_path(path, window, cx);
         }
+    }
+    fn delete_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.deleting.contains(&path) || self.opening || self.loading {
+            return;
+        }
+        let Some(entry) = self.index.entries.iter().find(|e| e.path == path) else {
+            return;
+        };
+        let name = entry_title(entry, cx);
+        let owner = cx.entity().downgrade();
+        feedback::confirm(
+            t(cx, "notes.delete_file"),
+            crate::locale::tr(cx, "notes.delete_confirm", &[("name", &name)]),
+            window,
+            cx,
+            move |window, cx| {
+                let path = path.clone();
+                let _ = owner.update(cx, |this, cx| this.archive_note(path, window, cx));
+            },
+        );
+    }
+    fn archive_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.deleting.contains(&path) || self.opening || self.loading {
+            return;
+        }
+        let opened = self
+            .documents
+            .iter()
+            .find(|(_, v)| v.read(cx).path == path)
+            .map(|(key, v)| (key.clone(), v.clone()));
+        let expected = if let Some((_, view)) = &opened {
+            let Some(hash) = view.update(cx, |v, cx| v.begin_delete(cx)) else {
+                feedback::error(t(cx, "notes.delete_busy"), cx);
+                return;
+            };
+            Some(hash)
+        } else {
+            None
+        };
+        self.deleting.insert(path.clone());
+        let task_id = uuid::Uuid::new_v4();
+        let started = std::time::Instant::now();
+        let output = self.database.read(cx).output.clone();
+        if let Some(output) = &output {
+            output.update(cx, |log, cx| {
+                log.operation(
+                    crate::operation_log::Record::new(
+                        task_id,
+                        crate::operation_log::Kind::Note,
+                        crate::operation_log::Phase::Started,
+                    ),
+                    cx,
+                )
+            });
+        }
+        let source = path.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { note_store::archive(&source, expected) });
+        cx.spawn_in(window, async move |owner, cx| {
+            let result = work.await;
+            let _ = owner.update(cx, |this, cx| {
+                this.deleting.remove(&path);
+                let success = result.is_ok();
+                if let Some(output) = &output {
+                    let mut record = crate::operation_log::Record::new(
+                        task_id,
+                        crate::operation_log::Kind::Note,
+                        if success {
+                            crate::operation_log::Phase::Succeeded
+                        } else {
+                            crate::operation_log::Phase::Failed
+                        },
+                    );
+                    record.elapsed_ms = started.elapsed().as_millis() as u64;
+                    if let Err(error) = &result {
+                        record.failure = crate::operation_log::failure_class(error);
+                    }
+                    output.update(cx, |log, cx| log.operation(record, cx));
+                }
+                match result {
+                    Ok(_) => {
+                        this.index.entries.retain(|e| e.path != path);
+                        this.index.open.retain(|p| p != &path);
+                        if let Some((key, _)) = &opened {
+                            this.documents.remove(key);
+                            this.subscriptions.remove(key);
+                            cx.emit(LibraryEvent::Removed { key: key.clone() });
+                        }
+                        this.persist();
+                        feedback::success(t(cx, "notes.deleted"), cx);
+                    }
+                    Err(error) => {
+                        if let Some((_, view)) = &opened {
+                            view.update(cx, |v, cx| v.cancel_delete(cx));
+                        }
+                        feedback::error(error, cx);
+                    }
+                }
+                cx.emit(LibraryEvent::Settled {
+                    key: String::new(),
+                    success,
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
     fn update_entry(&mut self, entry: Entry) {
         if let Some(old) = self.index.entries.iter_mut().find(|e| e.path == entry.path) {
@@ -401,7 +534,7 @@ impl NoteLibrary {
         .detach();
     }
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        if self.opening || !self.ready || self.loading {
+        if self.opening || !self.ready || self.loading || self.deleting.contains(&path) {
             return;
         }
         if let Some((key, view)) = self
@@ -478,6 +611,7 @@ impl NoteLibrary {
     }
     pub fn pending(&self, cx: &App) -> bool {
         self.opening
+            || !self.deleting.is_empty()
             || self.index_revision != self.index_saved
             || self.documents.values().any(|n| n.read(cx).pending())
     }
@@ -736,7 +870,17 @@ impl Render for NoteLibrary {
                                         },
                                     ));
                             }
-                            menu
+                            let library = library.clone();
+                            let path = file_path.clone();
+                            menu.separator().item(
+                                PopupMenuItem::new(t(cx, "notes.delete_file"))
+                                    .icon(IconName::Delete)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = library.update(cx, |this, cx| {
+                                            this.delete_note(path.clone(), window, cx)
+                                        });
+                                    }),
+                            )
                         }),
                     );
                 }

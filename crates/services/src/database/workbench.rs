@@ -54,10 +54,24 @@ pub struct Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Action {
+    RedisWrite(super::redis_value::Mutation),
+    RedisScan {
+        cursor: Option<String>,
+        pattern: String,
+    },
+    RedisValue {
+        key: Vec<u8>,
+        cursor: String,
+        offset: usize,
+        size: usize,
+    },
     NoteGrid {
         plan: super::notebook_query::Plan,
         confirmed: bool,
         action: super::notebook_query::GridAction,
+    },
+    NoteExplain {
+        sql: String,
     },
     NotePrepare {
         sql: String,
@@ -83,6 +97,8 @@ pub enum Action {
     },
     Catalog,
     Describe(Object),
+    Ddl(Object),
+    NoteColumns(Object),
     Page {
         object: Object,
         offset: usize,
@@ -96,6 +112,7 @@ pub enum Action {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    RedisValue(super::redis_value::ValuePage),
     NotePrepared(super::notebook_query::Plan),
     NoteResult(super::notebook_query::ResultPage),
     GridPage {
@@ -197,8 +214,32 @@ async fn catalog(
                     });
                 }
             }
-            Err(e) if !category.is_empty() => notices.push(format!("{category}: {e}")),
+            Err(_) if !category.is_empty() => notices.push(format!(
+                "{category}: 元数据不可读取，可能缺少权限；可取消该类型后继续导出"
+            )),
             Err(e) => return Err(e),
+        }
+    }
+    if kind == DatabaseKind::MySql && !version.starts_with("4.") {
+        for (category, sql_kind) in [
+            ("view", "VIEW"),
+            ("trigger", "TRIGGER"),
+            ("procedure", "PROCEDURE"),
+            ("function", "FUNCTION"),
+            ("event", "EVENT"),
+        ] {
+            if let Some(object) = objects.iter().find(|o| o.kind == category)
+                && c.query(&format!(
+                    "SHOW CREATE {sql_kind} {}",
+                    qualified(kind, db, object)
+                ))
+                .await
+                .is_err()
+            {
+                notices.push(format!(
+                    "{category}: 部分对象定义不可读取，可能缺少权限；可取消该类型后继续导出"
+                ));
+            }
         }
     }
     Ok(Reply::Catalog {
@@ -370,6 +411,9 @@ pub async fn run(
     r: &Request,
 ) -> Result<Reply, String> {
     match &r.action {
+        Action::RedisScan { .. } | Action::RedisValue { .. } | Action::RedisWrite(_) => {
+            Err("此操作仅适用于 Redis".into())
+        }
         Action::NoteGrid {
             plan,
             confirmed,
@@ -386,6 +430,25 @@ pub async fn run(
             )
             .await
         }
+        Action::NoteColumns(object) => {
+            let object = if kind == DatabaseKind::PostgreSql && object.schema.is_empty() {
+                super::notebook_query::resolved_object(
+                    c,
+                    kind,
+                    &r.database,
+                    std::slice::from_ref(&object.name),
+                )
+                .await?
+            } else {
+                object.clone()
+            };
+            schema(c, kind, &r.database, &object, false)
+                .await
+                .map(Reply::Schema)
+        }
+        Action::NoteExplain { sql } => super::notebook_query::explain(c, kind, sql)
+            .await
+            .map(Reply::NoteResult),
         Action::NotePrepare { sql } => {
             super::notebook_query::prepare(c, kind, &r.database, version, sql)
                 .await
@@ -419,6 +482,30 @@ pub async fn run(
             changes,
         } => grid::commit(c, kind, &r.database, object, ddl, changes).await,
         Action::Catalog => catalog(c, kind, &r.database, version).await,
+        Action::Ddl(o) => {
+            if kind == DatabaseKind::MySql {
+                let name = qualified(kind, &r.database, o);
+                let rows = c
+                    .query(&format!(
+                        "SHOW CREATE {} {name}",
+                        if o.kind == "view" { "VIEW" } else { "TABLE" }
+                    ))
+                    .await?;
+                Ok(Reply::Schema(Schema {
+                    ddl: rows
+                        .values
+                        .first()
+                        .map(|row| value(row, 1))
+                        .unwrap_or_default(),
+                    ..Default::default()
+                }))
+            } else {
+                Ok(Reply::Schema(Schema {
+                    ddl: schema(c, kind, &r.database, o, true).await?.ddl,
+                    ..Default::default()
+                }))
+            }
+        }
         Action::Describe(o) => Ok(Reply::Schema(schema(c, kind, &r.database, o, true).await?)),
         Action::Page {
             object,

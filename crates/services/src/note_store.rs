@@ -20,13 +20,23 @@ pub struct Entry {
     pub draft: bool,
     pub used: u64,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Index {
     pub version: u32,
     pub entries: Vec<Entry>,
     pub open: Vec<PathBuf>,
     pub roots: Vec<PathBuf>,
+}
+impl Default for Index {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            entries: vec![],
+            open: vec![],
+            roots: vec![],
+        }
+    }
 }
 pub struct Loaded {
     pub note: Note,
@@ -113,6 +123,30 @@ pub fn save(path: &Path, note: &Note, expected: Option<[u8; 32]>) -> Result<[u8;
     }
     Ok(Sha256::digest(text.as_bytes()).into())
 }
+/// Recoverable deletion on the same filesystem. Keep the original basename for manual recovery.
+pub fn archive(path: &Path, expected: Option<[u8; 32]>) -> Result<PathBuf, String> {
+    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    if !path.is_absolute() || !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("只能删除普通 .note 文件".into());
+    }
+    let loaded = load(path)?;
+    if expected.is_some_and(|hash| hash != loaded.hash) {
+        return Err("笔记已被其他程序修改，请重新打开后再删除".into());
+    }
+    let folder = path
+        .parent()
+        .ok_or("笔记目录无效")?
+        .join(".turbodbnote-trash");
+    fs::create_dir_all(&folder).map_err(io_error)?;
+    let archived = folder.join(format!(
+        "{}-{}",
+        uuid::Uuid::new_v4(),
+        path.file_name().ok_or("笔记文件名无效")?.to_string_lossy()
+    ));
+    fs::rename(path, &archived).map_err(io_error)?;
+    Ok(archived)
+}
+
 pub fn load_index(path: &Path) -> Result<Index, String> {
     if !path.exists() {
         return Ok(Index {
@@ -194,6 +228,26 @@ pub fn discover(index: &mut Index, directory: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn archived_notes_are_recoverable_and_changed_files_are_preserved() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("note.note");
+        let note = Note::new("Keep me");
+        let hash = save(&path, &note, None).unwrap();
+        assert!(archive(&path, Some([0; 32])).is_err());
+        assert!(path.exists());
+        let archived = archive(&path, Some(hash)).unwrap();
+        assert!(!path.exists());
+        assert_eq!(load(&archived).unwrap().note, note);
+        let mut index = Index {
+            version: 1,
+            ..Default::default()
+        };
+        discover(&mut index, root.path()).unwrap();
+        assert!(index.entries.is_empty());
+        fs::rename(archived, &path).unwrap();
+        assert_eq!(load(&path).unwrap().hash, hash);
+    }
     #[test]
     fn changing_directory_preserves_old_drafts_and_open_paths() {
         let root = tempfile::tempdir().unwrap();

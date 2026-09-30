@@ -14,6 +14,7 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'windows-sdk.ps1')
 . (Join-Path $PSScriptRoot 'prepare-package-build.ps1')
 . (Join-Path $PSScriptRoot 'stage-crashsight.ps1')
+. (Join-Path $PSScriptRoot 'stage-mysql-driver.ps1')
 $targetRoot = Join-Path $root 'target'
 New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
 $packageLock = [IO.File]::Open((Join-Path $targetRoot 'package-build.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -76,10 +77,7 @@ try {
     if (-not (Test-Path -LiteralPath $legacyHelper)) {throw 'Legacy helper was not built'}
     Copy-Item -LiteralPath $legacyHelper -Destination $stage
     # Curated x64 client supports legacy 4.x servers; win32 4.x DLLs cannot load in this app.
-    $driverArguments = @('run', '--locked', '-p', 'turbodbn-services', '--example', 'prepare_mysql_driver', '--', (Join-Path $stage 'drivers'))
-    if ($LegacyDriverArchive) { $driverArguments += (Resolve-Path -LiteralPath $LegacyDriverArchive).Path }
-    if ($LegacySourceArchive) { $driverArguments += (Resolve-Path -LiteralPath $LegacySourceArchive).Path }
-    Invoke-Checked cargo $driverArguments
+    Stage-MySqlDriver -Destination (Join-Path $stage 'drivers') -LegacyDriverArchive $LegacyDriverArchive -LegacySourceArchive $LegacySourceArchive
     # Include the exact application source used for this build alongside the third-party source.
     $sourceStage = Join-Path $stage 'sources/TurboDBNote'
     $sourceFiles = & git ls-files --cached --others --exclude-standard
@@ -107,17 +105,17 @@ try {
     @"
 TurboDBNote v$version (Preview) / Windows x64
 Run turbodbnote.exe from this extracted folder.
-Edits are in-memory only and are LOST when the app exits.
-Note-file saving and Notebook SQL cell execution are not available yet.
+Notes persist as individual .note files. Application data is stored in connections.db.
+MySQL compatibility components are included in the adjacent drivers directory.
 AI Chat requires a separately installed Codex or Claude Code CLI and its configured login.
 This build is unsigned. Read RELEASE-NOTES.md before use.
-简体中文：编辑内容仅保留在内存中，退出后丢失。使用前请阅读 RELEASE-NOTES.zh-CN.md。
+简体中文：笔记独立持久化为 .note 文件，MySQL 兼容组件随包集成。使用前请阅读 RELEASE-NOTES.zh-CN.md。
 "@ | Set-Content -LiteralPath (Join-Path $stage 'README.txt') -Encoding utf8
     [ordered]@{ version=$version; commit=$commit; dirty=[bool]$changes; rust=$rust;
         target='x86_64-pc-windows-msvc'; gpui_adapter='0.2.2-fxc-file-v1'; fxc_version=(Get-Item $compiler).VersionInfo.FileVersion;
         built_at=[DateTime]::UtcNow.ToString('o') } |
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'BUILD-INFO.json') -Encoding utf8
-    'Portable settings are stored in data/settings.db beside the executable.' |
+    'Portable settings are stored in data/connections.db beside the executable.' |
         Set-Content -LiteralPath (Join-Path $stage 'portable.flag') -Encoding ascii
     Compress-Archive -LiteralPath $stage -DestinationPath $zip -CompressionLevel Optimal
     Invoke-Checked $IsccPath @("/DAppVersion=$version", "/DSourceDir=$stage", "/DOutputDir=$output",

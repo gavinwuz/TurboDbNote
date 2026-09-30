@@ -21,7 +21,7 @@ const APPLICATION_ID: i64 = 0x5444424e;
 fn db_error(_: impl std::fmt::Display) -> String {
     "连接存储读写失败，请检查权限、磁盘空间或数据库是否被其他程序锁定".into()
 }
-fn open(path: &Path) -> Result<Connection, String> {
+pub(crate) fn open(path: &Path) -> Result<Connection, String> {
     let parent = path.parent().ok_or("连接存储目录无效")?;
     std::fs::create_dir_all(parent).map_err(db_error)?;
     let c = Connection::open(path).map_err(db_error)?;

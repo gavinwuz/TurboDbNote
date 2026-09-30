@@ -26,6 +26,7 @@ pub enum SettingsRequest {
 impl EventEmitter<SettingsRequest> for ChatView {}
 pub struct SettingsView {
     drivers: Entity<crate::drivers::DriverManager>,
+    _drivers_observe: Subscription,
     category: Category,
     database_tab: usize,
     configuration: Entity<Configuration>,
@@ -50,6 +51,7 @@ impl SettingsView {
         let inputs = chat.read(cx).settings_inputs();
         let configuration = cx.new(|cx| Configuration::new(window, cx));
         Self {
+            _drivers_observe: cx.observe(&drivers, |_, _, cx| cx.notify()),
             drivers,
             _configuration_observe: cx.observe(&configuration, |this, _, cx| {
                 this.schedule_save(cx);
@@ -94,6 +96,11 @@ impl SettingsView {
             }),
             chat,
         }
+    }
+    pub fn select_sql(&mut self, cx: &mut Context<Self>) {
+        self.category = Category::Database;
+        self.database_tab = 1;
+        cx.notify();
     }
     pub fn select(&mut self, category: Option<Category>, cx: &mut Context<Self>) {
         if let Some(category) = category {
@@ -237,7 +244,18 @@ impl Render for SettingsView {
                             .border_color(cx.theme().border)
                             .child(kind.label())
                             .child(div().flex_1())
-                            .child(t(cx, "settings2.builtin")),
+                            .child(if kind == turbodbn_services::DatabaseKind::MySql {
+                                crate::locale::tr(
+                                    cx,
+                                    "drivers.mysql_status",
+                                    &[(
+                                        "compat",
+                                        t(cx, self.drivers.read(cx).status_key()).as_ref(),
+                                    )],
+                                )
+                            } else {
+                                t(cx, "settings2.builtin")
+                            }),
                     );
                 }
                 list.child(

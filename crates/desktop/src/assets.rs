@@ -18,6 +18,25 @@ impl AssetSource for Assets {
             "icons/note-expand.svg" => Some(include_bytes!("../assets/icons/note-expand.svg")),
 
             "icons/note-delete.svg" => Some(include_bytes!("../assets/icons/note-delete.svg")),
+            "icons/note-read-mode.svg" => {
+                Some(include_bytes!("../assets/icons/note-read-mode.svg"))
+            }
+            "icons/note-ddl.svg" => Some(include_bytes!("../assets/icons/note-ddl.svg")),
+            "icons/ai-permissions.svg" => {
+                Some(include_bytes!("../assets/icons/ai-permissions.svg"))
+            }
+            "icons/note-ai.svg" => Some(include_bytes!("../assets/icons/note-ai.svg")),
+            "icons/note-edit-mode.svg" => {
+                Some(include_bytes!("../assets/icons/note-edit-mode.svg"))
+            }
+            "icons/result-grid.svg" => Some(include_bytes!("../assets/icons/result-grid.svg")),
+            "icons/result-json.svg" => Some(include_bytes!("../assets/icons/result-json.svg")),
+            "icons/note-plan.svg" => Some(include_bytes!("../assets/icons/note-plan.svg")),
+            "icons/note-copy-insert.svg" => {
+                Some(include_bytes!("../assets/icons/note-copy-insert.svg"))
+            }
+            "icons/note-columns.svg" => Some(include_bytes!("../assets/icons/note-columns.svg")),
+            "icons/note-format.svg" => Some(include_bytes!("../assets/icons/note-format.svg")),
             "icons/note-run.svg" => Some(include_bytes!("../assets/icons/note-run.svg")),
             "icons/note-insert-before.svg" => {
                 Some(include_bytes!("../assets/icons/note-insert-before.svg"))
@@ -71,6 +90,17 @@ impl AssetSource for Assets {
                 "icons/note-expand.svg",
                 "icons/note-delete.svg",
                 "icons/note-run.svg",
+                "icons/note-read-mode.svg",
+                "icons/ai-permissions.svg",
+                "icons/note-ai.svg",
+                "icons/note-ddl.svg",
+                "icons/note-edit-mode.svg",
+                "icons/result-grid.svg",
+                "icons/result-json.svg",
+                "icons/note-plan.svg",
+                "icons/note-copy-insert.svg",
+                "icons/note-columns.svg",
+                "icons/note-format.svg",
                 "icons/note-insert-before.svg",
                 "icons/note-insert-after.svg",
                 "icons/project-add.svg",
@@ -108,44 +138,31 @@ pub fn refresh_icon() -> gpui_component::Icon {
 }
 
 /// Neutral document outline and independently tinted type badge (SVG masks are monochrome).
-pub fn note_icon(kind: usize, cx: &gpui::App) -> gpui::AnyElement {
-    use gpui::rgb;
+pub fn note_color(kind: usize, cx: &gpui::App) -> gpui::Hsla {
     use gpui_component::ActiveTheme;
-    let (path, color): (&str, gpui::Hsla) = match kind {
-        0 => (
-            "icons/note-sql.svg",
-            if cx.theme().is_dark() {
-                rgb(0x69b8ff).into()
-            } else {
-                rgb(0x1763a6).into()
-            },
-        ),
-        1 => (
-            "icons/note-md.svg",
-            if cx.theme().is_dark() {
-                rgb(0x6bcea0).into()
-            } else {
-                rgb(0x18784b).into()
-            },
-        ),
-        _ => (
-            "icons/note-file.svg",
-            if cx.theme().is_dark() {
-                rgb(0xb79afa).into()
-            } else {
-                rgb(0x7543b5).into()
-            },
-        ),
+    let (dark, light) = match kind {
+        0 => (0x69b8ff, 0x1763a6),
+        1 => (0x6bcea0, 0x18784b),
+        3 => (0xf87171, 0xb91c1c),
+        _ => (0xb79afa, 0x7543b5),
     };
-    layered_icon("icons/note-frame.svg", path, color, cx)
+    gpui::rgb(if cx.theme().is_dark() { dark } else { light }).into()
+}
+
+pub fn note_icon(kind: usize, cx: &gpui::App) -> gpui::AnyElement {
+    let path = match kind {
+        0 => "icons/note-sql.svg",
+        1 => "icons/note-md.svg",
+        _ => "icons/note-file.svg",
+    };
+    layered_icon("icons/note-frame.svg", path, note_color(kind, cx), cx)
 }
 
 pub fn task_icon(cx: &gpui::App) -> gpui::AnyElement {
-    use gpui_component::ActiveTheme;
     layered_icon(
         "icons/task-lines.svg",
         "icons/task-boxes.svg",
-        cx.theme().primary,
+        note_color(2, cx),
         cx,
     )
 }
@@ -160,7 +177,7 @@ fn layered_icon(
     use gpui_component::ActiveTheme;
     div()
         .relative()
-        .size(px(22.))
+        .size(px(16.))
         .flex_shrink_0()
         .child(
             svg()
@@ -178,4 +195,14 @@ fn layered_icon(
                 .text_color(color),
         )
         .into_any_element()
+}
+
+pub fn note_tool(id: impl Into<gpui::ElementId>) -> gpui_component::button::Button {
+    use gpui::Styled;
+    use gpui_component::{Sizable, button::ButtonVariants};
+    gpui_component::button::Button::new(id)
+        .with_size(gpui_component::Size::Medium)
+        .w(gpui::px(24.))
+        .h(gpui::px(24.))
+        .ghost()
 }

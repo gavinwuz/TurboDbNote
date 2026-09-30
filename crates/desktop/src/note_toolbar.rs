@@ -122,10 +122,12 @@ impl NoteView {
             .h_flex()
             .gap_1()
             .child(
-                Button::new("note-new-cell-menu")
-                    .small()
-                    .ghost()
-                    .icon(IconName::Plus)
+                crate::assets::note_tool("note-new-cell-menu")
+                    .w(px(32.))
+                    .icon(
+                        gpui_component::Icon::new(IconName::Plus)
+                            .text_color(crate::assets::note_color(0, cx)),
+                    )
                     .dropdown_caret(true)
                     .tooltip(t(cx, "notes.new_cell"))
                     .disabled(self.batch.is_some() || self.cells.len() >= note_store::MAX_CELLS)
@@ -149,36 +151,46 @@ impl NoteView {
                     }),
             )
             .child(
-                Button::new("save-note")
-                    .small()
-                    .ghost()
-                    .icon(gpui_component::Icon::default().path("icons/note-save.svg"))
+                crate::assets::note_tool("save-note")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path("icons/note-save.svg")
+                            .text_color(crate::assets::note_color(0, cx)),
+                    )
                     .tooltip(t(cx, "notes.save"))
                     .disabled(!self.dirty() || self.saving)
+                    .opacity(if !self.dirty() || self.saving {
+                        0.4
+                    } else {
+                        1.
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.save_now(cx))),
             )
             .child(
-                Button::new("run-all-note-cells")
-                    .small()
-                    .ghost()
-                    .icon(gpui_component::Icon::default().path("icons/note-run-all.svg"))
+                crate::assets::note_tool("run-all-note-cells")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path("icons/note-run-all.svg")
+                            .text_color(crate::assets::note_color(1, cx)),
+                    )
                     .tooltip(self.batch_label(cx))
                     .disabled(active || !self.cells.iter().any(|c| c.read(cx).has_sql(cx)))
                     .on_click(cx.listener(|this, _, window, cx| this.run_all(window, cx))),
             )
             .child(
-                Button::new("stop-all-note-cells")
-                    .small()
-                    .ghost()
-                    .icon(gpui_component::Icon::default().path("icons/stop.svg"))
+                crate::assets::note_tool("stop-all-note-cells")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path("icons/stop.svg")
+                            .text_color(crate::assets::note_color(3, cx)),
+                    )
                     .tooltip(t(cx, "notes.stop_all"))
                     .disabled(!active)
+                    .opacity(if active { 1. } else { 0.4 })
                     .on_click(cx.listener(|this, _, _, cx| this.stop_queries(cx))),
             )
             .child(
-                Button::new("collapse-all-note-cells")
-                    .small()
-                    .ghost()
+                crate::assets::note_tool("collapse-all-note-cells")
                     .icon(gpui_component::Icon::default().path("icons/note-collapse.svg"))
                     .tooltip(t(cx, "notes.collapse_all"))
                     .on_click(
@@ -186,9 +198,7 @@ impl NoteView {
                     ),
             )
             .child(
-                Button::new("expand-all-note-cells")
-                    .small()
-                    .ghost()
+                crate::assets::note_tool("expand-all-note-cells")
                     .icon(gpui_component::Icon::default().path("icons/note-expand.svg"))
                     .tooltip(t(cx, "notes.expand_all"))
                     .on_click(
@@ -292,32 +302,21 @@ impl NoteView {
                         for profile in &profiles {
                             let owner = binding.clone();
                             let profile = profile.clone();
-                            menu = menu.item(
-                                PopupMenuItem::new(profile.name.clone())
-                                    .disabled(!matches!(
-                                        profile.kind,
-                                        turbodbn_services::DatabaseKind::MySql
-                                            | turbodbn_services::DatabaseKind::PostgreSql
-                                            | turbodbn_services::DatabaseKind::Sqlite
-                                    ))
-                                    .on_click(move |_, window, cx| {
-                                        owner.update(cx, |this, cx| {
-                                            if this.defaults_locked(cx) {
-                                                return;
-                                            }
-                                            this.note.default_connection_id = Some(profile.id);
-                                            this.default_database.update(cx, |input, cx| {
-                                                input.set_value(
-                                                    profile.database.clone(),
-                                                    window,
-                                                    cx,
-                                                )
-                                            });
-                                            this.sync_defaults(cx);
-                                            this.changed(cx);
-                                        })
-                                    }),
-                            );
+                            menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(
+                                move |_, window, cx| {
+                                    owner.update(cx, |this, cx| {
+                                        if this.defaults_locked(cx) {
+                                            return;
+                                        }
+                                        this.note.default_connection_id = Some(profile.id);
+                                        this.default_database.update(cx, |input, cx| {
+                                            input.set_value(profile.database.clone(), window, cx)
+                                        });
+                                        this.sync_defaults(cx);
+                                        this.changed(cx);
+                                    })
+                                },
+                            ));
                         }
                         menu.scrollable(true).max_h(px(280.))
                     }),
@@ -376,8 +375,11 @@ impl NoteView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.deleting {
+            return;
+        }
         match action {
-            FileAction::Reveal => cx.reveal_path(&self.path),
+            FileAction::Reveal => crate::feedback::reveal_parent(self.path.clone(), cx),
             FileAction::SaveAs => self.save_as(window, cx),
             FileAction::Rename | FileAction::Project => {
                 self.metadata_dialog(matches!(action, FileAction::Project), window, cx)

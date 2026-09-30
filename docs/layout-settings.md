@@ -55,7 +55,7 @@
 - 尚未使用真实 API Key 调用各家提供商；模型接口通过本机 HTTP fixture 验证。未做正式发布/安装器回归。
 
 ## 扩展包示例
-语言包目录为 settings.db 相邻的 locales/。例如 en-custom.json：
+语言包目录为 connections.db 相邻的 locales/。例如 en-custom.json：
 ```json
 {"schema_version":2,"id":"en-custom","name":"English (custom)","strings":{"settings.title":"Preferences","settings.general.title":"General"}}
 ```
@@ -101,3 +101,10 @@
 ## 数据库上下分区
 
 数据库导航、对象树和表数据页签的当前规则见 [数据库工作区设计](database-workbench.md)。左侧保持固定工具区，无关闭按钮；支持拖动上下比例，中间打开分页数据，右侧保留结构详情。
+
+
+## 统一应用存储
+
+设置、数据库导航、笔记索引使用 connections.db 的 app_documents 命名空间（settings/navigation/note-library），连接与 DPAPI 密文继续使用原表。旧 settings.db 和 JSON 文件作为只读迁移源保留；命名空间存在后不再导入旧源。每项写入事务提交，未来版本拒绝覆盖。SQL 设置内可启用额外元数据查询；其范围不是数据库账号授权。
+
+迁移验证覆盖已存在设置库、仅旧 JSON、空白笔记索引、重复启动不重导入和未来命名空间版本拒绝覆盖；Windows 窗口核对 SQL 扩展自动保存只写统一库。旧设置源保留用于备份，不能将它当作当前运行配置继续修改。
