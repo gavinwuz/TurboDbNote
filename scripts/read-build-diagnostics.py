@@ -15,7 +15,15 @@ if not re.fullmatch(r'\d+', job):
 repo = os.environ['GITHUB_REPOSITORY']
 result = subprocess.run(['gh', 'api', f'repos/{repo}/actions/jobs/{job}/logs'], capture_output=True)
 if result.returncode:
-    print('::error title=Build diagnostics::Unable to read the selected job log; check Actions read permissions')
+    stderr = result.stderr.decode('utf-8', errors='replace')
+    status = re.search(r'HTTP (\d{3})', stderr)
+    code = status[1] if status else 'unavailable'
+    safe = next((line for line in stderr.splitlines() if line.startswith('gh:')), 'GitHub CLI request failed')
+    safe = re.sub(r'https?://\S+', '[URL omitted]', safe)
+    if re.search(r'password|secret|token|api[_-]?key|authorization', safe, re.I):
+        safe = 'Sensitive response detail omitted'
+    safe = safe[:300].replace('%','%25').replace('\r','%0D').replace('\n','%0A')
+    print('::error title=Build diagnostics::Job log request HTTP ' + code + ': ' + safe)
     raise SystemExit(1)
 lines = result.stdout.decode('utf-8', errors='replace').splitlines()
 selected = []
