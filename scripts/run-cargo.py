@@ -13,7 +13,7 @@ def clean(line):
 
 def failure(line):
     summary = clean(line).strip()
-    if re.match(r'(error(?:\[[A-Z0-9]+\])?:|fatal error)', summary, re.I) or re.match(r'test .*FAILED$', summary) or 'panicked at ' in summary or summary.startswith('--> '):
+    if re.match(r'(error(?:\[[A-Z0-9]+\])?:|fatal error)', summary, re.I) or re.match(r'test .*FAILED$', summary) or 'panicked at ' in summary:
         return summary[:600]
     return None
 
@@ -24,9 +24,11 @@ def main():
         line = clean(line)
         print(line, end='', flush=True)
         summary = failure(line)
-        if summary:
+        if summary or line.strip().startswith('--> '):
+            level = 'error' if summary else 'notice'
+            summary = summary or line.strip()[:600]
             safe = summary.replace('%','%25').replace('\r','%0D').replace('\n','%0A')
-            print('::error title=Cargo diagnostic::' + safe, flush=True)
+            print(f'::{level} title=Cargo diagnostic::' + safe, flush=True)
     sys.exit(process.wait())
 
 

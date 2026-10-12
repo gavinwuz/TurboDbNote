@@ -24,6 +24,9 @@ class CargoDiagnosticTests(unittest.TestCase):
     def test_colored_failures_remain_visible_without_sensitive_values(self):
         self.assertEqual(run_cargo.failure("\x1b[31merror[E0425]: unknown item\x1b[0m"), "error[E0425]: unknown item")
         self.assertEqual(run_cargo.failure("test example::case ... FAILED"), "test example::case ... FAILED")
+        self.assertIsNone(run_cargo.failure('warning: unreachable expression'))
+        self.assertIsNone(run_cargo.failure('  --> upstream/gpui/src/elements/surface.rs:35:21'))
+        self.assertEqual(run_cargo.failure('error: could not compile application'), 'error: could not compile application')
         self.assertIsNone(run_cargo.failure('left: confidential fixture value'))
         self.assertIsNone(run_cargo.failure('authorization=confidential fixture value'))
 
