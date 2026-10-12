@@ -34,3 +34,11 @@ Git push authorization is required once on the developer machine; the Actions jo
 Windows: `./scripts/package-windows.ps1 -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'` using PowerShell 7 and the standard SDK/toolchain.
 
 Linux: install the packages listed in the release workflow, then `python3 scripts/package-linux.py`. Existing output paths are rejected. Generated source archives include explicitly selected project sources and never root `config/` or user data.
+
+Driver contract verification uses the Rust example directly on both platforms (no Python dependency for this check):
+
+```sh
+cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts -- <package-directory>/drivers/native
+```
+
+The check starts only local fixtures and owned worker processes; it verifies bounded reads, rejected writes, invalid input handling and clean shutdown. Packaging and window smoke checks currently retain Python 3.11.

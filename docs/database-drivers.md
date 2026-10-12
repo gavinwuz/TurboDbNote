@@ -40,7 +40,7 @@ Protocol frames are limited to 1 MiB, aggregate preview content to 768 KiB, cell
 
 ## Validation
 
-Rust tests cover retired H2 record compatibility, worker rejection, quoting, bounded results and TLS descriptor generation. `scripts/verify-driver-host.py` uses isolated Elasticsearch/TDengine HTTP contracts and checks worker exit and error redaction. These checks are not real-server acceptance for those engines or other external adapters.
+Rust tests cover retired H2 record compatibility, worker rejection, quoting, bounded results and TLS descriptor generation. `crates/driver-host/examples/verify_contracts.rs` uses isolated Elasticsearch/TDengine HTTP contracts and checks worker exit and error redaction. These checks are not real-server acceptance for those engines or other external adapters.
 
 Before H2 removal, native Windows GUI validation confirmed a Rust HTTP worker's 0 → 1 → 0 lifecycle on connect/disconnect and displayed bounded data/JSON. H2 test results from the earlier JDBC implementation do not imply current H2 support.
 

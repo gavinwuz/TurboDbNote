@@ -299,3 +299,11 @@ python3 scripts/package-linux.py
 - [Linux 打包脚本](../scripts/package-linux.py)
 - [GitHub Actions](https://github.com/gavinwuz/TurboDbNote/actions/workflows/release.yml)
 - [GitHub Releases](https://github.com/gavinwuz/TurboDbNote/releases)
+
+驱动契约验证已统一为 Rust，Windows/Linux 共用同一个入口，此项不再依赖 Python：
+
+```sh
+cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts -- <解压目录>/drivers/native
+```
+
+验证仅启动本地模拟服务及自身创建的驱动进程，检查有界读取、拒绝写入、非法输入处理及正常回收，不代表真实数据库服务端验收。当前打包及窗口启动验证仍保留 Python 3.11。

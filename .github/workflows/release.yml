@@ -80,7 +80,7 @@ jobs:
             throw
           }
       - name: Verify isolated driver contracts
-        run: python scripts/verify-driver-host.py --runtime dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-windows-x64/drivers/native
+        run: cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts -- dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-windows-x64/drivers/native
       - name: Open the packaged Windows window in isolation
         run: python scripts/verify-windows-startup.py dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-windows-x64
       - uses: actions/upload-artifact@v4
@@ -127,7 +127,7 @@ jobs:
       - name: Build archive
         run: python3 scripts/package-linux.py
       - name: Verify isolated driver contracts
-        run: python3 scripts/verify-driver-host.py --runtime dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-linux-x64/drivers/native
+        run: cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts -- dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-linux-x64/drivers/native
       - name: Open the packaged window in isolated X11
         run: xvfb-run -a python3 scripts/verify-linux-startup.py dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-linux-x64
       - uses: actions/upload-artifact@v4
