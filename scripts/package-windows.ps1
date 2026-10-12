@@ -52,13 +52,13 @@ try {
     $notes = Get-VersionReleaseNotes -ChangelogPath (Join-Path $root 'CHANGELOG.md') -Version $version
     $notesZh = Get-VersionReleaseNotes -ChangelogPath (Join-Path $root 'CHANGELOG.zh-CN.md') -Version $version
     Invoke-Checked cargo @('fmt', '--all', '--', '--check')
-    Invoke-Checked cargo @('test', '--locked', '-p', 'turbodbn-core', '-p', 'turbodbn-services', '-p', 'turbodbnote-driver-host')
-    Invoke-Checked cargo @('clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings')
+    Invoke-Checked cargo @('test', '--locked', '-j', '1', '-p', 'turbodbn-core', '-p', 'turbodbn-services', '-p', 'turbodbnote-driver-host', '--', '--test-threads=1')
+    Invoke-Checked cargo @('clippy', '--locked', '-j', '1', '--workspace', '--all-targets', '--', '-D', 'warnings')
     $buildWorkspace = New-PackageBuildWorkspace -Root $root -FxcPath $compiler
     $buildTarget = Join-Path $root 'target'
     Push-Location $buildWorkspace
     try {
-        Invoke-Checked cargo @('build', '--locked', '--release', '--target', 'x86_64-pc-windows-msvc', '--target-dir', $buildTarget, '-p', 'turbodbnote', '-p', 'turbodbnote-driver-host')
+        Invoke-Checked cargo @('build', '--locked', '-j', '1', '--release', '--target', 'x86_64-pc-windows-msvc', '--target-dir', $buildTarget, '-p', 'turbodbnote', '-p', 'turbodbnote-driver-host')
     } finally { Pop-Location }
     $exe = Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote.exe'
     Invoke-Checked python @('scripts/verify-windows-icon.py', $exe)
@@ -101,7 +101,7 @@ try {
     if (-not (Test-Path -LiteralPath $pdb -PathType Leaf)) { throw 'Release PDB missing; crash reports would not be symbolicated' }
     New-Item -ItemType Directory -Path $symbols | Out-Null
     Copy-Item -LiteralPath $exe, $pdb -Destination $symbols
-    foreach ($nativeSymbolName in @('turbodbnote-driver-host.exe', 'turbodbnote_driver_host.pdb')) {
+    foreach ($nativeSymbolName in @('turbodbnote-driver-host.exe', 'turbodbnote_driver_host.pdb', 'turbodbnote-mysql-legacy.exe', 'turbodbnote_mysql_legacy.pdb')) {
         $nativeSymbolFile = Join-Path $buildTarget "x86_64-pc-windows-msvc/release/$nativeSymbolName"
         if (-not (Test-Path -LiteralPath $nativeSymbolFile -PathType Leaf)) { throw 'Native driver symbols missing' }
         Copy-Item -LiteralPath $nativeSymbolFile -Destination $symbols
@@ -110,7 +110,7 @@ try {
     $notes | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.md') -Encoding utf8
     $notesZh | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.zh-CN.md') -Encoding utf8
     @"
-TurboDBNote v$version (Preview) / Windows x64
+TurboDBNote v$version / Windows x64
 Run turbodbnote.exe from this extracted folder.
 Notes persist as individual .note files. Application data is stored in connections.db.
 MySQL compatibility components are included in the adjacent drivers directory.
@@ -132,8 +132,8 @@ This build is unsigned. Read RELEASE-NOTES.md before use.
         $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
         "$hash  $([IO.Path]::GetFileName($_))"
     } | Set-Content -LiteralPath $checksum -Encoding ascii
-    Write-Output "Candidate package: $zip"
-    Write-Output "Candidate installer: $setup"
+    Write-Output "Package: $zip"
+    Write-Output "Installer: $setup"
     Write-Output "Checksums: $checksum"
 } finally {
     Pop-Location

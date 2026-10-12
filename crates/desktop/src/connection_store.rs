@@ -443,7 +443,7 @@ mod tests {
             name: "fixture".into(),
             database: "demo".into(),
             group: "old".into(),
-            remember_password: true,
+            remember_password: cfg!(windows),
             ..Default::default()
         };
         save_password(&path, &p, "test-secret").unwrap();
@@ -453,7 +453,11 @@ mod tests {
         let renamed = load(&path).unwrap();
         assert_eq!(renamed.profiles[0].group, "new");
         assert_eq!(renamed.history[&p.id].credential_id, key);
-        assert!(read_password(&path, key.unwrap()).unwrap().as_deref() == Some("test-secret"));
+        if cfg!(windows) {
+            assert!(read_password(&path, key.unwrap()).unwrap().as_deref() == Some("test-secret"));
+        } else {
+            assert!(key.is_none());
+        }
         rename_project(&path, "new", "").unwrap();
         let removed = load(&path).unwrap();
         assert_eq!(removed.profiles.len(), 1);

@@ -14,7 +14,7 @@
 - 产品展示名统一为 **TurboDBNote**；桌面包和主程序名为 `turbodbnote`，Windows 可执行文件为 `turbodbnote.exe`。不要恢复旧启动名 `turbodbn-desktop`。品牌大小写调整不迁移旧数据目录、凭据标识或安装运行互斥量；保留兼容标识。
 - 版本以根目录 `Cargo.toml` 的 workspace 配置为准；依赖版本以各包清单和 `Cargo.lock` 为准。
 - 采用 Rust 2024、GPUI 与 GPUI Component 构建原生桌面应用。当前 GPUI、Component、assets 为配套固定版本，升级须一起检查兼容性，不混用不兼容的 GPUI 类型。
-- 发布目标为 Windows 10 1809+ / Windows 11 x64，不支持 Windows 7。不能把 Windows 验证结果等同于 macOS/Linux 已验收。
+- 发布目标为 Windows 10 1809+ / Windows 11 x64，以及以 Ubuntu 22.04/glibc 2.35 为基线的 Linux x64；不支持 Windows 7。Windows 与 Linux 分别构建和验证，不把 Windows 验证结果等同于 Linux 桌面／GPU／真实服务端已验收。
 
 
 | 目录                    | 职责                                 |
@@ -236,3 +236,5 @@ Notebook 已接入独立 .note 草稿/文件保存、Markdown 预览、任务编
 - Note 任务使用独立清单项 ID，支持完成、负责人文本、截止日期时间及本地提醒；完成项置灰并显示删除线。提醒只针对应用运行期间已打开笔记，完成项不提醒，按任务项与提醒时刻去重，应用内提醒保留到关闭，不发送外部消息。Note v2 兼容读取 v1，旧正文保留，逐行转换须显式操作；恢复任务不执行 SQL。
 
 - Windows 主窗口默认关闭先提供取消／退出／托管到系统托盘；首次托管成功后持久化自动托管，设置 → 通用可关闭并恢复询问；托管保留窗口实体、笔记和会话，图标创建成功后才隐藏。托盘提供打开／退出与双击恢复，明确退出复用保存和运行任务检查；图标失败恢复窗口，不静默退出。
+
+- 双平台发布复用 .github/workflows/release.yml 与 scripts/release.ps1 / prepare-release.py；两平台验证成功后才创建不可变版本标签并发布两个平台包。后续版本从双语 Unreleased 生成说明，不移动已发布标签；Linux 首版密码仅会话内存，Windows DPAPI／托盘／随包旧 MySQL DLL 不宣称跨平台。

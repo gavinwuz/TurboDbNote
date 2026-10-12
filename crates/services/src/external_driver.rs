@@ -30,8 +30,15 @@ pub fn directory() -> Option<PathBuf> {
     }
     Some(base.join("drivers/native"))
 }
+pub fn executable_name() -> &'static str {
+    if cfg!(windows) {
+        "turbodbnote-driver-host.exe"
+    } else {
+        "turbodbnote-driver-host"
+    }
+}
 pub fn installed() -> bool {
-    directory().is_some_and(|p| p.join("turbodbnote-driver-host.exe").is_file())
+    directory().is_some_and(|p| p.join(executable_name()).is_file())
 }
 pub fn status_key() -> &'static str {
     if installed() {
@@ -49,7 +56,7 @@ pub(crate) fn command(p: &Profile) -> Result<tokio::process::Command, String> {
         return Err("drivers.removed".into());
     }
     let dir = directory().ok_or("drivers.runtime_missing")?;
-    let executable = dir.join("turbodbnote-driver-host.exe");
+    let executable = dir.join(executable_name());
     if !executable.is_file() {
         return Err("drivers.runtime_missing".into());
     }

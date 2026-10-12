@@ -14,7 +14,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: cargo test --locked -p turbodbn-core -p turbodbn-services -p turbodbnote-driver-host
-      - run: cargo test --locked -p turbodbnote --bin turbodbnote
+      - run: cargo test --locked -p turbodbnote --bin turbodbnote -- --test-threads=1
       - run: cargo check --locked --workspace --all-targets
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo build --locked -p turbodbnote

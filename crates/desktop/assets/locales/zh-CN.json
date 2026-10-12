@@ -1047,6 +1047,7 @@
     "settings.general.close_to_tray": "关闭时自动托管到系统托盘",
     "settings.general.close_to_tray_hint": "选择托管后自动记住；关闭此开关可恢复询问。完全退出请使用托盘菜单。",
     "app.tray.remember_failed": "无法保存关闭行为，窗口已保留。请检查设置存储后重试。",
-    "app.tray.remember_busy": "设置正在保存，窗口已保留。请等待保存完成后重试。"
+    "app.tray.remember_busy": "设置正在保存，窗口已保留。请等待保存完成后重试。",
+    "drivers.authentication_unsupported": "当前平台不支持 Windows 集成认证，请填写数据库用户名。"
   }
 }

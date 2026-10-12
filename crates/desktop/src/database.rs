@@ -758,7 +758,7 @@ impl DatabaseView {
         let mut p = driver.profile();
         p.name.clear();
         p.group.clear();
-        p.remember_password = !driver.file;
+        p.remember_password = cfg!(windows) && !driver.file;
         p.tls = TlsMode::Disabled;
         p.allow_old_auth = driver.id == "mysql";
         if p.kind == DatabaseKind::Redis {
@@ -770,7 +770,7 @@ impl DatabaseView {
         let mut p = turbodbn_services::database::defaults(kind);
         p.name.clear();
         p.group.clear();
-        p.remember_password = kind != DatabaseKind::Sqlite;
+        p.remember_password = cfg!(windows) && kind != DatabaseKind::Sqlite;
         p.tls = TlsMode::Disabled;
         p.allow_old_auth = kind == DatabaseKind::MySql;
         if kind == DatabaseKind::Redis {
@@ -2227,7 +2227,7 @@ impl Render for DatabaseView {
                 Switch::new("remember-db-password")
                     .label(crate::locale::t(cx, "feedback.password.remember"))
                     .checked(self.editing.remember_password)
-                    .disabled(self.saving)
+                    .disabled(self.saving || !cfg!(windows))
                     .on_click(cx.listener(|this, value: &bool, _, cx| {
                         this.editing.remember_password = *value;
                         cx.notify();
@@ -2482,7 +2482,10 @@ mod connection_form_tests {
     fn explicit_names_and_database_targets_are_required() {
         for kind in DatabaseKind::ALL {
             let mut profile = DatabaseView::empty_profile(kind);
-            assert_eq!(profile.remember_password, kind != DatabaseKind::Sqlite);
+            assert_eq!(
+                profile.remember_password,
+                cfg!(windows) && kind != DatabaseKind::Sqlite
+            );
             assert!(profile.name.is_empty());
             assert_eq!(
                 required_connection_field(&profile, false),

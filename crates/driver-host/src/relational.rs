@@ -64,7 +64,14 @@ impl Relational {
                 string(p, "database")
             });
             config.authentication(if string(p, "user").is_empty() && password.is_empty() {
-                tiberius::AuthMethod::Integrated
+                #[cfg(windows)]
+                {
+                    tiberius::AuthMethod::Integrated
+                }
+                #[cfg(not(windows))]
+                {
+                    return Err("drivers.authentication_unsupported");
+                }
             } else {
                 tiberius::AuthMethod::sql_server(string(p, "user"), password)
             });

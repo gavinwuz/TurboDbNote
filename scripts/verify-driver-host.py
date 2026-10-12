@@ -1,5 +1,6 @@
 """Isolated Elasticsearch/TDengine HTTP contract and lifecycle checks."""
 import argparse
+import os
 import http.server
 import json
 import pathlib
@@ -21,8 +22,8 @@ def read_line(process):
 
 
 def connect(driver, port, database):
-    command = [str(runtime / "turbodbnote-driver-host.exe")]
-    process = subprocess.Popen(command, cwd=runtime, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW)
+    command = [str(runtime / ("turbodbnote-driver-host.exe" if os.name == "nt" else "turbodbnote-driver-host"))]
+    process = subprocess.Popen(command, cwd=runtime, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     profile = dict(driver_id=driver, kind="External", host="127.0.0.1", port=port, user="", database=database, timeout_seconds=10, tls="Disabled", list_all_databases=False)
     process.stdin.write((json.dumps(dict(profile=profile, password="")) + "\n").encode()); process.stdin.flush()
     reply = read_line(process)
@@ -103,7 +104,7 @@ finally:
 
 # Failures must not echo submitted credentials, SQL or malformed input.
 for payload in [b'x' * 65538, json.dumps({'profile': {'driver_id': 'unknown'}, 'password': 'fixture-secret-never-echo'}).encode()]:
-    check = subprocess.run([str(runtime / 'turbodbnote-driver-host.exe')], cwd=runtime, input=payload+b'\n', stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW)
+    check = subprocess.run([str(runtime / 'turbodbnote-driver-host.exe')], cwd=runtime, input=payload+b'\n', stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
     reply = json.loads(check.stdout)
     assert reply.get('error') in ('drivers.invalid_identity', 'drivers.value_limit')
     assert b'fixture-secret-never-echo' not in check.stdout + check.stderr

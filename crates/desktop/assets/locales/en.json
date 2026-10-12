@@ -1047,6 +1047,7 @@
     "settings.general.close_to_tray": "Keep in system tray when closing",
     "settings.general.close_to_tray_hint": "Enabled after choosing Keep in tray. Turn off to ask again. Use the tray menu to exit.",
     "app.tray.remember_failed": "Unable to remember the close behavior. The window remains open; check settings storage and try again.",
-    "app.tray.remember_busy": "Settings are being saved. The window remains open; try again when saving completes."
+    "app.tray.remember_busy": "Settings are being saved. The window remains open; try again when saving completes.",
+    "drivers.authentication_unsupported": "This platform does not support Windows integrated authentication; specify a database username."
   }
 }
