@@ -29,7 +29,11 @@ try {
     $IsccPath = (Resolve-Path -LiteralPath $IsccPath).Path
     Write-Output "GPUI shader compiler: $compiler"
     function Invoke-Checked([string]$Program, [string[]]$Arguments) {
-        & $Program @Arguments
+        if ($Program -eq 'cargo') {
+            & python (Join-Path $root 'scripts/run-cargo.py') @Arguments
+        } else {
+            & $Program @Arguments
+        }
         if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
     }
     $metadataJson = & cargo metadata --locked --no-deps --format-version 1
