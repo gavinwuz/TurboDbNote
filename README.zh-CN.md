@@ -6,7 +6,7 @@
 
 **版本 0.1.0 · Windows 与 Linux x64**
 
-[下载](https://github.com/gavinwuz/TurboDbNote/releases) · [更新日志](CHANGELOG.zh-CN.md) · [发布流程](docs/releasing.md)
+[下载](https://github.com/gavinwuz/TurboDbNote/releases) · [更新日志](CHANGELOG.zh-CN.md) · [发布流程](docs/releasing.zh-CN.md)
 
 ## 主要功能
 
@@ -65,7 +65,7 @@ cargo clippy --locked -j 1 --workspace --all-targets -- -D warnings
 - [设置与常用操作](docs/settings-workbench.md)
 - [数据库驱动范围](docs/database-drivers.md)
 - [诊断与验证边界](docs/crashsight-integration.md)
-- [版本发布与打包](docs/releasing.md)
+- [版本发布与打包](docs/releasing.zh-CN.md)
 
 下次发布时，在双语 Unreleased 中补充说明，将功能提交到干净的默认分支，再运行 `./scripts/release.ps1 -Version 0.1.1`（Linux：`python3 scripts/prepare-release.py 0.1.1`）。Actions 仅在两平台验证通过后打包发布；版本标签不可变，不覆盖已有 Release。
 

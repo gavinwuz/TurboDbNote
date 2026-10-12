@@ -1,5 +1,7 @@
 # Releasing TurboDBNote
 
+[English](releasing.md) | [简体中文操作手册](releasing.zh-CN.md)
+
 The public release has two platform packages: a Windows x64 portable ZIP and a Linux x64 tar.gz, plus SHA256SUMS.txt. Windows packaging also creates an installer and matching symbols as Actions artifacts. Do not put PDB files in the public packages.
 
 ## Next release
