@@ -89,6 +89,7 @@ jobs:
           path: |
             dist/*-portable.zip
             dist/*-setup.exe
+            dist/*-sources.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
@@ -168,9 +169,9 @@ jobs:
           sha256sum --check SHA256SUMS-linux.txt
           cd ../..
           mkdir upload
-          cp candidate/windows/*-portable.zip candidate/linux/*.tar.gz upload/
+          cp candidate/windows/*-portable.zip candidate/windows/*-setup.exe candidate/windows/*-sources.zip candidate/linux/*.tar.gz upload/
           cd upload
-          sha256sum *.zip *.tar.gz > SHA256SUMS.txt
+          sha256sum *.zip *.exe *.tar.gz > SHA256SUMS.txt
           cd ..
           if gh release view "v$VERSION" >/dev/null 2>&1; then
             echo 'This version already has a release; refusing to overwrite it.'

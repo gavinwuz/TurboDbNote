@@ -31,7 +31,7 @@ Capabilities vary. Note SQL execution supports MySQL/PostgreSQL/SQLite. External
 
 ## Install
 
-- **Windows 10 1809+ / Windows 11 x64:** extract the portable ZIP and run `turbodbnote.exe`. Keep the bundled `drivers` and license/source material with the executable. Windows 7 is unsupported; binaries are unsigned.
+- **Windows 10 1809+ / Windows 11 x64:** extract the portable ZIP and run `turbodbnote.exe`. Keep the bundled `drivers` and license material with the executable. Future releases provide source materials as a separate download. Windows 7 is unsupported; binaries are unsigned.
 - **Linux x64:** extract the tar.gz and run `./turbodbnote`. The baseline is Ubuntu 22.04 / glibc 2.35, with a working X11/Wayland desktop, Vulkan graphics, fontconfig, libxkbcommon and unixODBC. See the included `*-dependencies.txt` files.
 - Verify downloaded files using `SHA256SUMS.txt`. AI chat requires a separately installed and authenticated Codex or Claude Code CLI; it is not bundled.
 
@@ -70,3 +70,5 @@ The serial test setting avoids Windows credential-test interference. CI checks n
 For the next release, add bilingual Unreleased notes, commit features on the clean default branch and run `./scripts/release.ps1 -Version 0.1.1` (Linux: `python3 scripts/prepare-release.py 0.1.1`). Actions tests, packages and publishes only after both platforms pass. Version tags are immutable; existing releases are not overwritten.
 
 Licensed under [Apache-2.0](LICENSE). Bundled third-party components retain their respective licenses.
+
+Future Windows releases include an Inno Setup installer alongside the portable ZIP and SHA256 checksums. See [release instructions](docs/releasing.md). Current binaries remain unsigned.

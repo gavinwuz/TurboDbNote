@@ -4,12 +4,7 @@
 
 ## 1. 当前状态与产物
 
-截至 2026-10-12 本次整理时：
-
-- 当前源码分支：`feat/mysql-driver`；候选提交：`27abbb0`。
-- [候选构建](https://github.com/gavinwuz/TurboDbNote/actions/runs/38211908708)正在执行：版本检查通过；Linux 工作区编译检查、串行测试、Clippy 已通过，正在构建发行归档；Windows 正在验证及打包。
-- `v0.1.0` GitHub Release 尚未创建。以上状态只是记录时间点，实际结果以 Actions 为准。
-- 候选分支只构建验证，不自动公开发布；默认分支的 `[release]` 提交才会触发自动发布。
+`v0.1.0` 已从 main 提交 `051072b` 成功发布。原版本附件保持不变；后续版本增加安装包公开发布。
 
 公开 Release 包含：
 
@@ -184,7 +179,7 @@ flowchart TD
 
 平台构建分开执行，依赖及兼容组件使用缓存。旧候选可以被新候选取消，默认分支和标签发布运行保留顺序保护。
 
-公开发布只上传两个平台包及校验清单；安装 EXE 和符号保留在工作流产物中。发布说明从根目录双语 CHANGELOG 生成，不另建重复的版本说明源文件。
+后续公开发布上传 Windows 便携 ZIP、安装 EXE、Linux tar.gz 和统一校验清单；符号仅保留在工作流产物中。发布说明从根目录双语 CHANGELOG 生成，不另建重复的版本说明源文件。
 
 ## 6. 失败时如何处理
 
@@ -307,3 +302,30 @@ cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts --
 ```
 
 验证仅启动本地模拟服务及自身创建的驱动进程，检查有界读取、拒绝写入、非法输入处理及正常回收，不代表真实数据库服务端验收。当前打包及窗口启动验证仍保留 Python 3.11。
+
+## 10. Windows 安装包发布流程
+
+### 方案与操作
+
+复用已有 Inno Setup 打包，在下一版本同时公开发布便携 ZIP、setup.exe、Linux tar.gz 和包含三个文件的 SHA256SUMS.txt。现有 v0.1.0 附件不变。Windows 原始校验清单先验证，发布清单再从最终上传文件生成。
+
+1. 在根目录双语 CHANGELOG 的 Unreleased 中写入更新说明。
+2. 提交并推送，确保 main 与远端同步、工作区干净。
+3. 执行 `./scripts/release.ps1 -Version 0.1.1`。
+4. 等待 metadata、windows、linux、publish 全部成功。
+5. 检查公开附件 ZIP、setup.exe、tar.gz 与 SHA256SUMS.txt 齐全。
+6. 下载所需文件，对照清单验证 SHA256，再安装或解压运行。
+
+安装包与便携包由同一次构建、同一版本生成。安装包按当前用户安装，无需管理员权限，支持中英文、开始菜单及可选桌面快捷方式；排除 portable.flag，卸载保留用户数据。安装或升级前退出程序及托盘实例。安装版和便携版的数据位置不同，不直接复用便携目录作为安装目录。
+
+### SignPath 获批后的流程
+
+构建与测试 → 签名自有主程序及辅助程序 → 验证签名 → 生成 ZIP 与安装程序 → 签名安装程序 → 验证签名和隔离安装/升级/卸载 → 生成最终哈希 → 发布。
+
+同时配置 Inno Setup 卸载程序签名。第三方 DLL 保留原厂签名，PDB 不进入用户包。Foundation 每次正式签名需人工批准，批准后继续自动发布。必须签名的步骤失败就停止，不自动发布未签名替代包；签名改变哈希，校验清单始终最后生成。
+
+当前安装程序仍未签名：SignPath 尚待申请批准与接入，安装/升级/卸载交互验证也需在接入时完成。
+
+官方参考：[Foundation 条件](https://signpath.org/terms.html)、[GitHub Actions 接入](https://docs.signpath.io/trusted-build-systems/github)。
+
+Windows 绿色 ZIP 排除 `sources/` 与 `drivers/mysql-5.1.73-winx64/mysql-5.1.73-source.tar.gz`，驱动运行文件及许可证保留。排除的材料另打包为 `*-windows-x64-sources.zip` 并作为 Release 独立附件公开，统一纳入 SHA256SUMS.txt；安装包继续保留原有源码材料。因此后续发布为四个包加校验清单。

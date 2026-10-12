@@ -2,7 +2,7 @@
 
 [English](releasing.md) | [简体中文操作手册](releasing.zh-CN.md)
 
-The public release has two platform packages: a Windows x64 portable ZIP and a Linux x64 tar.gz, plus SHA256SUMS.txt. Windows packaging also creates an installer and matching symbols as Actions artifacts. Do not put PDB files in the public packages.
+Future releases publish a Windows portable ZIP, Inno Setup installer EXE and Linux tar.gz, plus SHA256SUMS.txt covering all three. Windows symbols remain Actions artifacts. Do not put PDB files in the public packages.
 
 ## Next release
 
@@ -42,3 +42,15 @@ cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts --
 ```
 
 The check starts only local fixtures and owned worker processes; it verifies bounded reads, rejected writes, invalid input handling and clean shutdown. Packaging and window smoke checks currently retain Python 3.11.
+
+## Windows installer release flow
+
+The existing v0.1.0 assets remain unchanged; this workflow applies to subsequent releases. Add bilingual Unreleased notes, commit and push to main, then run `./scripts/release.ps1 -Version 0.1.1`. Both platform jobs must pass. Confirm ZIP, setup.exe, tar.gz and SHA256SUMS.txt appear in the release.
+
+`package-windows.ps1` already produces the ZIP and installer from the same staged binaries and version. The installer is per-user, supports English/Simplified Chinese and optional desktop shortcuts, excludes portable.flag and preserves user data on uninstall. Exit the app including its tray instance before installation or upgrade. Installer and portable data locations differ. Verify the downloaded package SHA256 before running it.
+
+Current binaries remain unsigned. After SignPath approval, integrate: build/test → sign owned binaries → verify signatures → build ZIP and installer → sign installer (also configure Inno Setup uninstaller signing) → verify signatures and isolated install/upgrade/uninstall → compute final checksums → publish. Foundation signing needs manual approval. Required signing failures stop publication; no unsigned fallback. Third-party DLLs retain original signatures. Do not modify final files after checksums. Signing integration and installer interaction validation are not yet completed.
+
+References: [Foundation terms](https://signpath.org/terms.html), [GitHub integration](https://docs.signpath.io/trusted-build-systems/github).
+
+Windows portable ZIP excludes `sources/` and `drivers/mysql-5.1.73-winx64/mysql-5.1.73-source.tar.gz`. These files are published separately as `*-windows-x64-sources.zip`, covered by SHA256SUMS.txt; runtime DLLs and licenses remain in the portable ZIP. The installer retains the existing source materials. Future releases therefore contain four packages plus the checksum manifest.

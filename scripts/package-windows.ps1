@@ -49,8 +49,9 @@ try {
     $stage = Join-Path $output $name
     $zip = Join-Path $output "$name-portable.zip"
     $setup = Join-Path $output "$name-setup.exe"
+    $sourcesZip = Join-Path $output "$name-sources.zip"
     $checksum = Join-Path $output 'SHA256SUMS.txt'
-    foreach ($path in @($stage, $zip, $setup, $checksum)) {
+    foreach ($path in @($stage, $zip, $setup, $sourcesZip, $checksum)) {
         if (Test-Path -LiteralPath $path) { throw "Output already exists: $path" }
     }
     $notes = Get-VersionReleaseNotes -ChangelogPath (Join-Path $root 'CHANGELOG.md') -Version $version
@@ -128,13 +129,14 @@ This build is unsigned. Read RELEASE-NOTES.md before use.
         ConvertTo-Json | Set-Content -LiteralPath (Join-Path $stage 'BUILD-INFO.json') -Encoding utf8
     'Portable settings are stored in data/connections.db beside the executable.' |
         Set-Content -LiteralPath (Join-Path $stage 'portable.flag') -Encoding ascii
-    Compress-Archive -LiteralPath $stage -DestinationPath $zip -CompressionLevel Optimal
+    Write-WindowsReleaseArchives -Stage $stage -PortableZip $zip -SourcesZip $sourcesZip
     Invoke-Checked $IsccPath @("/DAppVersion=$version", "/DSourceDir=$stage", "/DOutputDir=$output",
         "/DIconFile=$(Join-Path $root 'crates/desktop/assets/turbodbnote.ico')", (Join-Path $root 'installer/turbodbnote.iss'))
     if (-not (Test-Path -LiteralPath $setup)) { throw 'Installer was not generated' }
-    Write-ReleaseChecksums -Paths @($zip, $setup) -OutputFile $checksum
+    Write-ReleaseChecksums -Paths @($zip, $setup, $sourcesZip) -OutputFile $checksum
     Write-Output "Package: $zip"
     Write-Output "Installer: $setup"
+    Write-Output "Sources: $sourcesZip"
     Write-Output "Checksums: $checksum"
 } finally {
     Pop-Location

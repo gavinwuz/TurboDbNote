@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+- 公开发布 Windows 安装包和独立源码材料 ZIP；绿色 ZIP 排除应用源码目录与 MySQL 源码归档。
+
 ## [0.1.0] - 2026-10-12
 
 TurboDBNote 首个公开版本，提供 Windows 与 Linux x64 包。

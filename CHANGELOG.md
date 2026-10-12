@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Publish the Windows installer and a separate source-material ZIP; exclude application and MySQL source archives from the portable ZIP.
+
 ## [0.1.0] - 2026-10-12
 
 First public release of TurboDBNote for Windows and Linux x64.

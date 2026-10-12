@@ -70,3 +70,5 @@ cargo clippy --locked -j 1 --workspace --all-targets -- -D warnings
 下次发布时，在双语 Unreleased 中补充说明，将功能提交到干净的默认分支，再运行 `./scripts/release.ps1 -Version 0.1.1`（Linux：`python3 scripts/prepare-release.py 0.1.1`）。Actions 仅在两平台验证通过后打包发布；版本标签不可变，不覆盖已有 Release。
 
 采用 [Apache-2.0](LICENSE) 许可，随包第三方组件保留各自许可。
+
+后续 Windows 版本同时发布 Inno Setup 安装包、绿色 ZIP 与 SHA256 校验，详见[发布流程](docs/releasing.zh-CN.md)。当前程序仍未签名。
