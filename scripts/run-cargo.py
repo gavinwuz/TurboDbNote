@@ -13,7 +13,7 @@ def clean(line):
 
 def failure(line):
     summary = clean(line).strip()
-    if re.match(r'(error(?:\[[A-Z0-9]+\])?:|fatal error)', summary, re.I) or re.match(r'test .*FAILED$', summary) or 'panicked at ' in summary:
+    if re.match(r'(error(?:\[[A-Z0-9]+\])?:|fatal error)', summary, re.I) or re.match(r'test .*FAILED$', summary) or 'panicked at ' in summary or summary.startswith('--> '):
         return summary[:600]
     return None
 
