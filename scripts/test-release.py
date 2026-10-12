@@ -15,6 +15,19 @@ spec.loader.exec_module(prepare_release)
 replace_version = prepare_release.replace_version
 
 
+cargo_spec = importlib.util.spec_from_file_location("run_cargo", pathlib.Path(__file__).with_name("run-cargo.py"))
+run_cargo = importlib.util.module_from_spec(cargo_spec)
+cargo_spec.loader.exec_module(run_cargo)
+
+
+class CargoDiagnosticTests(unittest.TestCase):
+    def test_colored_failures_remain_visible_without_sensitive_values(self):
+        self.assertEqual(run_cargo.failure("\x1b[31merror[E0425]: unknown item\x1b[0m"), "error[E0425]: unknown item")
+        self.assertEqual(run_cargo.failure("test example::case ... FAILED"), "test example::case ... FAILED")
+        self.assertIsNone(run_cargo.failure('left: confidential fixture value'))
+        self.assertIsNone(run_cargo.failure('authorization=confidential fixture value'))
+
+
 class ReleaseTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
