@@ -21,7 +21,7 @@ jobs:
       - name: Build and package candidate
         shell: pwsh
         run: |
-          choco install innosetup --version=6.7.3 --yes --no-progress
+          choco install innosetup --version=6.7.1 --yes --no-progress
           if ($LASTEXITCODE -ne 0) { throw 'Inno Setup installation failed' }
           ./scripts/package-windows.ps1 -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
       - uses: actions/upload-artifact@v4
