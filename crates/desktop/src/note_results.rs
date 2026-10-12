@@ -44,6 +44,7 @@ impl TableView {
             parent: String::new(),
         });
         let writable = meta.editable
+            && saved.profile.supports_mutation()
             && !(saved.profile.kind == turbodbn_services::DatabaseKind::Sqlite
                 && saved.profile.sqlite_read_only)
             && !(saved.profile.kind == turbodbn_services::DatabaseKind::MySql
@@ -99,7 +100,10 @@ impl TableView {
         self.busy
     }
     pub(super) fn query_controls(&self) -> bool {
-        if self.target.kind == turbodbn_services::DatabaseKind::Redis {
+        if matches!(
+            self.target.kind,
+            turbodbn_services::DatabaseKind::Redis | turbodbn_services::DatabaseKind::External
+        ) {
             return false;
         }
         self.notebook

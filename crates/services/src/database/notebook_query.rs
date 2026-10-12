@@ -30,12 +30,35 @@ pub struct Guard {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResultPage {
     #[serde(default)]
+    pub execution: Option<Box<ExecutionSummary>>,
+    #[serde(default)]
+    pub affected_rows: Option<u64>,
+    #[serde(default)]
     pub grid: Option<GridSource>,
     pub rows: Rows,
     pub more: bool,
     pub offset: usize,
     pub elapsed_ms: u64,
     pub read_only: bool,
+}
+/// Execution metadata only: never include SQL, credentials or raw server errors.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecutionSummary {
+    pub operation: String,
+    pub status: String,
+    pub affected_rows: Option<u64>,
+    pub matched_rows: Option<u64>,
+    pub changed_rows: Option<u64>,
+    pub elapsed_ms: u64,
+    pub count_source: Option<String>,
+}
+impl ExecutionSummary {
+    pub fn json_rows(&self) -> Rows {
+        Rows {
+            columns: vec!["execution".into()],
+            values: vec![vec![Some(serde_json::to_string(self).unwrap_or_default())]],
+        }
+    }
 }
 fn parse(kind: DatabaseKind, sql: &str) -> Result<Statement, String> {
     if sql.trim().is_empty()
@@ -258,14 +281,28 @@ async fn stamp(
     database: &str,
     o: &Object,
 ) -> Result<Option<String>, String> {
+    if kind == DatabaseKind::MySql {
+        // SHOW TABLES ... LIKE accepts a string literal, not CONVERT(...).
+        // Read the exact object's DDL directly; never interpret wildcards or
+        // depend on sql_mode, database size, or client-side name case folding.
+        let target = workbench::qualified(kind, database, o);
+        return match c.query(&format!("SHOW CREATE TABLE {target}")).await {
+            Ok(rows) => rows
+                .values
+                .first()
+                .and_then(|row| row.get(1))
+                .and_then(Clone::clone)
+                .filter(|ddl| !ddl.is_empty())
+                .map(Some)
+                .ok_or_else(|| "notes.schema_check_invalid".into()),
+            Err(error) if error == crate::mysql::TABLE_MISSING => Ok(None),
+            Err(error) => Err(error),
+        };
+    }
     let literal = workbench::literal_for(kind, &o.name);
     let sql = match kind {
         DatabaseKind::Sqlite => format!(
             "SELECT sql FROM sqlite_schema WHERE name={literal} COLLATE NOCASE AND type IN ('table','view')"
-        ),
-        DatabaseKind::MySql => format!(
-            "SHOW TABLES FROM {} LIKE {literal}",
-            workbench::quote(kind, database)
         ),
         DatabaseKind::PostgreSql => format!(
             "SELECT table_name FROM information_schema.tables WHERE table_schema={} AND table_name={literal}",
@@ -274,14 +311,7 @@ async fn stamp(
         _ => return Err("不支持该数据库类型".into()),
     };
     let rows = c.query(&sql).await?;
-    if rows.values.is_empty()
-        || (kind == DatabaseKind::MySql
-            && !rows.values.iter().any(|row| {
-                row.first()
-                    .and_then(|v| v.as_ref())
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&o.name))
-            }))
-    {
+    if rows.values.is_empty() {
         return Ok(None);
     }
     if kind == DatabaseKind::Sqlite {
@@ -451,6 +481,8 @@ async fn metadata_result(c: &mut impl Access, sql: &str) -> Result<ResultPage, S
         return Err("notes.metadata.limit".into());
     }
     Ok(ResultPage {
+        execution: None,
+        affected_rows: None,
         grid: None,
         rows,
         more: false,
@@ -523,6 +555,8 @@ pub async fn explain(
     }
     rows.values.shrink_to_fit();
     Ok(ResultPage {
+        execution: None,
+        affected_rows: None,
         grid: None,
         rows,
         more: false,
@@ -737,9 +771,41 @@ pub async fn execute(
             })
             .await;
     }
-    let mut rows = result.map_err(|_| {
-        "SQL 执行失败，请检查语法、权限及对象是否存在；写入可能已生效，请勿盲目重试".to_string()
+    let mut rows = result.map_err(|error| {
+        if kind == DatabaseKind::MySql
+            && matches!(
+                error.as_str(),
+                crate::mysql::SQL_SYNTAX_ERROR | crate::mysql::TABLE_MISSING
+            )
+        {
+            error
+        } else {
+            "SQL 执行失败，请检查语法、权限及对象是否存在；写入可能已生效，请勿盲目重试".to_string()
+        }
     })?;
+    // Read the session counter immediately, before metadata queries can replace it.
+    // SQLite changes() retains old DML counts after DDL, so only inspect DML.
+    let affected_rows = if !plan.read_only {
+        let dml = matches!(
+            parse(kind, &plan.sql)?,
+            Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_)
+        );
+        let counter = match kind {
+            DatabaseKind::MySql => Some("SELECT ROW_COUNT()"),
+            DatabaseKind::Sqlite if dml => Some("SELECT changes()"),
+            _ => None,
+        };
+        if let Some(counter) = counter {
+            c.query(counter)
+                .await
+                .ok()
+                .and_then(|r| r.values.first()?.first()?.as_ref()?.parse().ok())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     if rows.columns.len() > 512 {
         return Err("查询结果超过 512 列，请减少选择列".into());
     }
@@ -756,12 +822,28 @@ pub async fn execute(
     } else {
         None
     };
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    let execution = (!plan.read_only).then(|| {
+        Box::new(ExecutionSummary {
+            operation: command_required(kind, &plan.sql)
+                .unwrap_or("command")
+                .to_ascii_uppercase(),
+            status: "succeeded".into(),
+            affected_rows,
+            matched_rows: None,
+            changed_rows: None,
+            elapsed_ms,
+            count_source: affected_rows.map(|_| "session_counter".into()),
+        })
+    });
     Ok(ResultPage {
+        execution,
+        affected_rows,
         grid,
         rows,
         more,
         offset,
-        elapsed_ms: start.elapsed().as_millis() as u64,
+        elapsed_ms,
         read_only: plan.read_only,
     })
 }
@@ -769,6 +851,208 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sqlite_affected_rows_do_not_reuse_previous_dml_for_ddl() {
+        use sqlx::Connection;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut db = sqlx::SqliteConnection::connect("sqlite::memory:")
+                    .await
+                    .unwrap();
+                sqlx::query("CREATE TABLE items (id INTEGER)")
+                    .execute(&mut db)
+                    .await
+                    .unwrap();
+                for (sql, expected) in [
+                    ("INSERT INTO items VALUES (1), (2)", Some(2)),
+                    ("UPDATE items SET id=3 WHERE id=99", Some(0)),
+                    ("UPDATE items SET id=4", Some(2)),
+                    ("ALTER TABLE items ADD COLUMN note TEXT", None),
+                    ("DELETE FROM items WHERE id=4", Some(2)),
+                    ("INSERT INTO items(id) VALUES (5) RETURNING id", Some(1)),
+                ] {
+                    let plan = prepare(&mut db, DatabaseKind::Sqlite, "main", "3", sql)
+                        .await
+                        .unwrap();
+                    let result = execute(
+                        &mut db,
+                        DatabaseKind::Sqlite,
+                        "main",
+                        "3",
+                        &plan,
+                        true,
+                        (0, 20),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(result.affected_rows, expected, "{sql}");
+                    let summary = result.execution.as_ref().unwrap();
+                    assert_eq!(summary.affected_rows, expected);
+                    assert_eq!(summary.elapsed_ms, result.elapsed_ms);
+                    let json: serde_json::Value =
+                        serde_json::from_str(summary.json_rows().values[0][0].as_ref().unwrap())
+                            .unwrap();
+                    assert_eq!(json["status"], "succeeded");
+                    assert!(json["matched_rows"].is_null() && json["changed_rows"].is_null());
+                    assert_eq!(json.get("sql"), None);
+                    if sql.contains("RETURNING") {
+                        assert_eq!(result.rows.values, vec![vec![Some("5".into())]]);
+                    }
+                }
+            });
+    }
+    #[tokio::test]
+    async fn mysql_write_preflight_uses_exact_ddl_and_keeps_confirmation_and_stale_guards() {
+        struct Db {
+            ddl: Option<String>,
+            error: Option<String>,
+            calls: Vec<String>,
+        }
+        impl Access for Db {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                self.calls.push(sql.into());
+                Box::pin(async move {
+                    if sql.starts_with("SHOW CREATE TABLE ") {
+                        if let Some(error) = &self.error {
+                            return Err(error.clone());
+                        }
+                        return self
+                            .ddl
+                            .as_ref()
+                            .map(|ddl| Rows {
+                                columns: vec!["Table".into(), "Create Table".into()],
+                                values: vec![vec![Some("name".into()), Some(ddl.clone())]],
+                            })
+                            .ok_or_else(|| crate::mysql::TABLE_MISSING.into());
+                    }
+                    if sql == "SELECT ROW_COUNT()" {
+                        return Ok(Rows {
+                            columns: vec!["ROW_COUNT()".into()],
+                            values: vec![vec![Some("0".into())]],
+                        });
+                    }
+                    if sql.starts_with("SHOW TABLES") {
+                        return Err(crate::mysql::SQL_SYNTAX_ERROR.into());
+                    }
+                    Ok(Rows::default())
+                })
+            }
+        }
+        for version in ["4.0.30", "5.5.62", "8.0.32"] {
+            let sql = "ALTER TABLE `items_%'``x` ADD COLUMN label VARCHAR(40) DEFAULT 'a;b'";
+            let mut db = Db {
+                ddl: Some("CREATE TABLE original".into()),
+                error: None,
+                calls: vec![],
+            };
+            let plan = prepare(&mut db, DatabaseKind::MySql, "fixture", version, sql)
+                .await
+                .unwrap();
+            assert_eq!(db.calls, vec!["SHOW CREATE TABLE `fixture`.`items_%'``x`"]);
+            assert_eq!(plan.sql, sql);
+            assert!(plan.confirm && !plan.read_only);
+            db.calls.clear();
+            assert!(
+                execute(
+                    &mut db,
+                    DatabaseKind::MySql,
+                    "fixture",
+                    version,
+                    &plan,
+                    false,
+                    (0, 20)
+                )
+                .await
+                .is_err()
+            );
+            assert!(db.calls.is_empty());
+            db.ddl = Some("CREATE TABLE changed".into());
+            assert!(
+                execute(
+                    &mut db,
+                    DatabaseKind::MySql,
+                    "fixture",
+                    version,
+                    &plan,
+                    true,
+                    (0, 20)
+                )
+                .await
+                .is_err()
+            );
+            assert!(!db.calls.iter().any(|s| s == sql));
+            db.ddl = Some("CREATE TABLE original".into());
+            db.calls.clear();
+            let result = execute(
+                &mut db,
+                DatabaseKind::MySql,
+                "fixture",
+                version,
+                &plan,
+                true,
+                (0, 20),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.affected_rows, Some(0));
+            assert_eq!(
+                db.calls,
+                vec![
+                    "SHOW CREATE TABLE `fixture`.`items_%'``x`",
+                    sql,
+                    "SELECT ROW_COUNT()"
+                ]
+            );
+            for error in [
+                crate::mysql::SQL_SYNTAX_ERROR,
+                "permission denied",
+                "network failed",
+            ] {
+                db.error = Some(error.into());
+                assert_eq!(
+                    prepare(&mut db, DatabaseKind::MySql, "fixture", version, sql)
+                        .await
+                        .err()
+                        .unwrap(),
+                    error
+                );
+            }
+            db.error = None;
+            db.ddl = None;
+            let create = "CREATE TABLE fresh(id INT)";
+            let plan = prepare(&mut db, DatabaseKind::MySql, "fixture", version, create)
+                .await
+                .unwrap();
+            assert!(plan.guards[0].stamp.is_none());
+            db.ddl = Some("CREATE TABLE created_elsewhere".into());
+            db.calls.clear();
+            assert!(
+                execute(
+                    &mut db,
+                    DatabaseKind::MySql,
+                    "fixture",
+                    version,
+                    &plan,
+                    true,
+                    (0, 20)
+                )
+                .await
+                .is_err()
+            );
+            assert!(!db.calls.iter().any(|s| s == create));
+            db.ddl = Some(String::new());
+            assert_eq!(
+                prepare(&mut db, DatabaseKind::MySql, "fixture", version, sql)
+                    .await
+                    .err()
+                    .unwrap(),
+                "notes.schema_check_invalid"
+            );
+        }
+    }
     #[test]
     fn mysql_show_metadata_preserves_comments_without_pagination() {
         struct Capture(Vec<String>);

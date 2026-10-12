@@ -17,7 +17,7 @@ pub(crate) struct Connection {
 }
 impl Connection {
     pub(crate) fn database_label(&self) -> String {
-        if self.profile.kind == DatabaseKind::Sqlite {
+        if self.profile.is_file_database() {
             std::path::Path::new(&self.profile.sqlite_path)
                 .file_name()
                 .unwrap_or_default()
@@ -46,6 +46,14 @@ struct TransferView {
     mode: Mode,
     export_flow: bool,
     source_charset: String,
+    collation: Entity<InputState>,
+    target_databases: Vec<String>,
+    source_databases: Vec<String>,
+    source_catalog_task: Option<Task<()>>,
+    source_catalog_sequence: usize,
+    catalog_sequence: usize,
+    permissions: transfer::ReadPermissions,
+    target_catalog_task: Option<Task<()>>,
     log_id: Uuid,
     log_started: std::time::Instant,
     log_progress: std::time::Instant,
@@ -65,6 +73,8 @@ struct TransferView {
     options: Options,
     batch: Entity<InputState>,
     table_filter: Entity<InputState>,
+    table_scroll: ScrollHandle,
+    dialog_scroll: ScrollHandle,
     sample_table: Option<String>,
     preview_file: Option<Arc<tempfile::NamedTempFile>>,
     schema: bool,
@@ -137,10 +147,12 @@ impl DatabaseView {
         let Some(profile) = self.profiles.iter().find(|p| p.id == id) else {
             return;
         };
-        if !matches!(
-            profile.kind,
-            DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
-        ) {
+        if profile.driver_id == "doris"
+            || !matches!(
+                profile.kind,
+                DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+            )
+        {
             feedback::error(crate::locale::t(cx, "transfer.unsupported"), cx);
             return;
         }
@@ -154,10 +166,6 @@ impl DatabaseView {
         let owner = cx.entity().downgrade();
         let view =
             cx.new(|cx| TransferView::new(mode, choices, current, database, owner, window, cx));
-        if mode == Mode::Copy && profile.kind != DatabaseKind::Sqlite {
-            let preview = view.clone();
-            cx.defer(move |cx| preview.update(cx, |this, cx| this.preview(cx)));
-        }
         let observer = std::rc::Rc::new(cx.observe(&view, |_, _, cx| cx.refresh_windows()));
         window.open_dialog(cx, move |dialog, _, cx| {
             let _keep = &observer;
@@ -169,21 +177,45 @@ impl DatabaseView {
                 .overlay_closable(false)
                 .close_button(!running)
                 .keyboard(!running)
-                .child(
+                .child({
+                    let scroll = view.read(cx).dialog_scroll.clone();
                     div()
-                        .id("transfer-window-scroll")
+                        .relative()
                         .max_h(px(560.))
-                        .overflow_y_scroll()
-                        .child(view.clone()),
-                )
+                        .child(
+                            div()
+                                .id("transfer-window-scroll")
+                                .max_h(px(560.))
+                                .pr_4()
+                                .track_scroll(&scroll)
+                                .overflow_y_scroll()
+                                .child(view.clone()),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .bottom_0()
+                                .w(px(14.))
+                                .child(
+                                    gpui_component::scroll::Scrollbar::vertical(&scroll)
+                                        .scrollbar_show(
+                                            gpui_component::scroll::ScrollbarShow::Always,
+                                        ),
+                                ),
+                        )
+                })
                 .footer(move |_, _, _, cx| {
                     let running = buttons.read(cx).running;
-                    let disabled = (buttons.read(cx).mode != Mode::Export
-                        && buttons.read(cx).reviewed.as_ref()
-                            != Some(&buttons.read(cx).signature(cx)))
-                        || running
+                    let disabled = running
                         || buttons.read(cx).previewing
                         || buttons.read(cx).catalog_task.is_some()
+                        || (buttons.read(cx).schema
+                            && buttons
+                                .read(cx)
+                                .permissions
+                                .blocks(&buttons.read(cx).options))
                         || buttons.read(cx).result.is_some();
                     let cancel = buttons.clone();
                     let start = buttons.clone();
@@ -265,13 +297,18 @@ impl TransferView {
         let file = cx.new(|cx| InputState::new(window, cx));
         let batch = cx.new(|cx| InputState::new(window, cx).default_value("1000"));
         let table_filter = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(crate::locale::t(cx, "transfer.filter_tables"))
+            InputState::new(window, cx).placeholder(crate::locale::t(cx, "transfer.filter_objects"))
+        });
+        let collation = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::locale::t(cx, "transfer.collation_default"))
         });
         let mut subscriptions = [
             source_db.clone(),
             target_db.clone(),
             file.clone(),
             batch.clone(),
+            collation.clone(),
         ]
         .into_iter()
         .map(|input| {
@@ -291,12 +328,28 @@ impl TransferView {
                 this.load_catalog(cx);
             }
         }));
-        cx.defer_in(window, |this, _, cx| this.load_catalog(cx));
+        cx.defer_in(window, |this, _, cx| {
+            this.load_catalog(cx);
+            this.load_source_databases(cx);
+            if this.mode == Mode::ImportConnection
+                && this.choices[this.target].profile.kind != DatabaseKind::Sqlite
+            {
+                this.load_target_databases(cx);
+            }
+        });
         Self {
             owner,
             mode,
             export_flow: mode == Mode::Export,
             source_charset: String::new(),
+            target_databases: Vec::new(),
+            source_databases: Vec::new(),
+            source_catalog_task: None,
+            source_catalog_sequence: 0,
+            catalog_sequence: 0,
+            permissions: transfer::ReadPermissions::default(),
+            target_catalog_task: None,
+            collation,
             log_id: Uuid::new_v4(),
             log_started: std::time::Instant::now(),
             log_progress: std::time::Instant::now(),
@@ -329,6 +382,8 @@ impl TransferView {
             },
             batch,
             table_filter,
+            table_scroll: ScrollHandle::new(),
+            dialog_scroll: ScrollHandle::new(),
             sample_table: None,
             preview_file: None,
             schema: true,
@@ -345,10 +400,13 @@ impl TransferView {
     }
     fn load_catalog(&mut self, cx: &mut Context<Self>) {
         self.catalog_control.cancel();
+        self.catalog_sequence += 1;
+        let sequence = self.catalog_sequence;
         self.catalog_task = None;
         self.catalog.clear();
         self.catalog_error = false;
         self.catalog_notice.clear();
+        self.permissions = transfer::ReadPermissions::default();
         self.options.excluded_objects.clear();
         if self.mode == Mode::ImportFile {
             return;
@@ -371,12 +429,17 @@ impl TransferView {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    saved
-                        .endpoint(requested)
-                        .and_then(|endpoint| transfer::catalog(&endpoint, &control))
+                    saved.endpoint(requested).and_then(|endpoint| {
+                        let (preview, notice) = transfer::catalog(&endpoint, &control)?;
+                        let permissions = transfer::read_permissions(&endpoint, &preview, &control);
+                        Ok((preview, notice, permissions))
+                    })
                 })
                 .await;
             let _ = view.update(cx, |this, cx| {
+                if this.catalog_sequence != sequence {
+                    return;
+                }
                 this.catalog_task = None;
                 if this.source != source
                     || this.source_db.read(cx).value().trim() != database
@@ -389,7 +452,8 @@ impl TransferView {
                     return;
                 }
                 match result {
-                    Ok((preview, notice)) => {
+                    Ok((preview, notice, permissions)) => {
+                        this.permissions = permissions;
                         // Metadata failures are advisory: keep Execute available and let the
                         // user opt out of unreadable categories; never silently omit objects.
                         this.catalog_notice = notice;
@@ -444,6 +508,7 @@ impl TransferView {
         }
         record.elapsed_ms = self.log_started.elapsed().as_millis() as u64;
         record.rows = self.progress.rows;
+        record.context = self.choices[self.source].profile.name.clone();
         record.bytes = self.progress.bytes;
         if let Some(error) = error {
             record.failure = crate::operation_log::failure_class(error);
@@ -456,6 +521,11 @@ impl TransferView {
     }
     fn destination(&mut self, mode: Mode, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = mode;
+        if mode == Mode::ImportConnection
+            && self.choices[self.target].profile.kind != DatabaseKind::Sqlite
+        {
+            self.load_target_databases(cx);
+        }
         self.reviewed = None;
         self.result = None;
         self.schema = mode != Mode::ImportConnection;
@@ -502,6 +572,7 @@ impl TransferView {
             self.target,
             self.source_db.read(cx).value().as_str(),
             self.target_db.read(cx).value().as_str(),
+            self.collation.read(cx).value().as_str(),
             self.file.read(cx).value().as_str(),
             self.schema,
             self.data,
@@ -525,6 +596,78 @@ impl TransferView {
             }
         })
         .detach();
+    }
+    fn load_source_databases(&mut self, cx: &mut Context<Self>) {
+        self.source_databases.clear();
+        self.source_catalog_sequence += 1;
+        let sequence = self.source_catalog_sequence;
+        if self.choices[self.source].profile.kind == DatabaseKind::Sqlite {
+            return;
+        }
+        let index = self.source;
+        let saved = self.choices[index].clone();
+        let snapshot = saved.clone();
+        self.source_catalog_task = Some(cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let database = saved.database_label();
+                    saved
+                        .endpoint(database)
+                        .and_then(|endpoint| transfer::database_names(&endpoint))
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.source_catalog_sequence != sequence
+                    || this.source != index
+                    || this
+                        .owner
+                        .upgrade()
+                        .is_none_or(|owner| !owner.read(cx).connection_snapshot_current(&snapshot))
+                {
+                    return;
+                }
+                this.source_catalog_task = None;
+                match result {
+                    Ok(names) => this.source_databases = names,
+                    Err(error) => feedback::error(error, cx),
+                }
+                cx.notify();
+            });
+        }));
+    }
+    fn load_target_databases(&mut self, cx: &mut Context<Self>) {
+        self.target_databases.clear();
+        let index = self.target;
+        let saved = self.choices[index].clone();
+        let snapshot = saved.clone();
+        let database = saved.database_label();
+        self.target_catalog_task = Some(cx.spawn(async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    saved
+                        .endpoint(database)
+                        .and_then(|endpoint| transfer::database_names(&endpoint))
+                })
+                .await;
+            let _ = view.update(cx, |this, cx| {
+                if this.target != index
+                    || this
+                        .owner
+                        .upgrade()
+                        .is_none_or(|owner| !owner.read(cx).connection_snapshot_current(&snapshot))
+                {
+                    return;
+                }
+                this.target_catalog_task = None;
+                match result {
+                    Ok(names) => this.target_databases = names,
+                    Err(error) => feedback::error(error, cx),
+                }
+                cx.notify();
+            });
+        }));
     }
     fn connection_picker(&self, source: bool, cx: &Context<Self>) -> AnyElement {
         let selected = if source { self.source } else { self.target };
@@ -552,6 +695,7 @@ impl TransferView {
                         view.update(cx, |this, cx| {
                             if source {
                                 this.source = index;
+                                this.load_source_databases(cx);
                                 this.preview = Preview::default();
                                 this.options.tables = None;
                                 this.sample_table = None;
@@ -560,6 +704,12 @@ impl TransferView {
                                     .update(cx, |input, cx| input.set_value(value, window, cx));
                             } else {
                                 this.target = index;
+                                this.target_databases.clear();
+                                if this.mode == Mode::ImportConnection
+                                    && this.choices[index].profile.kind != DatabaseKind::Sqlite
+                                {
+                                    this.load_target_databases(cx);
+                                }
                                 if this.mode != Mode::Copy {
                                     let value = this.choices[index].database_label();
                                     this.target_db
@@ -799,10 +949,11 @@ impl TransferView {
         cx.notify();
     }
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.running
-            || self.previewing
-            || (self.mode != Mode::Export && self.reviewed.as_ref() != Some(&self.signature(cx)))
-        {
+        if self.running || self.previewing {
+            return;
+        }
+        if self.schema && self.permissions.blocks(&self.options) {
+            feedback::error(crate::locale::t(cx, "transfer.permission_selected"), cx);
             return;
         }
         if matches!(self.mode, Mode::Export | Mode::ImportFile)
@@ -955,18 +1106,26 @@ impl TransferView {
         let target = self.choices[self.target].clone();
         let source_db = self.source_db.read(cx).value().trim().to_string();
         let target_db = self.target_db.read(cx).value().trim().to_string();
-        let frozen = self.preview_file.clone();
+        let frozen = if self.reviewed.as_ref() == Some(&self.signature(cx)) {
+            self.preview_file.clone()
+        } else {
+            None
+        };
         let file = if self.mode == Mode::ImportFile {
-            let Some(file) = &frozen else {
-                return;
-            };
-            file.path().to_path_buf()
+            frozen
+                .as_ref()
+                .map(|file| file.path().to_path_buf())
+                .unwrap_or_else(|| PathBuf::from(self.file.read(cx).value().as_str()))
         } else {
             PathBuf::from(self.file.read(cx).value().as_str())
         };
         let mode = self.mode;
         let mut options = self.options.clone();
         options.batch_size = self.batch.read(cx).value().parse().unwrap_or(1000);
+        options.collation = (self.mode == Mode::Copy
+            && self.choices[self.target].profile.kind == DatabaseKind::MySql)
+            .then(|| self.collation.read(cx).value().trim().to_string())
+            .filter(|s| !s.is_empty());
         let contents = Contents {
             schema: self.schema,
             data: self.data,
@@ -1216,7 +1375,7 @@ impl TransferView {
                                 },
                             )
                             .to_string(),
-                            Err(error) => error.clone(),
+                            Err(_) => crate::locale::t(cx, "transfer.failed").to_string(),
                         }),
                 )
             })
@@ -1328,7 +1487,83 @@ impl Render for TransferView {
                     ));
                 }
             } else {
-                left = left.child(Input::new(&self.source_db).cleanable(true).disabled(locked));
+                let mut names = self.source_databases.clone();
+                if let Some(owner) = self.owner.upgrade()
+                    && let Some(info) = owner
+                        .read(cx)
+                        .info
+                        .get(&self.choices[self.source].profile.id)
+                {
+                    for name in &info.databases {
+                        if !names.contains(name) {
+                            names.push(name.clone());
+                        }
+                    }
+                }
+                let selected = self.source_db.read(cx).value().to_string();
+                let search = if names.contains(&selected) {
+                    String::new()
+                } else {
+                    selected.to_lowercase()
+                };
+                let owner = cx.entity().downgrade();
+                left =
+                    left.child(crate::locale::t(cx, "transfer.source_database_picker"))
+                        .child(
+                            div()
+                                .h_flex()
+                                .gap_2()
+                                .child(
+                                    Input::new(&self.source_db)
+                                        .cleanable(true)
+                                        .disabled(locked)
+                                        .flex_1(),
+                                )
+                                .child(
+                                    Button::new("source-database-list")
+                                        .ghost()
+                                        .icon(IconName::ChevronDown)
+                                        .disabled(locked)
+                                        .dropdown_menu(move |mut menu, _, _| {
+                                            for name in names.iter().filter(|name| {
+                                                search.is_empty()
+                                                    || name.to_lowercase().contains(&search)
+                                            }) {
+                                                let owner = owner.clone();
+                                                let name = name.clone();
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(name.clone()).on_click(
+                                                        move |_, window, cx| {
+                                                            let _ = owner.update(cx, |this, cx| {
+                                                                this.source_db.update(
+                                                                    cx,
+                                                                    |input, cx| {
+                                                                        input.set_value(
+                                                                            name.clone(),
+                                                                            window,
+                                                                            cx,
+                                                                        )
+                                                                    },
+                                                                )
+                                                            });
+                                                        },
+                                                    ),
+                                                );
+                                            }
+                                            menu.scrollable(true).max_h(px(320.))
+                                        }),
+                                )
+                                .child(
+                                    Button::new("refresh-source-databases")
+                                        .ghost()
+                                        .icon(crate::assets::refresh_icon())
+                                        .disabled(locked || self.source_catalog_task.is_some())
+                                        .tooltip(crate::locale::t(cx, "dbwork.refresh"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.load_source_databases(cx)
+                                        })),
+                                ),
+                        );
             }
         }
         let mut right = div().v_flex().gap_2().flex_1().min_w_0();
@@ -1356,6 +1591,60 @@ impl Render for TransferView {
                                     .disabled(locked)
                                     .flex_1(),
                             )
+                            .when(self.mode == Mode::ImportConnection && !sqlite, |el| {
+                                let mut names = self
+                                    .owner
+                                    .upgrade()
+                                    .and_then(|owner| {
+                                        owner
+                                            .read(cx)
+                                            .info
+                                            .get(&self.choices[self.target].profile.id)
+                                            .map(|info| info.databases.clone())
+                                    })
+                                    .unwrap_or_default();
+                                for name in &self.target_databases {
+                                    if !names.contains(name) {
+                                        names.push(name.clone());
+                                    }
+                                }
+                                el.child(
+                                    Button::new("target-database-list")
+                                        .ghost()
+                                        .icon(IconName::ChevronDown)
+                                        .tooltip(crate::locale::t(cx, "transfer.database"))
+                                        .disabled(locked)
+                                        .dropdown_menu({
+                                            let owner = cx.entity().downgrade();
+                                            move |mut menu, _, _| {
+                                                for name in &names {
+                                                    let owner = owner.clone();
+                                                    let name = name.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(name.clone()).on_click(
+                                                            move |_, window, cx| {
+                                                                let _ =
+                                                                    owner.update(cx, |this, cx| {
+                                                                        this.target_db.update(
+                                                                            cx,
+                                                                            |input, cx| {
+                                                                                input.set_value(
+                                                                                    name.clone(),
+                                                                                    window,
+                                                                                    cx,
+                                                                                )
+                                                                            },
+                                                                        );
+                                                                    });
+                                                            },
+                                                        ),
+                                                    );
+                                                }
+                                                menu.scrollable(true).max_h(px(320.))
+                                            }
+                                        }),
+                                )
+                            })
                             .when(sqlite && self.mode == Mode::Copy, |el| {
                                 el.child(
                                     Button::new("new-sqlite-target")
@@ -1369,6 +1658,58 @@ impl Render for TransferView {
                     );
             } else {
                 right = right.child(self.choices[self.target].database_label());
+            }
+            if self.mode == Mode::Copy && kind == DatabaseKind::MySql && !legacy {
+                right = right
+                    .child(crate::locale::t(cx, "transfer.collation"))
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .child(
+                                Input::new(&self.collation)
+                                    .cleanable(true)
+                                    .disabled(locked)
+                                    .flex_1(),
+                            )
+                            .child(
+                                Button::new("collation-presets")
+                                    .ghost()
+                                    .icon(IconName::ChevronDown)
+                                    .disabled(locked)
+                                    .dropdown_menu({
+                                        let owner = cx.entity().downgrade();
+                                        move |mut menu, _, _| {
+                                            for value in [
+                                                "utf8mb4_general_ci",
+                                                "utf8mb4_unicode_ci",
+                                                "utf8mb4_bin",
+                                                "utf8_general_ci",
+                                                "utf8_unicode_ci",
+                                                "utf8_bin",
+                                            ] {
+                                                let owner = owner.clone();
+                                                menu =
+                                                    menu.item(PopupMenuItem::new(value).on_click(
+                                                        move |_, window, cx| {
+                                                            let _ = owner.update(cx, |this, cx| {
+                                                                this.collation.update(
+                                                                    cx,
+                                                                    |input, cx| {
+                                                                        input.set_value(
+                                                                            value, window, cx,
+                                                                        )
+                                                                    },
+                                                                )
+                                                            });
+                                                        },
+                                                    ));
+                                            }
+                                            menu
+                                        }
+                                    }),
+                            ),
+                    );
             }
             if self.mode == Mode::Copy && !sqlite {
                 right = right.child(
@@ -1463,7 +1804,7 @@ impl Render for TransferView {
             );
         }
         if !file_import {
-            let mut params = div()
+            let params = div()
                 .h_flex()
                 .flex_wrap()
                 .gap_3()
@@ -1493,49 +1834,6 @@ impl Render for TransferView {
                             cx.notify();
                         })),
                 );
-            for (index, label, checked) in [
-                (0, "transfer.objects.views", self.options.views),
-                (1, "transfer.objects.triggers", self.options.triggers),
-                (2, "transfer.objects.routines", self.options.routines),
-                (3, "transfer.objects.events", self.options.events),
-            ] {
-                let supported = if sqlite {
-                    index < 2
-                } else {
-                    kind == DatabaseKind::MySql && !legacy && self.mode == Mode::Export
-                };
-                params = params.child(
-                    gpui_component::checkbox::Checkbox::new((
-                        "transfer-object-kind",
-                        index as usize,
-                    ))
-                    .label(crate::locale::t(cx, label))
-                    .checked(
-                        checked
-                            && self.schema
-                            && ((index != 0 && !(index == 2 && kind == DatabaseKind::PostgreSql))
-                                || self.options.tables.is_none()),
-                    )
-                    .disabled(
-                        locked
-                            || !self.schema
-                            || !supported
-                            || (index == 0 && self.options.tables.is_some()),
-                    )
-                    .on_click(cx.listener(
-                        move |this, value: &bool, _, cx| {
-                            match index {
-                                0 => this.options.views = *value,
-                                1 => this.options.triggers = *value,
-                                2 => this.options.routines = *value,
-                                _ => this.options.events = *value,
-                            };
-                            this.reviewed = None;
-                            cx.notify();
-                        },
-                    )),
-                );
-            }
             body = body.child(params);
             if self.data {
                 let mode_label = match self.options.write_mode {
@@ -1598,16 +1896,24 @@ impl Render for TransferView {
                         .child(crate::locale::t(cx, "transfer.page_backup")),
                 );
             }
+            body = body.child(Input::new(&self.table_filter).cleanable(true));
             let tables = self
                 .catalog
                 .iter()
                 .filter(|o| o.kind == "table")
                 .map(|o| o.name.clone())
                 .collect::<Vec<_>>();
-            if !tables.is_empty() && !legacy {
+            let table_query = self.table_filter.read(cx).value().to_lowercase();
+            if !tables.is_empty()
+                && !legacy
+                && tables
+                    .iter()
+                    .any(|name| name.to_lowercase().contains(&table_query))
+            {
                 let all = tables.clone();
                 let query = self.table_filter.read(cx).value().to_lowercase();
-                let mut list = div().v_flex();
+                let folded = self.folded_objects.contains("table") && query.is_empty();
+                let mut list = div().v_flex().pl_16();
                 for (index, name) in tables
                     .iter()
                     .enumerate()
@@ -1661,10 +1967,29 @@ impl Render for TransferView {
                     .child(
                         div()
                             .h_flex()
-                            .gap_3()
+                            .gap_2()
+                            .child(
+                                Button::new("fold-transfer-tables")
+                                    .ghost()
+                                    .icon(if folded {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if !this.folded_objects.remove("table") {
+                                            this.folded_objects.insert("table".into());
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
                             .child(
                                 gpui_component::checkbox::Checkbox::new("all-transfer-tables")
-                                    .label(crate::locale::t(cx, "transfer.all_tables"))
+                                    .label(format!(
+                                        "{} ({})",
+                                        crate::locale::t(cx, "transfer.objects.tables"),
+                                        tables.len()
+                                    ))
                                     .checked(self.options.tables.is_none())
                                     .disabled(locked)
                                     .on_click(cx.listener(|this, value, _, cx| {
@@ -1673,16 +1998,46 @@ impl Render for TransferView {
                                         this.reviewed = None;
                                         cx.notify();
                                     })),
-                            )
-                            .child(Input::new(&self.table_filter).cleanable(true).flex_1()),
+                            ),
                     )
-                    .child(
-                        div()
-                            .id("transfer-tables")
-                            .max_h(px(110.))
-                            .overflow_scrollbar()
-                            .child(list),
-                    );
+                    .when(!folded, |el| {
+                        el.child(
+                            div()
+                                .relative()
+                                .h(px((tables
+                                    .iter()
+                                    .filter(|name| name.to_lowercase().contains(&query))
+                                    .count()
+                                    .min(6)
+                                    * 28) as f32))
+                                .min_h_0()
+                                .child(
+                                    div()
+                                        .id("transfer-tables")
+                                        .size_full()
+                                        .pr_4()
+                                        .track_scroll(&self.table_scroll)
+                                        .overflow_y_scroll()
+                                        .child(list),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .top_0()
+                                        .right_0()
+                                        .bottom_0()
+                                        .w(px(14.))
+                                        .child(
+                                            gpui_component::scroll::Scrollbar::vertical(
+                                                &self.table_scroll,
+                                            )
+                                            .scrollbar_show(
+                                                gpui_component::scroll::ScrollbarShow::Always,
+                                            ),
+                                        ),
+                                ),
+                        )
+                    });
             }
         }
         if !file_import {
@@ -1692,6 +2047,7 @@ impl Render for TransferView {
                 ("routine", "transfer.objects.routines"),
                 ("event", "transfer.objects.events"),
             ] {
+                let query = self.table_filter.read(cx).value().to_lowercase();
                 let names = self
                     .catalog
                     .iter()
@@ -1702,10 +2058,16 @@ impl Render for TransferView {
                     })
                     .map(|o| (o.kind.clone(), o.name.clone()))
                     .collect::<Vec<_>>();
-                if names.is_empty() {
+                let total = names.len();
+                let names = names
+                    .into_iter()
+                    .filter(|(_, name)| name.to_lowercase().contains(&query))
+                    .collect::<Vec<_>>();
+                if names.is_empty() && !query.is_empty() {
                     continue;
                 }
-                let folded = self.folded_objects.contains(group);
+                let folded = self.folded_objects.contains(group) && query.is_empty();
+                let group_denied = self.permissions.denied(group);
                 let checked = match group {
                     "view" => self.options.views,
                     "trigger" => self.options.triggers,
@@ -1713,7 +2075,12 @@ impl Render for TransferView {
                     _ => self.options.events,
                 };
                 let supported = sqlite && matches!(group, "view" | "trigger")
-                    || kind == DatabaseKind::MySql && !legacy && self.mode == Mode::Export;
+                    || kind == DatabaseKind::MySql
+                        && !legacy
+                        && matches!(
+                            self.mode,
+                            Mode::Export | Mode::Copy | Mode::ImportConnection
+                        );
                 body = body.child(
                     div()
                         .h_flex()
@@ -1737,11 +2104,12 @@ impl Render for TransferView {
                             gpui_component::checkbox::Checkbox::new(SharedString::from(format!(
                                 "object-group-{group}"
                             )))
-                            .label(format!("{} ({})", crate::locale::t(cx, label), names.len()))
+                            .label(format!("{} ({})", crate::locale::t(cx, label), total))
                             .checked(checked && self.schema)
                             .disabled(
                                 locked
                                     || !supported
+                                    || group_denied
                                     || !self.schema
                                     || (group == "view" && self.options.tables.is_some()),
                             )
@@ -1775,13 +2143,31 @@ impl Render for TransferView {
                                     .map(|index| {
                                         let object = names[index].clone();
                                         let selected = checked && !exclusions.contains(&object);
-                                        gpui_component::checkbox::Checkbox::new((
-                                            "export-object",
-                                            index,
+                                        gpui_component::checkbox::Checkbox::new(SharedString::from(
+                                            format!("export-object-{group}-{index}"),
                                         ))
                                         .label(object.1.clone())
+                                        .tooltip(move |window, cx| {
+                                            gpui_component::tooltip::Tooltip::new(crate::locale::t(
+                                                cx,
+                                                if group_denied {
+                                                    "transfer.permission_denied"
+                                                } else if !individual {
+                                                    "transfer.type_selection_only"
+                                                } else {
+                                                    "transfer.permission_advisory"
+                                                },
+                                            ))
+                                            .build(window, cx)
+                                        })
                                         .checked(selected)
-                                        .disabled(locked || !individual || !checked || !supported)
+                                        .disabled(
+                                            locked
+                                                || !individual
+                                                || !checked
+                                                || !supported
+                                                || group_denied,
+                                        )
                                         .on_click(cx.listener(move |this, value: &bool, _, cx| {
                                             this.options.excluded_objects.retain(|o| o != &object);
                                             if !*value {
@@ -1796,9 +2182,78 @@ impl Render for TransferView {
                             }),
                         )
                         .h(px((count.min(4) * 28) as f32))
-                        .ml_6(),
+                        .ml_16(),
                     );
                 }
+            }
+            if self
+                .permissions
+                .0
+                .values()
+                .any(|p| *p == transfer::ReadPermission::Denied)
+            {
+                let types = [
+                    ("view", "transfer.objects.views"),
+                    ("trigger", "transfer.objects.triggers"),
+                    ("routine", "transfer.objects.routines"),
+                    ("event", "transfer.objects.events"),
+                ]
+                .into_iter()
+                .filter(|(kind, _)| self.permissions.denied(kind))
+                .map(|(_, key)| crate::locale::t(cx, key).to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+                body =
+                    body.child(div().text_sm().text_color(cx.theme().warning).child(
+                        crate::locale::tr(
+                            cx,
+                            "transfer.permission_denied_types",
+                            &[("types", &types)],
+                        ),
+                    ))
+                    .child(
+                        Button::new("remove-denied-transfer-objects")
+                            .icon(IconName::Close)
+                            .label(crate::locale::t(cx, "transfer.permission_remove"))
+                            .disabled(locked)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                for kind in ["view", "trigger", "routine", "event"] {
+                                    if this.permissions.denied(kind) {
+                                        match kind {
+                                            "view" => this.options.views = false,
+                                            "trigger" => this.options.triggers = false,
+                                            "routine" => this.options.routines = false,
+                                            _ => this.options.events = false,
+                                        }
+                                    }
+                                }
+                                this.reviewed = None;
+                                cx.notify();
+                            })),
+                    );
+            }
+            if self
+                .permissions
+                .0
+                .values()
+                .any(|permission| *permission == transfer::ReadPermission::Unknown)
+            {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(crate::locale::t(cx, "transfer.permission_unknown")),
+                );
+            }
+            if !self.permissions.0.is_empty() {
+                body = body.child(
+                    Button::new("recheck-transfer-permissions")
+                        .ghost()
+                        .icon(crate::assets::refresh_icon())
+                        .label(crate::locale::t(cx, "transfer.permission_recheck"))
+                        .disabled(locked || self.catalog_task.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.load_catalog(cx))),
+                );
             }
             if !self.catalog_notice.is_empty() {
                 body = body.child(
@@ -1834,13 +2289,15 @@ impl Render for TransferView {
                         },
                     )),
             )
-            .child(
-                Button::new("transfer-preview")
-                    .icon(IconName::Search)
-                    .label(crate::locale::t(cx, "transfer.preview"))
-                    .disabled(locked || self.catalog_task.is_some())
-                    .on_click(cx.listener(|this, _, _, cx| this.preview(cx))),
-            )
+            .when(file_import, |el| {
+                el.child(
+                    Button::new("preview-input-file")
+                        .icon(IconName::Search)
+                        .label(crate::locale::t(cx, "transfer.preview"))
+                        .disabled(locked)
+                        .on_click(cx.listener(|this, _, _, cx| this.preview(cx))),
+                )
+            })
             .when(!self.preview.columns.is_empty(), |el| {
                 el.child(self.render_preview(cx))
             });

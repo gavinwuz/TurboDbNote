@@ -106,6 +106,9 @@ fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 fn supported(p: &Profile) -> Result<(), String> {
+    if p.driver_id == "doris" {
+        return Err("drivers.operation_unsupported".into());
+    }
     if matches!(
         p.kind,
         DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
@@ -117,6 +120,21 @@ fn supported(p: &Profile) -> Result<(), String> {
 }
 
 /// Validate the same transports used by execution, without changing server state.
+pub fn database_names(endpoint: &Endpoint) -> Result<Vec<String>, String> {
+    let mut endpoint = Endpoint {
+        profile: endpoint.profile.clone(),
+        password: endpoint.password.clone(),
+    };
+    endpoint.profile.list_all_databases = true;
+    match service_operation(
+        &endpoint,
+        crate::database::OperationKind::Databases,
+        &Control::default(),
+    )? {
+        crate::database::OperationResult::Databases(names) => Ok(names),
+        _ => Err("无法读取目标数据库目录".into()),
+    }
+}
 pub fn preflight(
     source: &Endpoint,
     target: Option<&Endpoint>,
@@ -413,7 +431,7 @@ impl Job {
                     staged.path(),
                     self.contents,
                     &self.options,
-                    true,
+                    false,
                     &control,
                     tx,
                 )?;
@@ -481,13 +499,29 @@ impl Job {
                 {
                     return Err("无法读取源库字符集与排序规则".into());
                 }
+                if let Some(collation) = &self.options.collation {
+                    let name =
+                        crate::database::workbench::literal_for(DatabaseKind::MySql, collation);
+                    let support = query(
+                        target,
+                        &format!(
+                            "SELECT CHARACTER_SET_NAME FROM information_schema.COLLATIONS WHERE COLLATION_NAME={name};"
+                        ),
+                    )?;
+                    if support.trim() != values[0] {
+                        return Err(
+                            "目标服务器不支持所选排序规则，或与来源字符集不匹配；尚未创建目标库"
+                                .into(),
+                        );
+                    }
+                }
                 std::fs::write(
                     create.path(),
                     format!(
                         "CREATE DATABASE `{}` CHARACTER SET `{}` COLLATE `{}`;",
                         self.database.replace('`', "``"),
                         values[0],
-                        values[1]
+                        self.options.collation.as_deref().unwrap_or(values[1])
                     ),
                 )
                 .map_err(io_error)?;
@@ -1336,6 +1370,136 @@ fn query_inner(endpoint: &Endpoint, sql: &str, sample: bool) -> Result<String, S
     result.map_err(|error| diagnostic.detail().unwrap_or(error))
 }
 /// Read catalog metadata without sampling table rows or requiring native dump tools.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadPermission {
+    Available,
+    Denied,
+    #[default]
+    Unknown,
+}
+#[derive(Clone, Default)]
+pub struct ReadPermissions(pub std::collections::HashMap<String, ReadPermission>);
+impl ReadPermissions {
+    pub fn denied(&self, kind: &str) -> bool {
+        self.0.get(kind) == Some(&ReadPermission::Denied)
+    }
+    pub fn blocks(&self, options: &Options) -> bool {
+        [
+            ("view", options.views),
+            ("trigger", options.triggers),
+            ("routine", options.routines),
+            ("event", options.events),
+        ]
+        .into_iter()
+        .any(|(kind, selected)| selected && self.denied(kind))
+    }
+}
+fn permission_result(result: Result<String, String>) -> ReadPermission {
+    match result {
+        Ok(text) if !text.split('\t').any(|v| v.trim() == "NULL") => ReadPermission::Available,
+        Err(error)
+            if ["错误码 1044", "错误码 1142", "错误码 1227"]
+                .iter()
+                .any(|code| error.contains(code)) =>
+        {
+            ReadPermission::Denied
+        }
+        _ => ReadPermission::Unknown,
+    }
+}
+/// Bounded read-only checks through the CLI channel used by transfers; never emit definition bodies.
+pub fn read_permissions(
+    endpoint: &Endpoint,
+    preview: &Preview,
+    control: &Control,
+) -> ReadPermissions {
+    let result = ReadPermissions::default();
+    if endpoint.profile.kind != DatabaseKind::MySql || crate::mysql::uses_legacy(&endpoint.profile)
+    {
+        return result;
+    }
+    let db = crate::database::workbench::quote(DatabaseKind::MySql, &endpoint.profile.database);
+    let old_dump = tool(&endpoint.profile, "mysqldump")
+        .ok()
+        .and_then(|path| {
+            command(&path)
+                .args(["--no-defaults", "--version"])
+                .output()
+                .ok()
+        })
+        .is_some_and(|output| {
+            let version = String::from_utf8_lossy(&output.stdout);
+            ["Distrib 5.1", "Distrib 5.5", "Distrib 5.6", "Distrib 5.7"]
+                .iter()
+                .any(|prefix| version.contains(prefix))
+        });
+    inspect_permissions(&db, preview, control, old_dump, |sql| query(endpoint, sql))
+}
+fn inspect_permissions(
+    db: &str,
+    preview: &Preview,
+    control: &Control,
+    old_dump: bool,
+    mut read: impl FnMut(&str) -> Result<String, String>,
+) -> ReadPermissions {
+    let mut result = ReadPermissions::default();
+    for kind in ["view", "trigger", "routine", "event"] {
+        if control.is_cancelled() {
+            break;
+        }
+        let objects = preview
+            .objects
+            .iter()
+            .filter(|o| {
+                o.kind == kind
+                    || kind == "routine" && matches!(o.kind.as_str(), "procedure" | "function")
+            })
+            .collect::<Vec<_>>();
+        let mut state = ReadPermission::Unknown;
+        if kind == "event" {
+            state = permission_result(read(&format!("SHOW EVENTS FROM {db};")));
+        }
+        // Older dump clients read mysql.proc even when information_schema hides routine definitions.
+        if kind == "routine" && old_dump {
+            state = permission_result(read("SELECT 1 FROM mysql.proc LIMIT 0;"));
+        }
+        if state != ReadPermission::Denied {
+            let mut available = !objects.is_empty() && objects.len() <= 4;
+            for object in objects.iter().take(4) {
+                if control.is_cancelled() {
+                    available = false;
+                    break;
+                }
+                let keyword = match object.kind.as_str() {
+                    "view" => "VIEW",
+                    "trigger" => "TRIGGER",
+                    "event" => "EVENT",
+                    "function" => "FUNCTION",
+                    _ => "PROCEDURE",
+                };
+                let name = crate::database::workbench::quote(DatabaseKind::MySql, &object.name);
+                match permission_result(read(&format!("SHOW CREATE {keyword} {db}.{name};"))) {
+                    ReadPermission::Denied => {
+                        state = ReadPermission::Denied;
+                        break;
+                    }
+                    ReadPermission::Unknown => available = false,
+                    ReadPermission::Available => {}
+                }
+            }
+            if state != ReadPermission::Denied {
+                state = if available {
+                    ReadPermission::Available
+                } else {
+                    ReadPermission::Unknown
+                };
+            }
+        }
+        result.0.insert(kind.into(), state);
+    }
+    result
+}
+
 pub fn catalog(endpoint: &Endpoint, control: &Control) -> Result<(Preview, String), String> {
     use crate::database::{
         OperationKind, OperationResult,
@@ -1696,6 +1860,55 @@ pub fn freeze_file(path: &Path, c: &Control) -> Result<tempfile::NamedTempFile, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hidden_event_denial_does_not_disable_readable_views() {
+        let preview = Preview {
+            objects: vec![ObjectChoice {
+                name: "visible".into(),
+                kind: "view".into(),
+            }],
+            ..Default::default()
+        };
+        let checked =
+            inspect_permissions("`fixture`", &preview, &Control::default(), true, |sql| {
+                if sql.starts_with("SHOW EVENTS") {
+                    Err("数据库权限不足（错误码 1044）".into())
+                } else if sql.contains("mysql.proc") {
+                    Err("对象不存在（错误码 1146）".into())
+                } else if sql.starts_with("SHOW CREATE VIEW") {
+                    Ok("visible\tCREATE VIEW visible AS SELECT 1".into())
+                } else {
+                    Err("未确认".into())
+                }
+            });
+        assert_eq!(checked.0["event"], ReadPermission::Denied);
+        assert_eq!(checked.0["view"], ReadPermission::Available);
+        assert_eq!(checked.0["routine"], ReadPermission::Unknown);
+        assert!(!checked.denied("trigger"));
+    }
+    #[test]
+    fn permission_checks_only_disable_confirmed_denials() {
+        assert_eq!(
+            permission_result(Err("数据库权限不足（错误码 1044）".into())),
+            ReadPermission::Denied
+        );
+        assert_eq!(
+            permission_result(Err("网络失败；退出码 2".into())),
+            ReadPermission::Unknown
+        );
+        assert_eq!(
+            permission_result(Ok("name\tNULL".into())),
+            ReadPermission::Unknown
+        );
+        let permissions = ReadPermissions(std::collections::HashMap::from([(
+            "event".into(),
+            ReadPermission::Denied,
+        )]));
+        let mut options = Options::default();
+        assert!(permissions.blocks(&options));
+        options.events = false;
+        assert!(!permissions.blocks(&options));
+    }
     #[test]
     fn client_capabilities_are_not_tied_to_version_substrings() {
         assert_eq!(

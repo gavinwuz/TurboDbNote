@@ -53,7 +53,7 @@ impl DatabaseView {
             })
             .or_else(|| names.first().cloned())
             .unwrap_or_else(|| {
-                if profile.kind == DatabaseKind::Sqlite {
+                if profile.is_file_database() {
                     std::path::Path::new(&profile.sqlite_path)
                         .file_name()
                         .map(|p| p.to_string_lossy().into_owned())
@@ -96,6 +96,7 @@ impl DatabaseView {
         let log_kind = match &kind {
             OperationKind::CreateDatabase { .. } => crate::operation_log::Kind::Create,
             OperationKind::CopyDatabase { .. } => crate::operation_log::Kind::Copy,
+            _ if is_metadata_read(&kind) => crate::operation_log::Kind::Metadata,
             _ => crate::operation_log::Kind::Query,
         };
         self.request_sequence += 1;
@@ -173,6 +174,7 @@ impl DatabaseView {
         let log_kind = match &kind {
             OperationKind::CreateDatabase { .. } => crate::operation_log::Kind::Create,
             OperationKind::CopyDatabase { .. } => crate::operation_log::Kind::Copy,
+            _ if is_metadata_read(&kind) => crate::operation_log::Kind::Metadata,
             _ => crate::operation_log::Kind::Query,
         };
         self.operation_log(
@@ -235,6 +237,7 @@ impl DatabaseView {
         match result {
             Ok(OperationResult::Workbench(reply)) => match *reply {
                 Reply::Catalog { objects, notice } => {
+                    let notice = crate::locale::message(cx, &notice).to_string();
                     self.catalog_objects = objects;
                     self.object_catalog_loaded = true;
                     self.object_notice = if notice.is_empty() {
@@ -285,6 +288,7 @@ impl DatabaseView {
             },
             Err(error) => {
                 self.pending_object_action = None;
+                let error = crate::locale::message(cx, &error).to_string();
                 self.object_notice = error.clone();
                 feedback::error(error.clone(), cx);
                 self.status = error;
@@ -295,6 +299,14 @@ impl DatabaseView {
                     info.databases = names;
                 }
                 self.object_notice = format!("已刷新 {count} 个数据库");
+                if let Some((selected, db)) = self.selected_database.clone()
+                    && selected == id
+                {
+                    let owner = cx.entity();
+                    cx.defer(move |cx| {
+                        owner.update(cx, |this, cx| this.select_database(id, db, cx))
+                    });
+                }
             }
             Ok(OperationResult::Objects {
                 items,
@@ -435,12 +447,18 @@ impl DatabaseView {
                 },
             ))
         });
+        let collation = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::locale::t(cx, "dbwork.create.collation_default"))
+        });
+        let show_collation = profile.kind == DatabaseKind::MySql && !legacy40 && !copying;
         let include_data = Rc::new(Cell::new(false));
         let view = cx.entity().downgrade();
         let generation = self.generation.get(&id).copied().unwrap_or_default();
         window.open_dialog(cx, move |dialog, _, cx| {
             let target_field = target.clone();
             let charset_field = charset.clone();
+            let collation_field=collation.clone();
             let data = include_data.clone();
             let view = view.clone();
             let profile = profile.clone();
@@ -456,7 +474,7 @@ impl DatabaseView {
                         &[("source", &source)],
                     ))
                 })
-                .child(Input::new(&target));
+                .child(Input::new(&target).cleanable(true));
             if sqlite {
                 let field = target.clone();
                 let directory = std::path::Path::new(&profile.sqlite_path)
@@ -515,7 +533,7 @@ impl DatabaseView {
                                             PopupMenuItem::new(if value.is_empty() {
                                                 crate::locale::t(
                                                     cx,
-                                                    if copying {
+                                                                if copying {
                                                         "dbwork.copy.charset"
                                                     } else {
                                                         "dbwork.create.charset_default"
@@ -538,6 +556,16 @@ impl DatabaseView {
                 );
             } else if legacy40 {
                 fields = fields.child(crate::locale::t(cx, "dbwork.create.legacy_charset"));
+            }
+if show_collation {
+                let field=collation.clone();let charset_filter=charset.clone();
+                fields=fields.child(crate::locale::t(cx,"transfer.collation")).child(div().h_flex().gap_2().child(Input::new(&collation).cleanable(true).flex_1()).child(Button::new("create-collation-presets").ghost().icon(IconName::ChevronDown).dropdown_menu(move |mut menu,_,cx| {
+                    let selected=charset_filter.read(cx).value().to_string();
+                    for value in ["","utf8mb4_general_ci","utf8mb4_unicode_ci","utf8mb4_bin","utf8_general_ci","utf8_unicode_ci","utf8_bin","latin1_swedish_ci","latin1_bin","gbk_chinese_ci","gbk_bin"] {
+                        if !value.is_empty() && (!supports_mb4 && value.starts_with("utf8mb4") || !selected.is_empty() && !value.starts_with(&format!("{selected}_"))) {continue;}
+                        let field=field.clone();menu=menu.item(PopupMenuItem::new(if value.is_empty() {crate::locale::t(cx,"dbwork.create.collation_default").to_string()} else {value.into()}).on_click(move |_,window,cx|field.update(cx,|input,cx|input.set_value(value,window,cx))));
+                    }menu.scrollable(true).max_h(px(280.))
+                })));
             }
             if copying {
                 let data = include_data.clone();
@@ -575,6 +603,7 @@ impl DatabaseView {
                 .footer(move |_, _, _, cx| {
                     let target = target_field.clone();
                     let charset = charset_field.clone();
+                    let collation=collation_field.clone();
                     let data = data.clone();
                     let view = view.clone();
                     let profile = profile.clone();
@@ -601,6 +630,7 @@ impl DatabaseView {
                                     .on_click(move |_, window, cx| {
                                         let name = target.read(cx).value().trim().to_string();
                                         let charset = charset.read(cx).value().trim().to_string();
+                                        let collation=collation.read(cx).value().trim().to_string();
                                         let sql = if sqlite {
                                             if !std::path::Path::new(&name).is_absolute()
                                                 || std::path::Path::new(&name).exists()
@@ -613,10 +643,11 @@ impl DatabaseView {
                                             }
                                             String::new()
                                         } else {
-                                            match turbodbn_services::database::create_database_sql(
+                                            match turbodbn_services::database::create_database_sql_with_collation(
                                                 profile.kind,
                                                 &name,
                                                 &charset,
+                                                &collation,
                                             ) {
                                                 Ok(sql) => sql,
                                                 Err(error) => {
@@ -644,6 +675,7 @@ impl DatabaseView {
                                             OperationKind::CreateDatabase {
                                                 name: name.clone(),
                                                 charset,
+                                                collation,
                                             }
                                         };
                                         let view = view.clone();

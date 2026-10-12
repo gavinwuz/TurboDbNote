@@ -5,6 +5,8 @@ pub mod codex;
 pub mod codex_discovery;
 pub mod credentials;
 pub mod database;
+pub mod driver_catalog;
+pub mod external_driver;
 pub mod mysql;
 pub mod mysql_drivers;
 pub mod mysql_legacy;
@@ -37,6 +39,7 @@ pub enum DatabaseKind {
     Sqlite,
     ClickHouse,
     Redis,
+    External,
 }
 impl DatabaseKind {
     pub const ALL: [Self; 5] = [
@@ -53,6 +56,7 @@ impl DatabaseKind {
             Self::PostgreSql => "PostgreSQL",
             Self::ClickHouse => "ClickHouse",
             Self::Redis => "Redis",
+            Self::External => "External",
         }
     }
     pub fn port(self) -> u16 {
@@ -62,6 +66,7 @@ impl DatabaseKind {
             Self::PostgreSql => 5432,
             Self::ClickHouse => 8443,
             Self::Redis => 6379,
+            Self::External => 1,
         }
     }
     pub fn can_create_database(self) -> bool {

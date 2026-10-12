@@ -24,6 +24,18 @@ Note cells now open in reading mode; double-click/F2 edits and Esc returns to re
 
 The Note header is a compact icon toolbar. Unbound SQL cells inherit the document default connection/database; explicit cell scopes remain independent. Run all executes sequentially with per-statement write confirmation. Rename, Save as, project and reveal actions are in Note context menus; tab dots/tooltips show save state and file details.
 
+On Windows, closing the main window asks whether to cancel, exit or keep running in the system tray. The tray menu offers Open and Exit; double-click restores the window. Choosing Keep in tray remembers the behavior; Settings → General can restore the prompt. Keeping in tray preserves notes, sessions and tasks; Exit retains the existing save checks.
+
+## Supported databases
+
+16 driver types for SQL, analytics, NoSQL and local files:
+
+- **SQL / local:** MySQL, PostgreSQL, SQLite, MariaDB, TiDB, SQL Server, Oracle, Microsoft Access, IBM DB2 for LUW.
+- **Analytics / time series:** ClickHouse, Apache Doris, TDengine.
+- **NoSQL / search:** Redis, MongoDB, Cassandra, Elasticsearch.
+
+Capabilities vary by driver. External adapters currently offer connection, object browsing and bounded read-only previews; Doris is read-only. Note SQL execution supports MySQL/PostgreSQL/SQLite. Access and DB2 require x64 ODBC providers; Oracle requires x64 OCI. See [driver capabilities and prerequisites](docs/database-drivers.md).
+
 ## Development environment
 
 - Rust 1.92.0 (the validated toolchain) and Cargo; dependencies are locked in `Cargo.lock`.
@@ -265,3 +277,23 @@ Editing a SQL Note cell readies its saved connection and loads requested column 
 AI chats can select a connection/database. The bundled local MCP bridge exposes `current_database` and `query_sql` to Codex/Claude using an ephemeral authenticated loopback endpoint, without sending connection credentials to the model. Each SQL/result-sharing request is reviewed in an inline chat card; writes require a second action in that card. The composer provides read-only (default), read/write and administrator access modes, bound to the current chat and database and intersected with SQL settings and server grants. Responses are limited to 20 rows, 64 columns and 512 characters per value (single-value results such as JSON plans may use the full 32 KiB value budget); common sensitive column names are masked. This masking does not guarantee anonymization of arbitrary query results: review the requested data before sharing. Chat tables wrap within cells and support TSV copy; standalone images have an explicit open-original link.
 
 Redis value tabs support new string keys, member insertion, guarded text edits and whole-key deletion. Replacements preserve remaining TTL; displayed expiry is a local estimate. Binary/truncated previews are not editable, and writes require server EVAL/write permission. Network failure does not trigger write retries.
+
+### Extended driver catalog
+
+The connection picker and driver settings now list Microsoft Access, SQL Server, Oracle, MariaDB, MongoDB, Elasticsearch, TiDB, Cassandra, TDengine, IBM DB2 for LUW and Apache Doris alongside existing drivers. Category filters default to All. MySQL-compatible engines reuse the MySQL adapter; other adapters run in a lazy, disposable process and release their SDK/runtime memory on disconnect.
+
+The isolated adapters currently provide **connection, object browsing and bounded read-only previews**, not generic Note SQL, writes or transfers. Access/DB2 require their x64 ODBC provider; Oracle requires x64 OCI. External workers use Rust, with no JVM/JDBC runtime. Python is not shipped. DB2 TLS modes remain disabled pending verified identity support; selecting unsupported TLS fails explicitly. See [driver capabilities, prerequisites and verification boundaries](docs/database-drivers.md). Preview/release staging includes the locked runtime under `drivers/native`; do not distribute the EXE alone.
+
+Driver icon view uses large embedded color brand marks above names. Official vendor/project artwork is preferred; source provenance and mirror attribution are recorded in `crates/desktop/assets/brands/sources.json`. Long names retain full tooltips and list view stays compact.
+
+New connections start with an unassigned project; existing assignments and explicitly selected draft projects are preserved. MySQL Note write previews read the exact target DDL, without LIKE-pattern matching. Error 1064 is reported as SQL syntax/server-version compatibility rather than a permissions diagnosis. Confirmation and stale-schema checks remain mandatory.
+
+The inspector offers a field/value grid and JSON array view. Schema tools use a compact header with grid/TXT switching. Output text is selectable and includes connection/Note labels; these labels are excluded from persistent operation logs. Transfer previews are optional, and modern MySQL new-database transfers can select object types and validate a collation override against the target server.
+
+Connection transfers provide a searchable source database selector. MySQL object read checks disable only confirmed permission denials; selected unavailable types require explicit removal, while unknown permissions remain advisory. Checks do not grant privileges or validate every target write permission.
+
+Create database offers MySQL collation presets and custom values with server validation. Transfer selection uses consistent two-level object categories and a single filter across tables and other objects; filtering preserves hidden selections.
+
+Note tasks support independent checklist items, local assignee text, calendar deadlines and optional reminders. Completed items use strikethrough. Reminders require a running app and an open note; no external messages are sent. Note v2 preserves legacy v1 text and provides explicit conversion.
+
+Markdown cells offer a compact formatting toolbar while editing, with headings, inline styles, lists, links, quotes, code blocks, tables, rules and image links. All format buttons use icons with tooltips. The toolbar wraps in narrow windows. Formatting supports native undo and autosave; Ctrl+B/I/K are scoped to the Markdown editor. Image insertion creates syntax without uploading files.

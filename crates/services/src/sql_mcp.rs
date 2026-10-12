@@ -110,7 +110,7 @@ pub fn result_data(page: crate::database::notebook_query::ResultPage) -> Value {
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
-    json!({"columns":columns,"rows":rows,"more":page.more,"truncated":truncated,"elapsed_ms":page.elapsed_ms,"limits":{"rows":20,"columns":64,"characters_per_value":per_value,"value_bytes":32768}})
+    json!({"columns":columns,"rows":rows,"more":page.more,"truncated":truncated,"elapsed_ms":page.elapsed_ms,"affected_rows":page.affected_rows,"execution":page.execution,"read_only":page.read_only,"limits":{"rows":20,"columns":64,"characters_per_value":per_value,"value_bytes":32768}})
 }
 pub struct Server {
     pub config: Config,
@@ -323,6 +323,8 @@ mod tests {
     fn results_are_utf8_bounded_and_sensitive_columns_are_masked() {
         use crate::database::{notebook_query::ResultPage, workbench::Rows};
         let page = ResultPage {
+            execution: None,
+            affected_rows: None,
             grid: None,
             rows: Rows {
                 columns: std::iter::once("password".into())
@@ -341,6 +343,8 @@ mod tests {
         assert!(result.to_string().len() < 131072);
         assert_eq!(result["rows"].as_array().unwrap().len(), 20);
         let plan = ResultPage {
+            execution: None,
+            affected_rows: None,
             grid: None,
             rows: Rows {
                 columns: vec!["EXPLAIN".into()],

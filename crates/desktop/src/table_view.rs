@@ -715,6 +715,9 @@ impl TableView {
         self.selected = Some((row, col));
         self.focus.focus(window);
         self.sync_selection(cx);
+        if cx.global::<crate::feedback::InspectorSource>().0.as_deref() == Some(self.key.as_str()) {
+            self.show_details(Some(row), true, cx);
+        }
     }
     fn can_insert(&self) -> bool {
         self.target.mode == Mode::Grid
@@ -1132,7 +1135,7 @@ impl TableView {
         );
     }
     fn copy(&self, row: usize, col: usize, format: &str, cx: &mut App) {
-        if format == "sql"
+        if matches!(format, "sql" | "insert" | "update")
             && self
                 .notebook
                 .as_ref()
@@ -1142,7 +1145,7 @@ impl TableView {
             return;
         }
         let data = self.display_rows();
-        if format == "sql"
+        if matches!(format, "sql" | "insert" | "update")
             && self.schema.as_ref().is_some_and(|schema| {
                 schema.columns.iter().enumerate().any(|(i, c)| {
                     ["blob", "binary", "bytea"]
@@ -1182,7 +1185,7 @@ impl TableView {
                         "NULL".into()
                     }
                 }))
-        } else if format == "sql" && row >= self.rows.values.len() {
+        } else if matches!(format, "sql" | "insert") && row >= self.rows.values.len() {
             match (self.schema.as_ref(), self.changes.get(&row)) {
                 (Some(schema), Some(change)) => workbench::edit_preview(
                     self.target.kind,
@@ -1194,6 +1197,21 @@ impl TableView {
                 .map(|sql| format!("{sql};")),
                 _ => Err(t(cx, "grid.filter.empty").to_string()),
             }
+        } else if format == "update" {
+            self.schema
+                .as_ref()
+                .ok_or("grid.copy.update_requires_key".to_string())
+                .and_then(|schema| {
+                    workbench::copy_update(
+                        self.target.kind,
+                        &self.target.database,
+                        &self.target.object,
+                        schema,
+                        &data,
+                        &self.rows,
+                        row,
+                    )
+                })
         } else {
             workbench::copy_row(
                 self.target.kind,
@@ -1209,7 +1227,7 @@ impl TableView {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 crate::feedback::success(t(cx, "feedback.copied"), cx)
             }
-            Err(e) => crate::feedback::error(e, cx),
+            Err(e) => crate::feedback::error(crate::locale::message(cx, &e), cx),
         }
     }
     fn change_query(&mut self, cx: &mut Context<Self>) {
@@ -1219,8 +1237,11 @@ impl TableView {
         self.total = None;
         self.load(cx);
     }
-    fn show_details(&self, row: Option<usize>, cx: &mut App) {
+    fn show_details(&self, row: Option<usize>, refresh: bool, cx: &mut App) {
         if let Some(row) = row {
+            if !refresh {
+                cx.global_mut::<crate::feedback::InspectorSource>().0 = Some(self.key.clone());
+            }
             let data = self.display_rows();
             let entries = data
                 .columns
@@ -1235,10 +1256,27 @@ impl TableView {
                         .map(|v| v.unwrap_or_else(|| "NULL".into())),
                 )
                 .collect::<Vec<_>>();
-            let text = serde_json::to_string_pretty(&entries).unwrap_or_default();
+            let object = data
+                .columns
+                .iter()
+                .cloned()
+                .zip(
+                    data.values
+                        .get(row)
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|v| {
+                            v.map(serde_json::Value::String)
+                                .unwrap_or(serde_json::Value::Null)
+                        }),
+                )
+                .collect::<serde_json::Map<String, serde_json::Value>>();
+            let text = serde_json::to_string_pretty(&vec![object]).unwrap_or_default();
             crate::feedback::details(
                 crate::feedback::DetailRequest {
                     inspector: true,
+                    refresh,
                     title: format!(
                         "{}.{} · #{}",
                         self.target.database,
@@ -1438,6 +1476,30 @@ impl TableView {
                 .p_2()
                 .track_focus(&self.focus)
                 .on_key_down(cx.listener(Self::grid_key))
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .child(format!("KEY: {}", self.target.object.name)),
+                        )
+                        .child(
+                            Button::new("redis-copy-key")
+                                .ghost()
+                                .icon(IconName::Copy)
+                                .tooltip(t(cx, "redis.copy_key"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        this.target.object.name.clone(),
+                                    ));
+                                    crate::feedback::success(t(cx, "feedback.copied"), cx);
+                                })),
+                        ),
+                )
                 .child(
                     div()
                         .h_flex()
@@ -2158,6 +2220,7 @@ pub(crate) fn structure_details(
 ) -> crate::feedback::DetailRequest {
     crate::feedback::DetailRequest {
         inspector: false,
+        refresh: false,
         title: if object.schema.is_empty() {
             format!("{database}.{}", object.name)
         } else {

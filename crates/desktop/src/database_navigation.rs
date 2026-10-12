@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct Navigation {
+    pub driver_group: String,
     pub order: Vec<String>,
     pub environment_order: Vec<String>,
     pub mode: GroupMode,
@@ -101,6 +102,7 @@ pub(super) fn type_icon(kind: DatabaseKind) -> gpui_component::Icon {
             DatabaseKind::Sqlite => "icons/db-sqlite.svg",
             DatabaseKind::ClickHouse => "icons/db-clickhouse.svg",
             DatabaseKind::Redis => "icons/db-redis.svg",
+            DatabaseKind::External => "icons/database.svg",
         })
         .text_color(match kind {
             DatabaseKind::MySql => hsla(0.56, 0.7, 0.5, 1.),
@@ -108,6 +110,7 @@ pub(super) fn type_icon(kind: DatabaseKind) -> gpui_component::Icon {
             DatabaseKind::PostgreSql => hsla(0.63, 0.7, 0.5, 1.),
             DatabaseKind::ClickHouse => hsla(0.14, 0.8, 0.45, 1.),
             DatabaseKind::Redis => hsla(0., 0.8, 0.6, 1.),
+            DatabaseKind::External => hsla(0.48, 0.6, 0.45, 1.),
         })
 }
 impl DatabaseView {
@@ -435,6 +438,104 @@ impl DatabaseView {
                 )
         });
     }
+    fn rename_project(
+        &mut self,
+        old: String,
+        new: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = self.file.clone();
+        let previous = old.clone();
+        let replacement = new.clone();
+        cx.spawn_in(window, async move |view, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(
+                    async move { connection_store::rename_project(&path, &previous, &replacement) },
+                )
+                .await;
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            for p in &mut this.profiles {
+                                if p.group == old {
+                                    p.group = new.clone();
+                                }
+                            }
+                            if this.fields["group"].read(cx).value().as_str() == old {
+                                this.fields["group"].update(cx, |input, cx| {
+                                    input.set_value(new.clone(), window, cx)
+                                });
+                            }
+                            if this.editing.group == old {
+                                this.editing.group = new.clone();
+                            }
+                            if this.baseline.group == old {
+                                this.baseline.group = new.clone();
+                            }
+                            for names in
+                                [&mut this.navigation.categories, &mut this.navigation.order]
+                            {
+                                for name in names.iter_mut() {
+                                    if *name == old {
+                                        *name = new.clone();
+                                    }
+                                }
+                                names.retain(|n| !n.is_empty());
+                            }
+                            if this.navigation.collapsed.remove(&old) && !new.is_empty() {
+                                this.navigation.collapsed.insert(new.clone());
+                            }
+                            this.persist_navigation();
+                            feedback::success(crate::locale::t(cx, "project.saved"), cx);
+                        }
+                        Err(error) => feedback::error(error, cx),
+                    }
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
+    }
+    fn edit_project(&mut self, old: String, window: &mut Window, cx: &mut Context<Self>) {
+        use gpui_component::WindowExt;
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(old.clone()));
+        let owner = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let field = input.clone();
+            let old = old.clone();
+            let owner = owner.clone();
+            dialog
+                .title(crate::locale::t(cx, "project.rename"))
+                .child(Input::new(&input).cleanable(true))
+                .child(
+                    feedback::actions().child(feedback::close_button(cx)).child(
+                        Button::new("rename-project-save")
+                            .primary()
+                            .label(crate::locale::t(cx, "dbwork.save"))
+                            .on_click(move |_, window, cx| {
+                                let name = field.read(cx).value().trim().to_string();
+                                if name.is_empty() || name.chars().count() > 80 {
+                                    return;
+                                }
+                                let _ = owner.update(cx, |this, cx| {
+                                    if name != old
+                                        && (this.navigation.categories.contains(&name)
+                                            || this.profiles.iter().any(|p| p.group == name))
+                                    {
+                                        feedback::error(crate::locale::t(cx, "project.exists"), cx);
+                                        return;
+                                    }
+                                    this.rename_project(old.clone(), name.clone(), window, cx);
+                                    window.close_dialog(cx);
+                                });
+                            }),
+                    ),
+                )
+        });
+    }
     fn move_group(&mut self, from: &str, to: &str, cx: &mut Context<Self>) {
         let mut names = self.ordered_groups();
         if let (Some(a), Some(b)) = (
@@ -454,10 +555,20 @@ impl DatabaseView {
     }
     pub(super) fn render_type_picker(&self, cx: &Context<Self>) -> AnyElement {
         let filter = self.text("type_filter", cx).to_lowercase();
-        let kinds = DatabaseKind::ALL
-            .into_iter()
-            .filter(|kind| kind.label().to_lowercase().contains(&filter))
+        let group = if self.navigation.driver_group.is_empty() {
+            "all"
+        } else {
+            &self.navigation.driver_group
+        };
+        let kinds = turbodbn_services::driver_catalog::DRIVERS
+            .iter()
+            .filter(|driver| driver.in_group(group) && driver.name.to_lowercase().contains(&filter))
             .collect::<Vec<_>>();
+        let group_label = turbodbn_services::driver_catalog::GROUPS
+            .iter()
+            .find(|(id, _)| *id == group)
+            .map(|(_, label)| *label)
+            .unwrap_or("drivers.group.all");
         div()
             .v_flex()
             .size_full()
@@ -476,6 +587,30 @@ impl DatabaseView {
                         Input::new(&self.fields["type_filter"])
                             .cleanable(true)
                             .flex_1(),
+                    )
+                    .child(
+                        Button::new("driver-group")
+                            .label(crate::locale::t(cx, group_label))
+                            .dropdown_caret(true)
+                            .dropdown_menu({
+                                let owner = cx.entity().downgrade();
+                                move |mut menu, _, cx| {
+                                    for &(id, label) in turbodbn_services::driver_catalog::GROUPS {
+                                        let owner = owner.clone();
+                                        menu = menu.item(
+                                            PopupMenuItem::new(crate::locale::t(cx, label))
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = owner.update(cx, |this, cx| {
+                                                        this.navigation.driver_group = id.into();
+                                                        this.persist_navigation();
+                                                        cx.notify();
+                                                    });
+                                                }),
+                                        );
+                                    }
+                                    menu.scrollable(true).max_h(px(360.))
+                                }
+                            }),
                     )
                     .children(
                         [
@@ -510,11 +645,36 @@ impl DatabaseView {
                     .when(self.type_grid, |el| el.flex_wrap().content_start())
                     .when(!self.type_grid, |el| el.flex_col())
                     .children(kinds.into_iter().map(|kind| {
-                        Button::new(SharedString::from(format!("pick-{}", kind.label())))
-                            .when(self.type_grid, |el| el.w(px(144.)).h(px(92.)).flex_col())
-                            .when(!self.type_grid, |el| el.w_full().justify_start())
-                            .icon(type_icon(kind))
-                            .label(kind.label())
+                        let content = div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .when(self.type_grid, |el| el.flex_col().w(px(120.)))
+                            .when(!self.type_grid, |el| el.flex_row())
+                            .child(crate::assets::driver_brand_image(
+                                kind.id,
+                                if self.type_grid { 48. } else { 24. },
+                            ))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .when(self.type_grid, |el| {
+                                        el.w(px(120.)).text_center().truncate()
+                                    })
+                                    .child(kind.name),
+                            );
+                        Button::new(SharedString::from(format!("pick-{}", kind.name)))
+                            .when(self.type_grid, |el| el.w(px(144.)).h(px(112.)).rounded_lg())
+                            .when(!self.type_grid, |el| el.w_full().h(px(44.)).justify_start())
+                            .selected(
+                                self.editing
+                                    .driver_spec()
+                                    .is_some_and(|selected| selected.id == kind.id),
+                            )
+                            .tooltip(kind.name)
+                            .child(content)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.choose_type(kind, window, cx)
                             }))
@@ -522,26 +682,38 @@ impl DatabaseView {
             )
             .into_any_element()
     }
-    fn choose_type(&mut self, kind: DatabaseKind, window: &mut Window, cx: &mut Context<Self>) {
+    fn choose_type(
+        &mut self,
+        kind: &'static turbodbn_services::driver_catalog::DriverSpec,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Ok(profile) = self.raw_draft(cx) {
             let password = self.fields["password"].read(cx).value().to_string();
-            self.typed_drafts.insert(profile.kind, (profile, password));
+            self.typed_drafts.insert(
+                profile
+                    .driver_spec()
+                    .map(|d| d.id)
+                    .unwrap_or("")
+                    .to_string(),
+                (profile, password),
+            );
         }
         let common = self.editing.clone();
         let (mut profile, password) = self
             .typed_drafts
-            .get(&kind)
+            .get(kind.id)
             .cloned()
-            .unwrap_or((Self::empty_profile(kind), String::new()));
+            .unwrap_or((Self::empty_driver_profile(kind), String::new()));
         profile.group = self.text("group", cx);
         profile.environment = self.text("environment", cx);
         let name = self.text("name", cx);
         profile.name = name;
-        if common.kind == kind {
+        if common.driver_spec().is_some_and(|d| d.id == kind.id) {
             profile.id = common.id;
         }
         self.fill(profile, window, cx);
-        self.baseline = Self::empty_profile(kind);
+        self.baseline = Self::empty_driver_profile(kind);
         self.baseline.id = self.editing.id;
         self.fields["password"].update(cx, |input, cx| input.set_value(password, window, cx));
         self.tab = 0;
@@ -587,7 +759,7 @@ impl DatabaseView {
                 files: true,
                 directories: false,
                 multiple: false,
-                prompt: Some("选择 SQLite 数据库文件".into()),
+                prompt: Some(crate::locale::t(cx, "drivers.choose_file")),
             });
             cx.spawn_in(window, async move |view, cx| {
                 if let Ok(Ok(Some(paths))) = selected.await
@@ -755,6 +927,57 @@ impl DatabaseView {
                         cx.notify();
                     })),
             );
+        if !recent && self.navigation.mode == GroupMode::Group && key != "未分组" {
+            let name = key.to_string();
+            let owner = cx.entity().downgrade();
+            header =
+                header.child(
+                    Button::new(SharedString::from(format!("project-menu-{key}")))
+                        .ghost()
+                        .icon(IconName::Ellipsis)
+                        .dropdown_menu(move |menu, _, cx| {
+                            let rename = owner.clone();
+                            let rename_name = name.clone();
+                            let remove = owner.clone();
+                            let remove_name = name.clone();
+                            menu.item(
+                                PopupMenuItem::new(crate::locale::t(cx, "project.rename"))
+                                    .on_click(move |_, window, cx| {
+                                        let _ = rename.update(cx, |this, cx| {
+                                            this.edit_project(rename_name.clone(), window, cx)
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(crate::locale::t(cx, "project.remove"))
+                                    .on_click(move |_, window, cx| {
+                                        let target = remove_name.clone();
+                                        let owner = remove.clone();
+                                        feedback::confirm(
+                                            crate::locale::t(cx, "project.remove"),
+                                            crate::locale::tr(
+                                                cx,
+                                                "project.remove_body",
+                                                &[("name", &target)],
+                                            ),
+                                            window,
+                                            cx,
+                                            move |window, cx| {
+                                                let _ = owner.update(cx, |this, cx| {
+                                                    this.rename_project(
+                                                        target.clone(),
+                                                        String::new(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                });
+                                            },
+                                        );
+                                    }),
+                            )
+                        }),
+                );
+        }
         if !recent && !matches!(self.navigation.mode, GroupMode::Date | GroupMode::UsedDate) {
             header = header.child(
                 div()
@@ -789,7 +1012,7 @@ impl DatabaseView {
                     p.host,
                     p.database,
                     p.environment,
-                    p.kind.label(),
+                    p.driver_label(),
                     p.group,
                     self.catalog(&p).join(" ")
                 )
@@ -863,7 +1086,7 @@ impl DatabaseView {
                                     .tooltip(format!(
                                         "{label} · {address} · {} · {}",
                                         p.environment,
-                                        p.kind.label()
+                                        p.driver_label()
                                     ))
                                     .justify_start()
                                     .selected(selected)

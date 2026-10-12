@@ -516,6 +516,14 @@ pub(in crate::database) async fn commit_columns(
     }
     result
 }
+/// Human-readable copy only; execution retains the mode-independent encoder.
+fn copy_literal(kind: DatabaseKind, value: &str) -> String {
+    if kind == DatabaseKind::MySql && !value.chars().any(|c| c == '\\' || c.is_control()) {
+        format!("'{}'", value.replace('\'', "''"))
+    } else {
+        literal_for(kind, value)
+    }
+}
 pub fn copy_row(
     kind: DatabaseKind,
     db: &str,
@@ -545,7 +553,7 @@ pub fn copy_row(
             serde_json::to_string_pretty(&rows.columns.iter().zip(row).collect::<BTreeMap<_, _>>())
                 .map_err(|_| "复制失败".into())
         }
-        "sql" => Ok(format!(
+        "sql" | "insert" => Ok(format!(
             "INSERT INTO {} ({}) VALUES ({});",
             qualified(kind, db, object),
             rows.columns
@@ -556,7 +564,7 @@ pub fn copy_row(
             row.iter()
                 .map(|v| v
                     .as_ref()
-                    .map(|v| literal_for(kind, v))
+                    .map(|v| copy_literal(kind, v))
                     .unwrap_or_else(|| "NULL".into()))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -583,6 +591,85 @@ pub fn copy_row(
             .collect::<Vec<_>>()
             .join("\t")),
     }
+}
+
+/// Copy only. Use original complete primary keys so edits cannot retarget the predicate.
+pub fn copy_update(
+    kind: DatabaseKind,
+    db: &str,
+    object: &Object,
+    schema: &Schema,
+    rows: &Rows,
+    original: &Rows,
+    index: usize,
+) -> Result<String, String> {
+    let row = rows
+        .values
+        .get(index)
+        .ok_or("grid.copy.update_requires_key")?;
+    let before = original
+        .values
+        .get(index)
+        .ok_or("grid.copy.update_requires_key")?;
+    let primary = keys(schema);
+    if primary.is_empty()
+        || row.len() != rows.columns.len()
+        || before.len() != original.columns.len()
+        || rows.columns.is_empty()
+        || rows
+            .columns
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != rows.columns.len()
+    {
+        return Err("grid.copy.update_requires_key".into());
+    }
+    if rows
+        .columns
+        .iter()
+        .any(|name| !schema.columns.iter().any(|column| &column.name == name))
+    {
+        return Err("grid.copy.update_requires_key".into());
+    }
+    let mut predicates = Vec::new();
+    for column in primary {
+        let position = original
+            .columns
+            .iter()
+            .position(|name| name == &column.name)
+            .ok_or("grid.copy.update_requires_key")?;
+        let value = before[position]
+            .as_ref()
+            .ok_or("grid.copy.update_requires_key")?;
+        predicates.push(format!(
+            "{}={}",
+            quote(kind, &column.name),
+            copy_literal(kind, value)
+        ));
+    }
+    let assignments = rows
+        .columns
+        .iter()
+        .zip(row)
+        .map(|(name, value)| {
+            format!(
+                "{}={}",
+                quote(kind, name),
+                value
+                    .as_ref()
+                    .map(|v| copy_literal(kind, v))
+                    .unwrap_or_else(|| "NULL".into())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(format!(
+        "UPDATE {} SET {} WHERE {};",
+        qualified(kind, db, object),
+        assignments,
+        predicates.join(" AND ")
+    ))
 }
 
 /// Copy-only predicate for a single cell; quoting follows the selected driver.
@@ -654,4 +741,105 @@ pub fn cell_where(
         literal_for(kind, value)
     };
     Ok(format!("WHERE {name}={literal}"))
+}
+
+#[cfg(test)]
+mod copy_literal_tests {
+    use super::*;
+    #[test]
+    fn copied_update_uses_original_key_and_preserves_other_rows() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE items(id INTEGER PRIMARY KEY,name TEXT);INSERT INTO items VALUES(1,'before'),(2,'untouched');").unwrap();
+        let schema = Schema {
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    data_type: "INTEGER".into(),
+                    primary: true,
+                    comment: String::new(),
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: "TEXT".into(),
+                    primary: false,
+                    comment: String::new(),
+                },
+            ],
+            ..Default::default()
+        };
+        let object = Object {
+            schema: String::new(),
+            name: "items".into(),
+            kind: "table".into(),
+            comment: String::new(),
+            parent: String::new(),
+        };
+        let original = Rows {
+            columns: vec!["id".into(), "name".into()],
+            values: vec![vec![Some("1".into()), Some("before".into())]],
+        };
+        let changed = Rows {
+            columns: original.columns.clone(),
+            values: vec![vec![Some("3".into()), Some("魔域'先锋".into())]],
+        };
+        let sql = copy_update(
+            DatabaseKind::Sqlite,
+            "main",
+            &object,
+            &schema,
+            &changed,
+            &original,
+            0,
+        )
+        .unwrap();
+        db.execute_batch(&sql).unwrap();
+        assert_eq!(
+            db.query_row("SELECT name FROM items WHERE id=3", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "魔域'先锋"
+        );
+        assert_eq!(
+            db.query_row("SELECT name FROM items WHERE id=2", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "untouched"
+        );
+        assert!(
+            copy_update(
+                DatabaseKind::Sqlite,
+                "main",
+                &object,
+                &Schema::default(),
+                &changed,
+                &original,
+                0
+            )
+            .is_err()
+        );
+        assert!(
+            copy_update(
+                DatabaseKind::Sqlite,
+                "main",
+                &object,
+                &schema,
+                &changed,
+                &Rows::default(),
+                0
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn readable_copy_preserves_quotes_and_safe_fallback() {
+        assert_eq!(copy_literal(DatabaseKind::MySql, "魔域先锋"), "'魔域先锋'");
+        assert_eq!(copy_literal(DatabaseKind::MySql, "538"), "'538'");
+        assert_eq!(copy_literal(DatabaseKind::MySql, "a'b"), "'a''b'");
+        for value in ["a\\b", "a\nb", "a\0b"] {
+            assert_eq!(
+                copy_literal(DatabaseKind::MySql, value),
+                literal_for(DatabaseKind::MySql, value)
+            );
+        }
+    }
 }

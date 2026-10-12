@@ -317,7 +317,7 @@ impl TableDelegate for GridDelegate {
                                                         this.filter_dialog(col, window, cx);
                                                     }
                                                 } else {
-                                                    this.show_details(None, cx);
+                                                    this.show_details(None, false, cx);
                                                 }
                                             });
                                         }
@@ -470,10 +470,10 @@ impl TableDelegate for GridDelegate {
                             .on_click(move |_, window, cx| {
                                 if let Some(owner) = &owner {
                                     let _ = owner.update(cx, |this, cx| {
-                                        this.selected = Some((row, col));
+                                        this.select_cell(row, col, window, cx);
                                         match action {
                                             "delete" => this.delete_row(row, window, cx),
-                                            "inspect" => this.show_details(Some(row), cx),
+                                            "inspect" => this.show_details(Some(row), false, cx),
                                             format => this.copy(row, col, format, cx),
                                         }
                                     });
@@ -481,6 +481,36 @@ impl TableDelegate for GridDelegate {
                             }),
                     );
                 }
+                let structure_available = menu_owner
+                    .as_ref()
+                    .and_then(|owner| owner.upgrade())
+                    .is_some_and(|owner| {
+                        matches!(owner.read(cx).target.object.kind.as_str(), "table" | "view")
+                    });
+                let structure_owner = menu_owner.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(t(cx, "grid.view_definition"))
+                        .icon(IconName::File)
+                        .disabled(!structure_available)
+                        .on_click(move |_, _, cx| {
+                            if let Some(owner) = &structure_owner {
+                                let _ = owner.update(cx, |this, cx| {
+                                    crate::feedback::ddl_context(
+                                        crate::feedback::DdlContext {
+                                            origin: None,
+                                            scope: Some((
+                                                this.target.connection,
+                                                this.target.database.clone(),
+                                            )),
+                                            object: Some(this.target.object.clone()),
+                                            open: true,
+                                        },
+                                        cx,
+                                    );
+                                });
+                            }
+                        }),
+                );
                 let document_owner = menu_owner.clone();
                 menu = menu.item(
                     PopupMenuItem::new(t(cx, "result.full_value"))
@@ -502,7 +532,8 @@ impl TableDelegate for GridDelegate {
                         for (key, format) in [
                             ("grid.copy.csv", "csv"),
                             ("grid.copy.json", "json"),
-                            ("grid.copy.sql", "sql"),
+                            ("grid.copy.insert", "insert"),
+                            ("grid.copy.update", "update"),
                             ("grid.copy.md", "md"),
                             ("grid.copy.txt", "txt"),
                         ] {

@@ -88,7 +88,7 @@ impl DatabaseView {
                 mode,
                 generation: self.generation.get(&id).copied().unwrap_or_default(),
                 kind: p.kind,
-                writable: p.kind != DatabaseKind::Sqlite || !p.sqlite_read_only,
+                writable: p.supports_mutation(),
             });
         }
     }
@@ -126,23 +126,22 @@ impl DatabaseView {
         let create_categories = categories.clone();
         let create_database = profile
             .as_ref()
-            .filter(|p| p.kind.can_create_database())
+            .filter(|p| p.kind.can_create_database() && p.supports_mutation())
             .map(|p| p.id);
         let can_copy = profile.as_ref().is_some_and(|p| {
-            matches!(
-                p.kind,
-                DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
-            )
+            p.supports_mutation()
+                && matches!(
+                    p.kind,
+                    DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+                )
         });
         let connected = selected
             .as_ref()
             .is_some_and(|(id, _)| self.states.get(id).is_some_and(|state| state == "已连接"));
-        let writable = profile
-            .as_ref()
-            .is_some_and(|p| p.kind != DatabaseKind::Sqlite || !p.sqlite_read_only);
+        let writable = profile.as_ref().is_some_and(|p| p.supports_mutation());
         let relational = profile
             .as_ref()
-            .is_some_and(|p| p.kind != DatabaseKind::Redis);
+            .is_some_and(|p| !matches!(p.kind, DatabaseKind::Redis | DatabaseKind::External));
         let copy_source = selected.clone();
         let mut body = div()
             .v_flex()
@@ -158,6 +157,19 @@ impl DatabaseView {
                     .gap_1()
                     .child(div().flex_1().child(t(cx, "dbwork.objects")))
                     .child(
+                        Button::new("objects-copy-database")
+                            .ghost()
+                            .icon(IconName::Copy)
+                            .tooltip(t(cx, "database.copy_name"))
+                            .disabled(selected.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some((_, db)) = &this.selected_database {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(db.clone()));
+                                    feedback::success(t(cx, "feedback.copied"), cx);
+                                }
+                            })),
+                    )
+                    .child(
                         Button::new("objects-refresh")
                             .ghost()
                             .icon(crate::assets::refresh_icon())
@@ -165,7 +177,8 @@ impl DatabaseView {
                             .disabled(busy || !connected)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 if let Some((id, db)) = this.selected_database.clone() {
-                                    this.select_database(id, db, cx);
+                                    let _ = db;
+                                    this.request_operation(id, OperationKind::Databases, cx);
                                 }
                             })),
                     )

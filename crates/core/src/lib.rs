@@ -2,5 +2,5 @@
 pub mod notebook;
 pub mod query;
 
-pub use notebook::{Cell, CellContent, Note, NoteError, TaskStatus};
+pub use notebook::{Cell, CellContent, Note, NoteError, TaskItem, TaskStatus};
 pub use query::{QueryState, QueryStatus, QueryToken};

@@ -27,3 +27,6 @@ crashsight.local.json
 
 docs/plans/*
 docs/*.docx
+
+# Python driver host bytecode
+__pycache__/

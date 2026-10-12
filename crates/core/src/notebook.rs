@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Note {
@@ -38,12 +38,53 @@ pub enum CellContent {
     },
     Task {
         description: String,
+        #[serde(default)]
+        items: Vec<TaskItem>,
         status: TaskStatus,
         due_at: Option<i64>,
         remind_at: Option<i64>,
         linked_cells: Vec<Uuid>,
         connection_id: Option<Uuid>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TaskItem {
+    pub id: Uuid,
+    pub title: String,
+    #[serde(default)]
+    pub assignee: String,
+    #[serde(default)]
+    pub completed: bool,
+    pub due_at: Option<i64>,
+    /// Minutes before the deadline; None disables reminders.
+    pub reminder_minutes: Option<i64>,
+    #[serde(default)]
+    pub reminded_at: Option<i64>,
+}
+impl TaskItem {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            title: title.into(),
+            assignee: String::new(),
+            completed: false,
+            due_at: None,
+            reminder_minutes: None,
+            reminded_at: None,
+        }
+    }
+    pub fn reminder_at(&self) -> Option<i64> {
+        if self.completed {
+            return None;
+        }
+        self.due_at?
+            .checked_sub(self.reminder_minutes?.checked_mul(60)?)
+    }
+    pub fn needs_reminder(&self, now: i64) -> bool {
+        self.reminder_at()
+            .is_some_and(|at| at <= now && self.reminded_at != Some(at))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +105,8 @@ pub enum NoteError {
     DuplicateCell(Uuid),
     #[error("笔记标题或项目名称过长")]
     MetadataTooLong,
+    #[error("任务项数据无效或超过上限")]
+    InvalidTask,
 }
 
 impl Note {
@@ -86,10 +129,11 @@ impl Note {
             schema_version: u32,
         }
         let version: Version = serde_json::from_str(json)?;
-        if version.schema_version != SCHEMA_VERSION {
+        if ![1, SCHEMA_VERSION].contains(&version.schema_version) {
             return Err(NoteError::UnsupportedVersion(version.schema_version));
         }
-        let note: Self = serde_json::from_str(json)?;
+        let mut note: Self = serde_json::from_str(json)?;
+        note.schema_version = SCHEMA_VERSION;
         note.validate()?;
         Ok(note)
     }
@@ -108,6 +152,22 @@ impl Note {
         }
         let mut ids = HashSet::new();
         for cell in &self.cells {
+            if let CellContent::Task { items, .. } = &cell.content {
+                if items.len() > 1000 {
+                    return Err(NoteError::InvalidTask);
+                }
+                for item in items {
+                    if !ids.insert(item.id)
+                        || item.title.len() > 8192
+                        || item.assignee.len() > 1024
+                        || item
+                            .reminder_minutes
+                            .is_some_and(|v| !(0..=10080).contains(&v))
+                    {
+                        return Err(NoteError::InvalidTask);
+                    }
+                }
+            }
             if !ids.insert(cell.id) {
                 return Err(NoteError::DuplicateCell(cell.id));
             }
@@ -128,6 +188,7 @@ impl Note {
             }),
             Cell::new("验证查询口径", CellContent::Task {
                 description: "核对数据范围，记录分析结论。".into(),
+                items:vec![],
                 status: TaskStatus::Pending,
                 due_at: None,
                 remind_at: None,
@@ -144,7 +205,16 @@ impl Cell {
     pub fn duplicate(&self) -> Self {
         let mut copied = self.clone();
         copied.id = Uuid::new_v4();
-        if let CellContent::Task { linked_cells, .. } = &mut copied.content {
+        if let CellContent::Task {
+            items,
+            linked_cells,
+            ..
+        } = &mut copied.content
+        {
+            for item in items {
+                item.id = Uuid::new_v4();
+                item.reminded_at = None;
+            }
             for id in linked_cells {
                 if *id == self.id {
                     *id = copied.id;
@@ -169,6 +239,7 @@ impl Cell {
             },
             CellContent::Task { .. } => CellContent::Task {
                 description: String::new(),
+                items: vec![],
                 status: TaskStatus::Pending,
                 due_at: None,
                 remind_at: None,
@@ -190,6 +261,55 @@ impl Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn checklist_migration_roundtrip_and_copy_keep_independent_identity() {
+        let legacy = r#"{"schema_version":1,"id":"c19902b9-30ef-4657-8d14-b6ef704a0261","title":"task","cells":[{"id":"73e6f2f0-e92c-419b-a7cb-a385af974be7","title":"legacy","content":{"type":"task","description":"- first\n- second","status":"in_progress","due_at":null,"remind_at":null,"linked_cells":[],"connection_id":null}}]}"#;
+        let mut note = Note::from_json(legacy).unwrap();
+        assert_eq!(note.schema_version, 2);
+        let CellContent::Task {
+            items, description, ..
+        } = &mut note.cells[0].content
+        else {
+            panic!("task expected")
+        };
+        assert!(items.is_empty());
+        assert_eq!(description, "- first\n- second");
+        let mut item = TaskItem::new("first");
+        item.assignee = "owner".into();
+        item.due_at = Some(2000);
+        item.reminder_minutes = Some(5);
+        items.push(item);
+        assert_eq!(Note::from_json(&note.to_json().unwrap()).unwrap(), note);
+        let duplicate = note.cells[0].duplicate();
+        let CellContent::Task { items: copied, .. } = duplicate.content else {
+            panic!("task expected")
+        };
+        let CellContent::Task {
+            items: original, ..
+        } = &note.cells[0].content
+        else {
+            panic!("task expected")
+        };
+        assert_ne!(copied[0].id, original[0].id);
+        assert!(copied[0].reminded_at.is_none());
+    }
+    #[test]
+    fn reminders_deduplicate_complete_and_reschedule_without_overflow() {
+        let mut item = TaskItem::new("task");
+        item.due_at = Some(2000);
+        item.reminder_minutes = Some(5);
+        assert!(!item.needs_reminder(1699));
+        assert!(item.needs_reminder(1700));
+        item.reminded_at = item.reminder_at();
+        assert!(!item.needs_reminder(1800));
+        item.due_at = Some(2200);
+        assert!(item.needs_reminder(1900));
+        item.completed = true;
+        assert!(!item.needs_reminder(9999));
+        item.completed = false;
+        item.due_at = Some(i64::MIN);
+        assert_eq!(item.reminder_at(), None);
+    }
     #[test]
     fn note_defaults_round_trip_without_rebinding_existing_cells() {
         let mut note = Note::welcome();

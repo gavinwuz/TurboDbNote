@@ -14,6 +14,7 @@ use std::{
 use turbodbn_services::mysql_drivers;
 
 pub struct DriverManager {
+    pub selected_group: &'static str,
     root: PathBuf,
     details: bool,
     path: Option<PathBuf>,
@@ -36,6 +37,7 @@ impl DriverManager {
                     .then_some(local)
             });
         Self {
+            selected_group: "all",
             helper_available: std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.join("turbodbnote-mysql-legacy.exe")))

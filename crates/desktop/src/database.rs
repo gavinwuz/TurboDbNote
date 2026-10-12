@@ -80,7 +80,7 @@ pub struct DatabaseView {
 
     choosing_type: bool,
     type_grid: bool,
-    typed_drafts: HashMap<DatabaseKind, (Profile, String)>,
+    typed_drafts: HashMap<String, (Profile, String)>,
     navigation: Navigation,
     navigation_error: bool,
     nav_writer: async_channel::Sender<Navigation>,
@@ -462,7 +462,7 @@ impl DatabaseView {
                     cx.new(|cx| {
                         let input = InputState::new(window, cx).placeholder(match *key {
                             "name" => crate::locale::t(cx, "dbwork.connection.name.required"),
-                            "group" => crate::locale::t(cx, "dbwork.project.name"),
+                            "group" => crate::locale::t(cx, "dbwork.project.placeholder"),
                             "type_filter" => crate::locale::t(cx, "grid.connection.filter"),
                             "database" => {
                                 crate::locale::t(cx, "dbwork.connection.database.required")
@@ -660,6 +660,12 @@ impl DatabaseView {
         }
         let mut record = Record::new(id, kind, phase);
         record.source = Some(id);
+        record.context = self
+            .profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
         record.elapsed_ms = self
             .operation_started
             .get(&id)
@@ -748,9 +754,22 @@ impl DatabaseView {
         };
         Ok(profile)
     }
+    fn empty_driver_profile(driver: &turbodbn_services::driver_catalog::DriverSpec) -> Profile {
+        let mut p = driver.profile();
+        p.name.clear();
+        p.group.clear();
+        p.remember_password = !driver.file;
+        p.tls = TlsMode::Disabled;
+        p.allow_old_auth = driver.id == "mysql";
+        if p.kind == DatabaseKind::Redis {
+            p.database = "0".into();
+        }
+        p
+    }
     fn empty_profile(kind: DatabaseKind) -> Profile {
         let mut p = turbodbn_services::database::defaults(kind);
         p.name.clear();
+        p.group.clear();
         p.remember_password = kind != DatabaseKind::Sqlite;
         p.tls = TlsMode::Disabled;
         p.allow_old_auth = kind == DatabaseKind::MySql;
@@ -1222,6 +1241,7 @@ impl DatabaseView {
                                     }
                                 }
                                 Event::Failed(error) => {
+                                    let error = crate::locale::message(cx, &error).to_string();
                                     this.operation_log(
                                         id,
                                         crate::operation_log::Kind::Connection,
@@ -2175,11 +2195,11 @@ impl Render for DatabaseView {
             .gap_4()
             .p_4()
             .track_focus(&self.focus)
-            .child(div().h_flex().justify_between().child(div().text_lg().child(format!("{} 连接",self.editing.kind.label())))
+            .child(div().h_flex().justify_between().child(div().text_lg().child(format!("{} 连接",self.editing.driver_label())))
                 .when(!self.profiles.iter().any(|p|p.id==id),|el|el.child(Button::new("choose-database-type").icon(IconName::ArrowLeft).label("选择类型")
                     .on_click(cx.listener(|this,_,_,cx|{this.choosing_type=true;cx.notify();})))))
             .child(div().h_flex().gap_2().children(["连接信息", "TLS / SSL", "高级"].into_iter().enumerate().map(|(index,label)| {
-                Button::new(("connection-tab",index)).label(label).selected(self.tab==index).disabled(index==1&&self.editing.kind==DatabaseKind::Sqlite)
+                Button::new(("connection-tab",index)).label(label).selected(self.tab==index).disabled(index==1&&(self.editing.is_file_database() || self.editing.driver_id == "db2"))
                     .on_click(cx.listener(move |this,_,_,cx|{this.tab=index;cx.notify();}))
             })))
             .child(div().id("connection-form-body").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_3()
@@ -2192,7 +2212,7 @@ impl Render for DatabaseView {
                     .child(self.combo("group", "",self.profiles.iter().map(|p|p.group.clone()).chain(self.navigation.categories.clone()).collect(),cx))
                     .child(self.combo("environment", "环境（可自定义）",["开发","测试","预发","正式"].into_iter().map(String::from).chain(self.profiles.iter().map(|p|p.environment.clone())).chain(self.navigation.environments.clone()).collect(),cx)),
             )
-            .when(self.editing.kind!=DatabaseKind::Sqlite,|el|el
+            .when(!self.editing.is_file_database(),|el|el
             .child(
                 div()
                     .h_flex()
@@ -2222,16 +2242,17 @@ impl Render for DatabaseView {
                         } else { "feedback.password.memory_only" })))
             ))
             )
-            .when(self.editing.kind==DatabaseKind::Sqlite,|el|el
+            .when(self.editing.driver_id=="access",|el|el.child(self.password_field(cx)))
+            .when(self.editing.is_file_database(),|el|el
                 .child(self.required_field("sqlite_path","dbwork.connection.file","dbwork.connection.file.required",cx))
                 .child(div().h_flex().gap_2()
                     .child(Button::new("sqlite-browse").icon(IconName::FolderOpen).label("选择文件").disabled(self.saving).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(false,window,cx))))
-                    .child(Button::new("sqlite-create").icon(IconName::Plus).label("新建文件").disabled(self.saving).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(true,window,cx)))))
-                .child(Switch::new("sqlite-read-only").label("只读连接").checked(self.editing.sqlite_read_only).disabled(self.saving)
+                    .child(Button::new("sqlite-create").icon(IconName::Plus).label("新建文件").disabled(self.saving || self.editing.kind!=DatabaseKind::Sqlite).on_click(cx.listener(|this,_,window,cx|this.browse_sqlite(true,window,cx)))))
+                .child(Switch::new("sqlite-read-only").label("只读连接").checked(self.editing.kind==DatabaseKind::External || self.editing.sqlite_read_only).disabled(self.saving || self.editing.kind==DatabaseKind::External)
                     .on_click(cx.listener(|this,v:&bool,_,cx|{this.editing.sqlite_read_only = *v;cx.notify();}))))
             .when(self.editing.kind==DatabaseKind::Redis,|el|el.child(Switch::new("redis-cluster").label("Redis 集群（仅 DB 0，浏览当前节点）").checked(self.editing.redis_cluster).disabled(self.saving)
                 .on_click(cx.listener(|this,v:&bool,_,cx|{this.editing.redis_cluster = *v;cx.notify();}))))
-            .when(self.editing.kind!=DatabaseKind::Sqlite,|el|el
+            .when(!self.editing.is_file_database(),|el|el
             .child(div().h_flex().gap_2().items_end()
                 .child(div().flex_1().min_w_0().child(self.combo("database","数据库 *",self.raw_draft(cx).ok().map(|p|self.catalog(&p)).unwrap_or_default(),cx)))
                 .child(Button::new("detect-databases").flex_shrink_0().icon(IconName::Search).label("检测")
@@ -2239,6 +2260,10 @@ impl Render for DatabaseView {
                     .disabled(self.saving||running).on_click(cx.listener(|this,_,_,cx|this.start_request(true,true,cx)))))
             )
             )
+            .when(self.editing.kind==DatabaseKind::External,|el|el.child(div().text_sm().whitespace_normal().child(crate::locale::t(cx,"drivers.external_scope"))))
+            .when(self.editing.kind==DatabaseKind::External,|el|el.child(div().text_sm().whitespace_normal().child(crate::locale::t(cx,match self.editing.driver_id.as_str() {
+                "access" => "drivers.hint.access", "sqlserver" => "drivers.hint.sqlserver", "oracle" => "drivers.hint.oracle", "mongodb" => "drivers.hint.mongodb", "h2" => "drivers.removed", "db2" => "drivers.hint.db2", "cassandra" => "drivers.hint.cassandra", "tdengine" => "drivers.hint.tdengine", _ => "drivers.hint.elasticsearch"
+            }))))
             .when(self.tab==2,|el|el
             .when(self.editing.kind==DatabaseKind::MySql,|el|el
             .child(Button::new("driver-override").ghost().icon(IconName::Settings2).label(crate::locale::t(cx,"dbwork.driver_override"))
@@ -2364,7 +2389,7 @@ impl Render for DatabaseView {
                 el.child(Button::new("connection-details").ghost().icon(IconName::Info).label(if self.connection_details {"收起连接详情"}else{"连接详情"})
                     .on_click(cx.listener(|this,_,_,cx|{this.connection_details = !this.connection_details;cx.notify();})))
                     .when(self.connection_details,|el|el.child(div().v_flex().gap_1().text_sm()
-                        .child(format!("{} {} · 会话 {} · {} ms",self.editing.kind.label(),info.version,info.session_id,info.elapsed_ms))
+                        .child(format!("{} {} · 会话 {} · {} ms",self.editing.driver_label(),info.version,info.session_id,info.elapsed_ms))
                         .child(format!("字符集：{} · 数据库：{}",info.charset,info.database.as_deref().unwrap_or("未选择")))
                         .child(format!("TLS：{}",if info.tls_cipher.is_empty(){"未加密"}else{&info.tls_cipher}))
                         .when_some(info.database_list_error.as_ref(),|el,error|el.child(error.clone()))))
@@ -2375,7 +2400,7 @@ impl Render for DatabaseView {
 fn required_connection_field(profile: &Profile, discover: bool) -> Option<&'static str> {
     if !discover && profile.name.trim().is_empty() {
         Some("dbwork.connection.name.required")
-    } else if profile.kind == DatabaseKind::Sqlite {
+    } else if profile.is_file_database() {
         profile
             .sqlite_path
             .trim()
@@ -2390,13 +2415,13 @@ fn required_connection_field(profile: &Profile, discover: bool) -> Option<&'stat
 fn generated_connection_name(profile: &Profile, profiles: &[Profile]) -> String {
     let prefix = if !profile.database.trim().is_empty() {
         profile.database.clone()
-    } else if profile.kind == DatabaseKind::Sqlite {
+    } else if profile.is_file_database() {
         std::path::Path::new(&profile.sqlite_path)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "SQLite".into())
     } else {
-        profile.kind.label().to_string()
+        profile.driver_label().to_string()
     };
     let prefix = prefix.chars().take(18).collect::<String>();
     let used = |name: &str| {
@@ -2500,8 +2525,20 @@ mod new_connection_defaults_tests {
         let new = super::DatabaseView::empty_profile(turbodbn_services::DatabaseKind::MySql);
         assert_eq!(new.tls, turbodbn_services::mysql::TlsMode::Disabled);
         assert!(new.allow_old_auth);
+        assert!(new.group.is_empty());
+        for driver in turbodbn_services::driver_catalog::DRIVERS {
+            assert!(
+                super::DatabaseView::empty_driver_profile(driver)
+                    .group
+                    .is_empty()
+            );
+        }
         let old: turbodbn_services::mysql::Profile = serde_json::from_str("{}").unwrap();
         assert_eq!(old.tls, turbodbn_services::mysql::TlsMode::VerifyIdentity);
         assert!(!old.allow_old_auth);
+        assert_eq!(old.group, "开发环境");
+        let existing: turbodbn_services::mysql::Profile =
+            serde_json::from_str(r#"{"group":"Existing project"}"#).unwrap();
+        assert_eq!(existing.group, "Existing project");
     }
 }

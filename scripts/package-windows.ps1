@@ -15,6 +15,7 @@ $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $PSScriptRoot 'prepare-package-build.ps1')
 . (Join-Path $PSScriptRoot 'stage-crashsight.ps1')
 . (Join-Path $PSScriptRoot 'stage-mysql-driver.ps1')
+. (Join-Path $PSScriptRoot 'stage-database-drivers.ps1')
 $targetRoot = Join-Path $root 'target'
 New-Item -ItemType Directory -Path $targetRoot -Force | Out-Null
 $packageLock = [IO.File]::Open((Join-Path $targetRoot 'package-build.lock'), [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
@@ -51,13 +52,13 @@ try {
     $notes = Get-VersionReleaseNotes -ChangelogPath (Join-Path $root 'CHANGELOG.md') -Version $version
     $notesZh = Get-VersionReleaseNotes -ChangelogPath (Join-Path $root 'CHANGELOG.zh-CN.md') -Version $version
     Invoke-Checked cargo @('fmt', '--all', '--', '--check')
-    Invoke-Checked cargo @('test', '--locked', '-p', 'turbodbn-core', '-p', 'turbodbn-services')
+    Invoke-Checked cargo @('test', '--locked', '-p', 'turbodbn-core', '-p', 'turbodbn-services', '-p', 'turbodbnote-driver-host')
     Invoke-Checked cargo @('clippy', '--locked', '--workspace', '--all-targets', '--', '-D', 'warnings')
     $buildWorkspace = New-PackageBuildWorkspace -Root $root -FxcPath $compiler
     $buildTarget = Join-Path $root 'target'
     Push-Location $buildWorkspace
     try {
-        Invoke-Checked cargo @('build', '--locked', '--release', '--target', 'x86_64-pc-windows-msvc', '--target-dir', $buildTarget, '-p', 'turbodbnote')
+        Invoke-Checked cargo @('build', '--locked', '--release', '--target', 'x86_64-pc-windows-msvc', '--target-dir', $buildTarget, '-p', 'turbodbnote', '-p', 'turbodbnote-driver-host')
     } finally { Pop-Location }
     $exe = Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote.exe'
     Invoke-Checked python @('scripts/verify-windows-icon.py', $exe)
@@ -77,13 +78,14 @@ try {
     if (-not (Test-Path -LiteralPath $legacyHelper)) {throw 'Legacy helper was not built'}
     Copy-Item -LiteralPath $legacyHelper -Destination $stage
     # Curated x64 client supports legacy 4.x servers; win32 4.x DLLs cannot load in this app.
+    Stage-DatabaseDrivers -Destination (Join-Path $stage 'drivers/native') -HostPath (Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote-driver-host.exe')
     Stage-MySqlDriver -Destination (Join-Path $stage 'drivers') -LegacyDriverArchive $LegacyDriverArchive -LegacySourceArchive $LegacySourceArchive
     # Include the exact application source used for this build alongside the third-party source.
     $sourceStage = Join-Path $stage 'sources/TurboDBNote'
     $sourceFiles = & git ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) { throw 'Unable to enumerate release source' }
     foreach ($sourceFile in ($sourceFiles | Sort-Object -Unique)) {
-        if ($sourceFile -notmatch '^(crates/|scripts/|installer/|Cargo\.(toml|lock)$|LICENSE$|README|CHANGELOG)' -or -not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) { continue }
+        if ($sourceFile -notmatch '^(crates/|drivers/|scripts/|installer/|Cargo\.(toml|lock)$|LICENSE$|README|CHANGELOG)' -or -not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) { continue }
         $destination = Join-Path $sourceStage $sourceFile
         New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
         Copy-Item -LiteralPath $sourceFile -Destination $destination
@@ -99,6 +101,11 @@ try {
     if (-not (Test-Path -LiteralPath $pdb -PathType Leaf)) { throw 'Release PDB missing; crash reports would not be symbolicated' }
     New-Item -ItemType Directory -Path $symbols | Out-Null
     Copy-Item -LiteralPath $exe, $pdb -Destination $symbols
+    foreach ($nativeSymbolName in @('turbodbnote-driver-host.exe', 'turbodbnote_driver_host.pdb')) {
+        $nativeSymbolFile = Join-Path $buildTarget "x86_64-pc-windows-msvc/release/$nativeSymbolName"
+        if (-not (Test-Path -LiteralPath $nativeSymbolFile -PathType Leaf)) { throw 'Native driver symbols missing' }
+        Copy-Item -LiteralPath $nativeSymbolFile -Destination $symbols
+    }
     Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination $stage
     $notes | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.md') -Encoding utf8
     $notesZh | Set-Content -LiteralPath (Join-Path $stage 'RELEASE-NOTES.zh-CN.md') -Encoding utf8

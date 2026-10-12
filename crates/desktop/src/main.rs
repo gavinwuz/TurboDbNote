@@ -28,10 +28,13 @@ mod result_document;
 mod settings;
 mod table_view;
 mod tabs;
+mod task_list;
 use turbodbn_services::database::transfer;
 mod typography;
 #[cfg(target_os = "windows")]
 mod windows_icon;
+#[cfg(target_os = "windows")]
+mod windows_tray;
 mod workspace;
 
 use gpui::*;
@@ -43,6 +46,7 @@ fn main() {
         windows_icon::install_guard().expect("Unable to register running application");
     Application::new().with_assets(assets::Assets).run(|cx| {
         gpui_component::init(cx);
+        cell::markdown_tools::init(cx);
         register_sql_highlighting();
         let diagnostics = diagnostics::start();
         let preferences = preferences::Preferences::load();
@@ -131,7 +135,7 @@ fn main() {
             let view = cx.new(|cx| workspace::Workspace::new(window, cx));
             let weak = view.downgrade();
             window.on_window_should_close(cx, move |window, cx| {
-                weak.update(cx, |view, cx| view.prepare_close(window, cx))
+                weak.update(cx, |view, cx| view.request_window_close(window, cx))
                     .unwrap_or(true)
             });
             cx.new(|cx| Root::new(view, window, cx))

@@ -8,6 +8,8 @@ use gpui_component::{
 #[derive(Clone)]
 pub struct Message {
     pub kind: NotificationType,
+    pub persistent: bool,
+    pub id: Option<SharedString>,
     pub text: SharedString,
 }
 #[derive(Clone, PartialEq, Eq)]
@@ -27,15 +29,31 @@ pub struct Events;
 impl EventEmitter<OpenSqlSettings> for Events {}
 impl EventEmitter<Message> for Events {}
 impl EventEmitter<SqlDraft> for Events {}
+#[derive(Default)]
+pub struct InspectorSource(pub Option<String>);
+impl Global for InspectorSource {}
 pub struct Hub(pub Entity<Events>);
 impl Global for Hub {}
 pub fn init(cx: &mut App) {
     let events = cx.new(|_| Events);
     cx.set_global(Hub(events));
+    cx.set_global(InspectorSource::default());
 }
 pub fn notify(kind: NotificationType, text: impl Into<SharedString>, cx: &mut App) {
     let event = Message {
         kind,
+        persistent: false,
+        id: None,
+        text: text.into(),
+    };
+    let hub = cx.global::<Hub>().0.clone();
+    hub.update(cx, |_, cx| cx.emit(event));
+}
+pub fn task_reminder(id: uuid::Uuid, scheduled: i64, text: impl Into<SharedString>, cx: &mut App) {
+    let event = Message {
+        kind: NotificationType::Warning,
+        persistent: true,
+        id: Some(format!("task-{id}-{scheduled}").into()),
         text: text.into(),
     };
     let hub = cx.global::<Hub>().0.clone();
@@ -45,7 +63,12 @@ pub fn success(text: impl Into<SharedString>, cx: &mut App) {
     notify(NotificationType::Success, text, cx)
 }
 pub fn error(text: impl Into<SharedString>, cx: &mut App) {
-    notify(NotificationType::Error, text, cx)
+    let text = text.into();
+    notify(
+        NotificationType::Error,
+        crate::locale::message(cx, &text),
+        cx,
+    )
 }
 pub fn actions() -> Div {
     div().h_flex().justify_end().w_full().gap_3().pt_3()
@@ -264,6 +287,7 @@ pub fn sql_preview_observed(
 #[derive(Clone)]
 pub struct DetailRequest {
     pub inspector: bool,
+    pub refresh: bool,
     pub title: String,
     pub entries: Vec<(String, String)>,
     pub text: String,

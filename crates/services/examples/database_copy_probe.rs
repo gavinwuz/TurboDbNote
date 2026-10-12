@@ -40,6 +40,7 @@ fn main() {
     let created = call(OperationKind::CreateDatabase {
         name: "charset_copy".into(),
         charset: "gbk".into(),
+        collation: String::new(),
     });
     if version.starts_with("4.0") {
         assert!(created.is_err());

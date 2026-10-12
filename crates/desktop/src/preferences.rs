@@ -79,6 +79,7 @@ pub struct GeneralPreferences {
     pub font_size: f32,
     pub note_directory: String,
     pub note_autosave: bool,
+    pub close_to_tray: bool,
     pub theme: Option<String>,
 }
 impl Default for GeneralPreferences {
@@ -89,6 +90,7 @@ impl Default for GeneralPreferences {
             font_size: 14.,
             note_directory: String::new(),
             note_autosave: true,
+            close_to_tray: false,
             theme: None,
         }
     }
@@ -297,6 +299,7 @@ mod tests {
         prefs.general.font_size = 20.;
         prefs.general.note_directory = directory.path().join("notes").display().to_string();
         prefs.general.note_autosave = false;
+        prefs.general.close_to_tray = true;
         prefs.providers.push(ProviderPreferences {
             api_key: "test-key".into(),
             api_mode: "Anthropic Messages".into(),
@@ -307,6 +310,7 @@ mod tests {
         prefs.save_to(&path).unwrap();
         let loaded = Preferences::load_from(&path).unwrap();
         assert_eq!(loaded.general, prefs.general);
+        assert!(loaded.general.close_to_tray);
         assert_eq!(loaded.providers, prefs.providers);
         assert_eq!(loaded.extensions, prefs.extensions);
     }
@@ -408,15 +412,18 @@ mod database_preferences_tests {
         let legacy: Preferences = serde_json::from_str(r#"{"general":{"font_size":18}}"#).unwrap();
         assert_eq!(legacy.general.font_size, 18.);
         assert!(legacy.general.note_autosave);
+        assert!(!legacy.general.close_to_tray);
         assert!(legacy.general.note_directory.is_empty());
         assert_eq!(Preferences::default().general.font_size, 14.);
         assert_eq!(legacy.database, DatabasePreferences::default());
         let mut changed = legacy;
+        changed.general.close_to_tray = true;
         changed.database.page_size = 500;
         changed.database.sql_wrap = false;
         let restored: Preferences =
             serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
         assert_eq!(restored.database, changed.database);
+        assert!(restored.general.close_to_tray);
         assert!(restored.database.confirm_destructive);
         assert!(!restored.database.sql_enter);
     }

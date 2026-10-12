@@ -195,7 +195,7 @@ impl ChatView {
                                 } else {
                                     p.database.clone()
                                 },
-                                kind: p.kind.label().into(),
+                                kind: p.driver_label().into(),
                             });
                             if let Some(db) = this.databases.as_ref() {
                                 let _ = db

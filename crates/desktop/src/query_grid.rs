@@ -71,7 +71,8 @@ impl TableDelegate for QueryGrid {
             .and_then(|r| r.get(col))
             .and_then(|v| v.as_deref())
             .unwrap_or("NULL");
-        div()
+        let copy = value.to_string();
+        let cell = div()
             .id(("query-value", row * 513 + index))
             .size_full()
             .px_1()
@@ -88,7 +89,24 @@ impl TableDelegate for QueryGrid {
                 table.delegate_mut().selected = Some((row, col));
                 window.focus(&table.focus_handle(cx));
                 cx.notify();
-            }))
-            .into_any_element()
+            }));
+        crate::context_menu::cell(
+            ("query-value-menu", row * 513 + index),
+            cell,
+            move |menu, _, cx| {
+                let copy = copy.clone();
+                menu.item(
+                    gpui_component::menu::PopupMenuItem::new(crate::locale::t(
+                        cx,
+                        "grid.copy.cell",
+                    ))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
+                        crate::feedback::success(crate::locale::t(cx, "feedback.copied"), cx);
+                    }),
+                )
+            },
+        )
+        .into_any_element()
     }
 }

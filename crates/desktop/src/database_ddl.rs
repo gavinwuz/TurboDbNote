@@ -9,6 +9,10 @@ pub(super) struct DdlState {
     objects: Vec<Object>,
     selected: Option<Object>,
     text: String,
+    schema: Option<workbench::Schema>,
+    grid: Option<Entity<gpui_component::table::TableState<crate::query_grid::QueryGrid>>>,
+    text_mode: bool,
+    text_scroll: ScrollHandle,
     notice: String,
     loaded: bool,
     pub(super) pending: bool,
@@ -54,7 +58,9 @@ impl DatabaseView {
                     self.ddl.loaded = true;
                 }
                 Reply::Schema(schema) => {
-                    self.ddl.text = schema.ddl;
+                    self.ddl.text = schema.ddl.clone();
+                    self.ddl.schema = Some(schema);
+                    self.ddl.grid = None;
                     if self.ddl.text.is_empty() {
                         self.ddl.notice = t(cx, "ddl.empty").to_string();
                     }
@@ -97,6 +103,8 @@ impl DatabaseView {
             if self.ddl.context.is_some() {
                 self.ddl.selected = None;
             }
+            self.ddl.schema = None;
+            self.ddl.grid = None;
             self.ddl.context = context;
             self.ddl.objects.clear();
             self.ddl.text.clear();
@@ -107,6 +115,39 @@ impl DatabaseView {
             let filter = cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "ddl.filter")));
             self.ddl.subscription = Some(cx.observe(&filter, |_, _, cx| cx.notify()));
             self.ddl.filter = Some(filter);
+        }
+        if self.ddl.grid.is_none()
+            && let Some(schema) = &self.ddl.schema
+        {
+            let rows = workbench::Rows {
+                columns: vec![
+                    t(cx, "details.field").to_string(),
+                    t(cx, "grid.structure.type").to_string(),
+                    t(cx, "details.definition").to_string(),
+                ],
+                values: schema
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        vec![
+                            Some(c.name.clone()),
+                            Some(c.data_type.clone()),
+                            Some(format!(
+                                "{} {}",
+                                if c.primary { "PRIMARY KEY" } else { "" },
+                                c.comment
+                            )),
+                        ]
+                    })
+                    .collect(),
+            };
+            self.ddl.grid = Some(cx.new(|cx| {
+                gpui_component::table::TableState::new(
+                    crate::query_grid::QueryGrid::new(rows, 0),
+                    window,
+                    cx,
+                )
+            }));
         }
         let filter = self.ddl.filter.as_ref().unwrap().clone();
         let search = filter.read(cx).value().to_lowercase();
@@ -131,7 +172,7 @@ impl DatabaseView {
             && let Some(object) = self.ddl.selected.clone()
         {
             cx.defer_in(window, move |this, _, cx| {
-                this.request_ddl(Action::Ddl(object), cx);
+                this.request_ddl(Action::Describe(object), cx);
             });
         }
         let objects = self
@@ -148,9 +189,57 @@ impl DatabaseView {
         body = body
             .child(
                 div()
-                    .text_sm()
-                    .whitespace_normal()
-                    .child(format!("{name} / {database}")),
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_ellipsis()
+                            .overflow_hidden()
+                            .child(format!("{name} / {database}")),
+                    )
+                    .child(
+                        Button::new("ddl-refresh")
+                            .ghost()
+                            .icon(crate::assets::refresh_icon())
+                            .tooltip(t(cx, "dbwork.refresh"))
+                            .disabled(self.ddl.pending)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ddl.loaded = false;
+                                this.ddl.text.clear();
+                                this.ddl.schema = None;
+                                this.ddl.grid = None;
+                                this.ddl.notice.clear();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("ddl-copy")
+                            .ghost()
+                            .icon(IconName::Copy)
+                            .tooltip(t(cx, "dbwork.copy.ddl"))
+                            .disabled(self.ddl.text.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    this.ddl.text.clone(),
+                                ));
+                                feedback::success(t(cx, "feedback.copied"), cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("ddl-mode")
+                            .ghost()
+                            .label(if self.ddl.text_mode {
+                                t(cx, "grid.structure.table").to_string()
+                            } else {
+                                "TXT".into()
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ddl.text_mode = !this.ddl.text_mode;
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(Input::new(&filter).cleanable(true))
             .child(
@@ -184,6 +273,8 @@ impl DatabaseView {
                                                 }
                                                 this.ddl.selected = Some(object.clone());
                                                 this.ddl.text.clear();
+                                                this.ddl.schema = None;
+                                                this.ddl.grid = None;
                                                 this.ddl.notice.clear();
                                                 cx.notify();
                                             });
@@ -198,39 +289,18 @@ impl DatabaseView {
             .when(self.ddl.pending, |el| el.child(t(cx, "ddl.loading")))
             .when(!self.ddl.notice.is_empty(), |el| {
                 el.child(div().whitespace_normal().child(self.ddl.notice.clone()))
-            })
-            .child(
+            });
+        if !self.ddl.text_mode
+            && let Some(grid) = &self.ddl.grid
+        {
+            body = body.child(
                 div()
-                    .h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("ddl-refresh")
-                            .ghost()
-                            .icon(crate::assets::refresh_icon())
-                            .tooltip(t(cx, "dbwork.refresh"))
-                            .disabled(self.ddl.pending)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.ddl.loaded = false;
-                                this.ddl.text.clear();
-                                this.ddl.notice.clear();
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("ddl-copy")
-                            .ghost()
-                            .icon(IconName::Copy)
-                            .tooltip(t(cx, "dbwork.copy.ddl"))
-                            .disabled(self.ddl.text.is_empty())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    this.ddl.text.clone(),
-                                ));
-                                feedback::success(t(cx, "feedback.copied"), cx);
-                            })),
-                    ),
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(gpui_component::table::Table::new(grid)),
             );
-        if !self.ddl.text.is_empty() {
+        } else if !self.ddl.text.is_empty() {
             let fence = "~".repeat(
                 self.ddl
                     .text
@@ -242,13 +312,42 @@ impl DatabaseView {
                     + 1,
             );
             body = body.child(
-                gpui_component::text::TextView::markdown(
-                    "database-ddl",
-                    format!("{fence}sql\n{}\n{fence}", self.ddl.text),
-                    window,
-                    cx,
-                )
-                .selectable(true),
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .child(
+                        div()
+                            .id("ddl-content-scroll")
+                            .size_full()
+                            .min_w_0()
+                            .pr_4()
+                            .track_scroll(&self.ddl.text_scroll)
+                            .overflow_y_scroll()
+                            .child(
+                                gpui_component::text::TextView::markdown(
+                                    "database-ddl",
+                                    format!("{fence}sql\n{}\n{fence}", self.ddl.text),
+                                    window,
+                                    cx,
+                                )
+                                .selectable(true)
+                                .h_auto(),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .bottom_0()
+                            .w(px(14.))
+                            .child(
+                                gpui_component::scroll::Scrollbar::vertical(&self.ddl.text_scroll)
+                                    .scrollbar_show(gpui_component::scroll::ScrollbarShow::Always),
+                            ),
+                    ),
             );
         }
         body.into_any_element()

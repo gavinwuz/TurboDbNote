@@ -10,6 +10,7 @@ pub enum WriteMode {
 }
 #[derive(Clone, Serialize)]
 pub struct Options {
+    pub collation: Option<String>,
     pub crlf: bool,
     pub excluded_objects: Vec<(String, String)>,
     pub tables: Option<Vec<String>>,
@@ -23,6 +24,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            collation: None,
             crlf: false,
             excluded_objects: vec![],
             tables: None,
@@ -45,6 +47,18 @@ impl Options {
         contents: Contents,
         profile: &Profile,
     ) -> Result<(), String> {
+        if let Some(collation) = &self.collation
+            && (mode != Mode::Copy
+                || crate::mysql::uses_legacy(profile)
+                || profile.kind != DatabaseKind::MySql
+                || collation.is_empty()
+                || collation.len() > 64
+                || !collation
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        {
+            return Err("排序规则仅支持 MySQL 新库，且须为合法名称".into());
+        }
         if !self.excluded_objects.is_empty()
             && (mode == Mode::ImportFile
                 || profile.kind == DatabaseKind::PostgreSql
@@ -392,7 +406,9 @@ pub(super) fn preflight_data(
             )
         };
         if from.is_empty() || from != to {
-            return Err("来源与目标表结构不同，已有库传输需要先建立匹配表结构".into());
+            return Err(format!(
+                "表 {table} 的来源与目标列定义或主键不同；请先建立匹配表结构，或选择复制到新库。未执行该表写入。"
+            ));
         }
         if options.write_mode == WriteMode::Upsert {
             suffix(&to, source.profile.kind == DatabaseKind::MySql)?;

@@ -84,9 +84,38 @@ async fn run(
     events: Sender<Event>,
 ) -> Result<(), String> {
     profile.validate()?;
-    validate(&profile)?;
+    let _permit = if profile.kind == crate::DatabaseKind::External {
+        Some(crate::external_driver::acquire()?)
+    } else {
+        None
+    };
+    let command = if profile.kind == crate::DatabaseKind::External {
+        crate::external_driver::command(&profile)?
+    } else {
+        validate(&profile)?;
+        tokio::process::Command::new(helper_path()?)
+    };
+    run_process(
+        command, profile, password, test_only, stop, requests, events,
+    )
+    .await
+}
+async fn run_process(
+    mut command: tokio::process::Command,
+    profile: Profile,
+    password: String,
+    test_only: bool,
+    stop: Receiver<()>,
+    requests: Receiver<Operation>,
+    events: Sender<Event>,
+) -> Result<(), String> {
     let timeout = Duration::from_secs(profile.timeout_seconds.clamp(1, 60));
-    let mut command = tokio::process::Command::new(helper_path()?);
+    let startup_timeout = timeout
+        + if profile.kind == crate::DatabaseKind::External {
+            Duration::from_secs(30)
+        } else {
+            Duration::ZERO
+        };
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -169,7 +198,7 @@ async fn run(
         }
     };
     tokio::pin!(result);
-    let deadline = tokio::time::sleep(timeout);
+    let deadline = tokio::time::sleep(startup_timeout);
     tokio::pin!(deadline);
     let mut waiting = true;
     let result = loop {
@@ -230,6 +259,9 @@ unsafe fn text(pointer: *const c_char) -> String {
     }
 }
 fn database_error(number: u32) -> String {
+    if let Some(message) = crate::mysql::statement_error(number) {
+        return message.into();
+    }
     match number {
         1045 => "兼容驱动认证失败，请检查密码和主机授权".into(),
         1049 => "默认数据库不存在".into(),
@@ -670,14 +702,21 @@ unsafe fn legacy_operation(
                         vec![p.database.clone()]
                     },
                 )),
-                OperationKind::CreateDatabase { name, charset } => {
-                    if version.starts_with("4.0") && !charset.is_empty() {
+                OperationKind::CreateDatabase {
+                    name,
+                    charset,
+                    collation,
+                } => {
+                    if version.starts_with("4.0") && (!charset.is_empty() || !collation.is_empty())
+                    {
                         return Err("MySQL 4.0 仅支持服务器默认字符集".into());
                     }
                     legacy_rows(
                         raw,
                         library,
-                        &crate::database::create_database_sql(p.kind, name, charset)?,
+                        &crate::database::create_database_sql_with_collation(
+                            p.kind, name, charset, collation,
+                        )?,
                         encoding,
                     )?;
                     Ok(OperationResult::Created(name.clone()))
@@ -893,6 +932,12 @@ unsafe fn legacy_workbench_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sql_syntax_and_missing_table_have_shared_sanitized_categories() {
+        assert_eq!(database_error(1064), crate::mysql::SQL_SYNTAX_ERROR);
+        assert_eq!(database_error(1146), crate::mysql::TABLE_MISSING);
+        assert_eq!(crate::mysql::statement_error(1142), None);
+    }
     #[test]
     fn chinese_database_names_decode_without_loss() {
         let (bytes, _, _) = encoding_rs::GBK.encode("测试数据库");

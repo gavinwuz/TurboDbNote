@@ -239,6 +239,13 @@ impl Configuration {
         self.sync_fields(window, cx);
         cx.notify();
     }
+    #[cfg(target_os = "windows")]
+    pub fn sync_close_to_tray(&mut self, value: bool, cx: &mut Context<Self>) {
+        // Only synchronize the externally persisted field; keep unrelated drafts.
+        self.general.close_to_tray = value;
+        self.baseline.0.close_to_tray = value;
+        cx.notify();
+    }
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
         if self.locked {
             return false;
@@ -600,6 +607,25 @@ impl Configuration {
                     }),
             )
             .child(self.typography_controls(window, cx));
+        #[cfg(target_os = "windows")]
+        {
+            body = body.child(
+                div()
+                    .v_flex()
+                    .gap_2()
+                    .child(
+                        gpui_component::switch::Switch::new("close-to-tray")
+                            .label(t(cx, "settings.general.close_to_tray"))
+                            .checked(self.general.close_to_tray)
+                            .disabled(self.locked)
+                            .on_click(cx.listener(|this, value, _, cx| {
+                                this.general.close_to_tray = *value;
+                                cx.notify();
+                            })),
+                    )
+                    .child(t(cx, "settings.general.close_to_tray_hint")),
+            );
+        }
 
         body = body.child(
             div()

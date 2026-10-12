@@ -3,6 +3,7 @@ use turbodbn_services::{DatabaseKind, mysql::Profile};
 #[derive(Clone, PartialEq)]
 struct Scope {
     kind: DatabaseKind,
+    driver: String,
     host: String,
     port: u16,
     user: String,
@@ -11,7 +12,12 @@ impl From<&Profile> for Scope {
     fn from(p: &Profile) -> Self {
         Self {
             kind: p.kind,
-            host: p.host.trim().to_ascii_lowercase(),
+            driver: p.driver_spec().map(|d| d.id).unwrap_or("").into(),
+            host: if p.is_file_database() {
+                p.sqlite_path.clone()
+            } else {
+                p.host.trim().to_ascii_lowercase()
+            },
             port: p.port,
             user: p.user.clone(),
         }

@@ -1,0 +1,99 @@
+{
+  "mysql": {
+    "source": "https://raw.githubusercontent.com/devicons/devicon/master/icons/mysql/mysql-original.svg",
+    "file": "sources/mysql.svg",
+    "sha256": "f73fa5d6b9da33fbf540ff96f5360c24b6d29d883ecfe6fcaecf89a8d3456067",
+    "origin": "Devicon mirror of brand artwork"
+  },
+  "postgresql": {
+    "source": "https://www.postgresql.org/media/img/about/press/elephant.png",
+    "file": "sources/postgresql.png",
+    "sha256": "ff92fb5d12a7fa6b23c2eb403d2edf4fbc58ced802021e1f02c3583cb70957be",
+    "origin": "Vendor/project official asset"
+  },
+  "sqlite": {
+    "source": "https://raw.githubusercontent.com/devicons/devicon/master/icons/sqlite/sqlite-original.svg",
+    "file": "sources/sqlite.svg",
+    "sha256": "2b91c30887d3602479ba845cc012ef6ae577fba71eb96705a05b12e35d2c5e7e",
+    "origin": "Devicon mirror of brand artwork"
+  },
+  "sqlserver": {
+    "source": "https://raw.githubusercontent.com/devicons/devicon/master/icons/microsoftsqlserver/microsoftsqlserver-original.svg",
+    "file": "sources/sqlserver.svg",
+    "sha256": "f52b63cb5ff8c17efc079ae93eb7e2f1a04ca34eb736310c3576b19c0b9db21d",
+    "origin": "Devicon mirror of brand artwork"
+  },
+  "oracle": {
+    "source": "https://www.oracle.com/asset/web/favicons/favicon-192.png",
+    "file": "sources/oracle.png",
+    "sha256": "b3ad291d75a80c3514e5b056da003553d9cfee21d136fa310f72a0d69ad029e6",
+    "origin": "Vendor/project official asset"
+  },
+  "mariadb": {
+    "source": "https://mariadb.org/wp-content/themes/twentynineteen-child/icons/logo_seal.svg",
+    "file": "sources/mariadb.svg",
+    "sha256": "c8019efca99890a35d46abb98245549eaea243f15c1c1a404f7cce1e11946641",
+    "origin": "Vendor/project official asset"
+  },
+  "mongodb": {
+    "source": "https://raw.githubusercontent.com/devicons/devicon/master/icons/mongodb/mongodb-original.svg",
+    "file": "sources/mongodb.svg",
+    "sha256": "d9f2bf7041264f4747e9969fb82ede0199c0ac97dfa8632aa0687d702ec05f7b",
+    "origin": "Devicon mirror of brand artwork"
+  },
+  "redis": {
+    "source": "https://redis.io/apple-icon.png",
+    "file": "sources/redis.png",
+    "sha256": "5bb7f4d969ab288e637d327e6446ac94dbc6ab245ed317355b1edf16e46637d1",
+    "origin": "Vendor/project official asset"
+  },
+  "elasticsearch": {
+    "source": "https://raw.githubusercontent.com/devicons/devicon/master/icons/elasticsearch/elasticsearch-original.svg",
+    "file": "sources/elasticsearch.svg",
+    "sha256": "7efc44ea67eac2a877248c0502e498bca8f61de490852c1a5c572db0b5d3f84d",
+    "origin": "Devicon mirror of brand artwork"
+  },
+  "clickhouse": {
+    "source": "https://clickhouse.com/icon0.svg",
+    "file": "sources/clickhouse.svg",
+    "sha256": "97e3c3f37814cf2cecd452d7d425f6d26dcedc7230a555327d797d370a01261c",
+    "origin": "Vendor/project official asset"
+  },
+  "access": {
+    "source": "https://res.cdn.office.net/files/fabric-cdn-prod_20221201.001/assets/brand-icons/product/svg/access_48x1.svg",
+    "file": "sources/access.svg",
+    "sha256": "42176d1939f39bf2a549de922dea8987fb54d4c5c7974aa2a557b7f5db55ba01",
+    "origin": "Vendor/project official asset"
+  },
+  "db2": {
+    "source": "https://raw.githubusercontent.com/carbon-design-system/carbon/main/packages/icons/src/svg/32/db2--database.svg",
+    "file": "sources/db2.svg",
+    "sha256": "cd885a627e0d6a6ea92812bf58fdf34bbbc4890481122ba8c896b9d4a16adab0",
+    "origin": "Vendor/project official asset",
+    "tint": "#0f62fe"
+  },
+  "cassandra": {
+    "source": "https://raw.githubusercontent.com/apache/cassandra-website/trunk/site-ui/src/img/favicon.ico",
+    "file": "sources/cassandra.png",
+    "sha256": "2ed1ca1cb14db307ddec627597419ddee54effd1d5a2b42c3bb2ae7782faac1c",
+    "origin": "Vendor/project official asset"
+  },
+  "tidb": {
+    "source": "https://static.pingcap.com/files/2024/09/25192015/cropped-favicon-192x192.png",
+    "file": "sources/tidb.png",
+    "sha256": "4e2c822b1f019f2d3b86054f64164b8bec4bd1cb8004ba662f763848bbddc893",
+    "origin": "Vendor/project official asset"
+  },
+  "tdengine": {
+    "source": "https://raw.githubusercontent.com/taosdata/TDengine/main/packaging/tools/logo.png",
+    "file": "sources/tdengine.png",
+    "sha256": "aea7c02f500d52521e8acb5b58e5da86de73b0a8668ecfa9083e827698dbdfea",
+    "origin": "Vendor/project official asset"
+  },
+  "doris": {
+    "source": "https://raw.githubusercontent.com/apache/doris-website/master/static/images/doris-logo-only.png",
+    "file": "sources/doris.png",
+    "sha256": "d935897d95a8cef46170fbbdc287cc0bc2a2c4c9aeafeb1f204a5061f3a224d2",
+    "origin": "Vendor/project official asset"
+  }
+}

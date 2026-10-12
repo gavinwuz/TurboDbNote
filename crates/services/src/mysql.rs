@@ -32,6 +32,7 @@ pub enum TlsMode {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Profile {
+    pub driver_id: String,
     pub id: Uuid,
     pub kind: DatabaseKind,
     #[serde(default)]
@@ -61,6 +62,7 @@ pub struct Profile {
 impl Default for Profile {
     fn default() -> Self {
         Self {
+            driver_id: String::new(),
             id: Uuid::new_v4(),
             kind: DatabaseKind::MySql,
             list_all_databases: false,
@@ -97,8 +99,14 @@ pub fn valid_charset(value: &str) -> bool {
 }
 impl Profile {
     pub fn validate(&self) -> Result<(), String> {
+        if !self.driver_id.is_empty() && self.driver_spec().is_none_or(|d| d.kind != self.kind) {
+            return Err("drivers.invalid_identity".into());
+        }
+        if self.kind == DatabaseKind::External && self.driver_spec().is_none() {
+            return Err("drivers.invalid_identity".into());
+        }
         if self.name.trim().is_empty()
-            || (self.kind != DatabaseKind::Sqlite && self.host.trim().is_empty())
+            || (!self.is_file_database() && self.host.trim().is_empty())
             || (matches!(self.kind, DatabaseKind::MySql | DatabaseKind::PostgreSql)
                 && self.user.trim().is_empty())
         {
@@ -298,6 +306,17 @@ fn tls_issue(error: &sqlx::Error) -> Option<TlsIssue> {
         _ => None,
     }
 }
+pub(crate) const SQL_SYNTAX_ERROR: &str = "mysql.error.syntax_1064";
+pub(crate) const TABLE_MISSING: &str = "mysql.error.table_missing_1146";
+
+pub(crate) fn statement_error(number: u32) -> Option<&'static str> {
+    match number {
+        1064 => Some(SQL_SYNTAX_ERROR),
+        1146 => Some(TABLE_MISSING),
+        _ => None,
+    }
+}
+
 pub(crate) fn error_message(error: sqlx::Error) -> String {
     if let Some(issue) = tls_issue(&error) {
         return issue.message().into();
@@ -307,6 +326,9 @@ pub(crate) fn error_message(error: sqlx::Error) -> String {
             .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
             .map(|e| e.number())
         {
+            Some(code) if statement_error(u32::from(code)).is_some() => {
+                statement_error(u32::from(code)).unwrap().into()
+            }
             Some(3159) => TlsIssue::Required.message().into(),
             Some(1045) => "认证失败：请检查用户名、密码与来源主机授权".into(),
             Some(1049) => "默认数据库不存在或不可访问".into(),
@@ -467,6 +489,12 @@ impl Drop for Session {
 }
 impl Session {
     pub fn start(profile: Profile, password: String, test_only: bool) -> (Self, Receiver<Event>) {
+        // Workspace builds may enable another provider through isolated drivers.
+        // Keep existing connection TLS deterministic instead of relying on feature inference.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        if profile.kind == DatabaseKind::External {
+            return crate::external_driver::start(profile, password, test_only);
+        }
         if profile.kind != DatabaseKind::MySql {
             return crate::database::start(profile, password, test_only);
         }

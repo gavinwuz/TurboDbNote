@@ -87,6 +87,7 @@ impl NoteView {
             },
             _ => CellContent::Task {
                 description: String::new(),
+                items: vec![],
                 status: TaskStatus::Pending,
                 due_at: None,
                 remind_at: None,

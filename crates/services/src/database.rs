@@ -62,6 +62,8 @@ pub enum OperationKind {
         name: String,
         #[serde(default)]
         charset: String,
+        #[serde(default)]
+        collation: String,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -171,6 +173,30 @@ pub fn create_database_sql(
         }
     };
     Ok(format!("CREATE DATABASE {quoted}{suffix}"))
+}
+fn collation_charset_matches(actual: &str, requested: &str) -> bool {
+    actual.eq_ignore_ascii_case(requested)
+        || actual.eq_ignore_ascii_case("utf8mb3") && requested.eq_ignore_ascii_case("utf8")
+}
+pub fn create_database_sql_with_collation(
+    kind: DatabaseKind,
+    name: &str,
+    charset: &str,
+    collation: &str,
+) -> Result<String, String> {
+    let mut sql = create_database_sql(kind, name, charset)?;
+    if !collation.is_empty() {
+        if kind != DatabaseKind::MySql
+            || collation.len() > 64
+            || !collation
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        {
+            return Err("dbwork.create.collation_invalid".into());
+        }
+        sql.push_str(&format!(" COLLATE {}", quote_mysql(collation)));
+    }
+    Ok(sql)
 }
 pub fn quote_mysql(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
@@ -384,6 +410,7 @@ impl Backend {
                 Ok((Self::Redis(client), info))
             }
             DatabaseKind::MySql => Err("MySQL 应使用专属适配器".into()),
+            DatabaseKind::External => Err("drivers.operation_unsupported".into()),
         }
     }
     async fn ping(&mut self) -> Result<(), String> {
@@ -448,11 +475,17 @@ async fn pg_operation(
                 vec![p.database.clone()]
             },
         )),
-        OperationKind::CreateDatabase { name, charset } => {
-            sqlx::query(&create_database_sql(p.kind, name, charset)?)
-                .execute(c)
-                .await
-                .map_err(db_error)?;
+        OperationKind::CreateDatabase {
+            name,
+            charset,
+            collation,
+        } => {
+            sqlx::query(&create_database_sql_with_collation(
+                p.kind, name, charset, collation,
+            )?)
+            .execute(c)
+            .await
+            .map_err(db_error)?;
             Ok(OperationResult::Created(name.clone()))
         }
         OperationKind::Objects { .. } => {
@@ -559,6 +592,7 @@ pub async fn mysql_operation(
     p: &Profile,
     op: &Operation,
 ) -> Result<OperationResult, String> {
+    crate::driver_catalog::check_operation(p, op)?;
     sqlx::query(if matches!(op.kind, OperationKind::Workbench(_)) {
         "SET NAMES utf8mb4"
     } else {
@@ -610,11 +644,21 @@ async fn mysql_inner(
             }
             Ok(OperationResult::Databases(out))
         }
-        OperationKind::CreateDatabase { name, charset } => {
-            sqlx::query(&create_database_sql(p.kind, name, charset)?)
-                .execute(c)
-                .await
-                .map_err(db_error)?;
+        OperationKind::CreateDatabase {
+            name,
+            charset,
+            collation,
+        } => {
+            let sql = create_database_sql_with_collation(p.kind, name, charset, collation)?;
+            if !collation.is_empty() {
+                let actual: Option<String>=sqlx::query_scalar("SELECT CHARACTER_SET_NAME FROM information_schema.COLLATIONS WHERE COLLATION_NAME=? OR COLLATION_NAME=? LIMIT 1").bind(collation).bind(collation.replacen("utf8_","utf8mb3_",1)).fetch_optional(&mut *c).await.map_err(db_error)?;
+                if actual.as_deref().is_none_or(|value| {
+                    !charset.is_empty() && !collation_charset_matches(value, charset)
+                }) {
+                    return Err("dbwork.create.collation_mismatch".into());
+                }
+            }
+            sqlx::query(&sql).execute(c).await.map_err(db_error)?;
             Ok(OperationResult::Created(name.clone()))
         }
         OperationKind::Objects { database, .. } => {
@@ -764,6 +808,38 @@ mod tests {
 #[cfg(test)]
 mod create_charset_tests {
     use super::*;
+    #[test]
+    fn database_collations_are_safe_and_mysql_only() {
+        assert!(collation_charset_matches("utf8mb3", "utf8"));
+        assert!(!collation_charset_matches("utf8mb4", "utf8"));
+        assert_eq!(
+            create_database_sql_with_collation(
+                DatabaseKind::MySql,
+                "demo",
+                "utf8mb4",
+                "utf8mb4_general_ci"
+            )
+            .unwrap(),
+            "CREATE DATABASE `demo` CHARACTER SET `utf8mb4` COLLATE `utf8mb4_general_ci`"
+        );
+        assert!(
+            create_database_sql_with_collation(DatabaseKind::MySql, "demo", "", "utf8mb4;DROP")
+                .is_err()
+        );
+        assert!(
+            create_database_sql_with_collation(
+                DatabaseKind::PostgreSql,
+                "demo",
+                "UTF8",
+                "utf8mb4_general_ci"
+            )
+            .is_err()
+        );
+        let old: OperationKind =
+            serde_json::from_str(r#"{"CreateDatabase":{"name":"demo","charset":"utf8mb4"}}"#)
+                .unwrap();
+        assert!(matches!(old,OperationKind::CreateDatabase{collation,..}if collation.is_empty()));
+    }
     #[test]
     fn charset_is_explicit_and_quoted() {
         assert_eq!(

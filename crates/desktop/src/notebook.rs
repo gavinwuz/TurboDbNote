@@ -633,6 +633,7 @@ impl Render for NoteView {
                     .children(self.cells.iter().enumerate().map(|(index, cell)| {
                         cell.update(cx, |cell, cx| {
                             cell.set_position(index, self.cells.len(), cx);
+                            cell.set_note_name(&self.note.title, cx);
                             cell.set_batch_locked(self.batch.is_some(), cx);
                         });
                         cell.clone()

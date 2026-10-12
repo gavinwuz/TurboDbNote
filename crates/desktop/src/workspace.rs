@@ -30,6 +30,12 @@ pub struct Workspace {
     _notes_observe: Subscription,
     pending_note_close: Option<Vec<String>>,
     closing_notes_window: bool,
+    #[cfg(target_os = "windows")]
+    tray: Option<crate::windows_tray::Tray>,
+    #[cfg(target_os = "windows")]
+    tray_ready: bool,
+    #[cfg(target_os = "windows")]
+    tray_epoch: u64,
 
     dock: Entity<DockArea>,
     ai: Entity<ChatView>,
@@ -89,11 +95,16 @@ impl Workspace {
                 window.push_notification(
                     gpui_component::notification::Notification::new()
                         .with_type(event.kind)
-                        .id1::<crate::feedback::Events>(event.text.clone())
-                        .autohide(!matches!(
-                            event.kind,
-                            gpui_component::notification::NotificationType::Error
-                        ))
+                        .id1::<crate::feedback::Events>(
+                            event.id.clone().unwrap_or_else(|| event.text.clone()),
+                        )
+                        .autohide(
+                            !event.persistent
+                                && !matches!(
+                                    event.kind,
+                                    gpui_component::notification::NotificationType::Error
+                                ),
+                        )
                         .content(move |_, _, cx| {
                             div()
                                 .id("notification-details")
@@ -400,6 +411,10 @@ impl Workspace {
                     this.schema.clone()
                 };
                 panel.update(cx, |panel, cx| panel.show_detail(event.clone(), window, cx));
+                if event.refresh {
+                    cx.notify();
+                    return;
+                }
                 this.leave_focus(window, cx);
                 this.right_tabs.update(cx, |tabs, cx| {
                     let panel: Arc<dyn PanelView> = Arc::new(panel);
@@ -543,6 +558,12 @@ impl Workspace {
             _notes_observe: notes_observe,
             pending_note_close: None,
             closing_notes_window: false,
+            #[cfg(target_os = "windows")]
+            tray: None,
+            #[cfg(target_os = "windows")]
+            tray_ready: false,
+            #[cfg(target_os = "windows")]
+            tray_epoch: 0,
             schema,
             properties,
             _detail_subscription: detail_subscription,
@@ -623,6 +644,162 @@ impl Workspace {
         self.settings_open = true;
         window.focus(&self.settings.read(cx).focus_handle(cx));
         cx.notify();
+    }
+
+    pub fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.prepare_close(window, cx)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            if self.closing_window || self.closing_notes_window || window.has_active_dialog(cx) {
+                return false;
+            }
+            if cx
+                .global::<crate::preferences::Preferences>()
+                .general
+                .close_to_tray
+            {
+                self.keep_in_tray(window, cx);
+                return false;
+            }
+            let owner = cx.entity().downgrade();
+            window.open_dialog(cx, move |dialog, _, cx| {
+                let exit = owner.clone();
+                let keep = owner.clone();
+                dialog
+                    .title(t(cx, "app.close.title"))
+                    .child(
+                        div()
+                            .h_flex()
+                            .items_start()
+                            .gap_3()
+                            .child(Icon::new(IconName::Info))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .whitespace_normal()
+                                    .child(t(cx, "app.close.description")),
+                            ),
+                    )
+                    .footer(move |_, _, _, cx| {
+                        let exit = exit.clone();
+                        let keep = keep.clone();
+                        vec![
+                            crate::feedback::footer_actions()
+                                .child(
+                                    crate::feedback::close_button(cx)
+                                        .label(t(cx, "app.close.cancel")),
+                                )
+                                .child(
+                                    Button::new("app-exit")
+                                        .icon(IconName::Close)
+                                        .label(t(cx, "app.close.exit"))
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let _ = exit.update(cx, |this, cx| {
+                                                this.exit_application(window, cx)
+                                            });
+                                        }),
+                                )
+                                .child(
+                                    Button::new("app-keep-tray")
+                                        .primary()
+                                        .icon(IconName::PanelBottom)
+                                        .label(t(cx, "app.close.tray"))
+                                        .on_click(move |_, window, cx| {
+                                            window.close_dialog(cx);
+                                            let _ = keep.update(cx, |this, cx| {
+                                                this.keep_in_tray(window, cx)
+                                            });
+                                        }),
+                                ),
+                        ]
+                    })
+            });
+            false
+        }
+    }
+    #[cfg(target_os = "windows")]
+    fn exit_application(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tray_epoch = self.tray_epoch.wrapping_add(1);
+        self.tray_ready = false;
+        self.tray = None;
+        crate::windows_tray::restore(window);
+        if self.prepare_close(window, cx) {
+            window.remove_window();
+        }
+    }
+    #[cfg(target_os = "windows")]
+    fn remember_close_to_tray(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut prefs = cx.global::<crate::preferences::Preferences>().clone();
+        if prefs.general.close_to_tray {
+            return true;
+        }
+        if self.ai.read(cx).settings_saving() {
+            crate::feedback::error(t(cx, "app.tray.remember_busy"), cx);
+            return false;
+        }
+        prefs.general.close_to_tray = true;
+        if prefs.save().is_err() {
+            crate::feedback::error(t(cx, "app.tray.remember_failed"), cx);
+            return false;
+        }
+        cx.set_global(prefs);
+        self.settings
+            .update(cx, |settings, cx| settings.sync_close_to_tray(true, cx));
+        true
+    }
+    #[cfg(target_os = "windows")]
+    fn keep_in_tray(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tray_ready {
+            if self.remember_close_to_tray(cx) {
+                crate::windows_tray::hide(window);
+            }
+            return;
+        }
+        if self.tray.is_some() {
+            return;
+        }
+        let (tray, events) =
+            crate::windows_tray::Tray::start(&t(cx, "app.tray.open"), &t(cx, "app.close.exit"));
+        self.tray = Some(tray);
+        self.tray_epoch = self.tray_epoch.wrapping_add(1);
+        let epoch = self.tray_epoch;
+        cx.spawn_in(window, async move |owner, cx| {
+            while let Ok(event) = events.recv().await {
+                if owner
+                    .update_in(cx, |this, window, cx| {
+                        if this.tray_epoch != epoch {
+                            return;
+                        }
+                        use crate::windows_tray::Event;
+                        match event {
+                            Event::Ready => {
+                                this.tray_ready = true;
+                                if this.remember_close_to_tray(cx) {
+                                    crate::windows_tray::hide(window);
+                                }
+                            }
+                            Event::Open => crate::windows_tray::restore(window),
+                            Event::Exit => this.exit_application(window, cx),
+                            Event::Failed => {
+                                this.tray_ready = false;
+                                this.tray = None;
+                                crate::windows_tray::restore(window);
+                                crate::feedback::error(t(cx, "app.tray.failed"), cx);
+                            }
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     pub fn prepare_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {

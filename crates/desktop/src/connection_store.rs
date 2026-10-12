@@ -152,6 +152,42 @@ pub fn load(path: &Path) -> Result<Snapshot, String> {
     }
     Ok(Snapshot { profiles, history })
 }
+/// Rename or remove a project without touching credentials or connections.
+pub fn rename_project(path: &Path, old: &str, new: &str) -> Result<(), String> {
+    if old.is_empty() || new.chars().count() > 80 {
+        return Err("项目名称无效".into());
+    }
+    let mut db = open(path)?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(db_error)?;
+    let profiles = {
+        let mut query = tx
+            .prepare("SELECT profile FROM connections")
+            .map_err(db_error)?;
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(db_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(db_error)?
+    };
+    for json in profiles {
+        let mut profile: Profile = serde_json::from_str(&json).map_err(db_error)?;
+        if profile.group == old {
+            profile.group = new.into();
+            tx.execute(
+                "UPDATE connections SET profile=?1,updated_at=?2 WHERE id=?3",
+                params![
+                    serde_json::to_string(&profile).map_err(db_error)?,
+                    timestamp(),
+                    profile.id.to_string()
+                ],
+            )
+            .map_err(db_error)?;
+        }
+    }
+    tx.commit().map_err(db_error)
+}
 pub fn save(
     path: &Path,
     profile: &Profile,
@@ -398,6 +434,35 @@ pub fn day(value: Option<&str>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn project_rename_and_removal_preserve_connection_and_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connections.db");
+        load(&path).unwrap();
+        let p = Profile {
+            name: "fixture".into(),
+            database: "demo".into(),
+            group: "old".into(),
+            remember_password: true,
+            ..Default::default()
+        };
+        save_password(&path, &p, "test-secret").unwrap();
+        let before = load(&path).unwrap();
+        let key = before.history[&p.id].credential_id;
+        rename_project(&path, "old", "new").unwrap();
+        let renamed = load(&path).unwrap();
+        assert_eq!(renamed.profiles[0].group, "new");
+        assert_eq!(renamed.history[&p.id].credential_id, key);
+        assert!(read_password(&path, key.unwrap()).unwrap().as_deref() == Some("test-secret"));
+        rename_project(&path, "new", "").unwrap();
+        let removed = load(&path).unwrap();
+        assert_eq!(removed.profiles.len(), 1);
+        assert!(removed.profiles[0].group.is_empty());
+        assert_eq!(
+            removed.history[&p.id].created_at,
+            before.history[&p.id].created_at
+        );
+    }
     #[test]
     fn migration_preserves_unknown_dates_and_does_not_resurrect_deleted_profiles() {
         let dir = tempfile::tempdir().unwrap();

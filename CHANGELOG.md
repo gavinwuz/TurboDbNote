@@ -1,5 +1,35 @@
 # Changelog
 
+- Remember successful tray hosting as the close behavior; add a General setting to restore the close prompt, preserve unrelated settings drafts and keep the window visible on persistence failure.
+
+- Add Windows close confirmation and system-tray hosting with Open/Exit, double-click restore, icon cleanup and Explorer recovery; explicit exit retains pending-save checks.
+
+- Add a compact Markdown editing toolbar with headings, inline styles, lists, links, quotes, code blocks, tables, rules and image links as directly accessible icons with tooltips; narrow windows wrap the toolbar. Formatting uses native undoable edits, preserves Unicode and line endings, restores editor focus and selects URL placeholders. Ctrl+B/I/K apply only in Markdown editors.
+
+- Replace Note task text/status cards with independent checklist rows, assignees, calendar deadlines and optional local reminders. Completed rows use muted strikethrough. Preserve legacy text with explicit conversion; Note v2 supports v1 reads, independent copied item IDs and reminder deduplication.
+
+- Add server-validated MySQL collation selection to Create database. Unify transfer table/object selection into two-level checkbox categories with one filter across all objects, preserving hidden selections and driver/permission restrictions.
+
+- Add a searchable source database selector to connection imports and bounded read-only MySQL object permission checks. Disable confirmed unavailable object types, require explicit exclusion of selected types, and retain unconfirmed permissions without guessing from CLI exit codes.
+
+- Split advanced SQL row copy into INSERT and primary-key-bound UPDATE; keep the inspector synchronized with selected rows without stealing focus or resetting JSON mode. Add a persistent vertical scrollbar to schema TXT views and an icon to View table definition.
+
+- Unify inspector grids/JSON and schema grids/TXT with compact tools; add readable safe SQL copy, schema navigation, selectable contextual output, project rename/ungrouping, Redis key copy, optional transfer previews, target database selection and validated new-database collation overrides. Refresh object-browser database inventories.
+
+- Show read-only execution summary grids with a JSON toggle and structured copy for Note writes/DDL; preserve returned data separately, show unknown write outcomes on failure/cancellation, and keep unsupported counts null.
+
+- Add Note SQL success notifications with elapsed time and affected-row counts (MySQL session counter and SQLite DML); show unavailable counts explicitly. Output distinguishes page result rows from write effects, includes connection IDs and readable failure guidance, and records actual failure duration without SQL or raw errors.
+
+- Fix MySQL Note write preflight issuing an invalid SHOW TABLES LIKE expression: check exact DDL instead, preserve confirmation/stale-schema guards, and classify 1064 as syntax/version compatibility. New connection projects now start unassigned without changing saved assignments.
+
+- Display large embedded color brand artwork above driver names in icon view; preserve compact list view, keyboard interaction and full-name tooltips.
+
+- Remove H2/JDBC from the supported driver catalog and distribution, including JRE/JAR and Java build dependencies. Preserve retired connection records without enabling execution.
+
+- Replace Python database workers with an on-demand Rust host (TDS, MongoDB, CQL, HTTP, ODBC/OCI) and direct isolated H2 JDBC; retain read-only boundaries and explicit native-client requirements.
+
+- Add 12 driver identities, category filters and a locked on-demand isolated driver runtime; provide read-only external catalogs/data and preserve protocol-specific capability boundaries.
+
 - Replace AI SQL modal confirmations with bounded inline chat cards, and add scope-bound read-only/read-write/administrator modes with explicit inline write reconfirmation.
 
 - Fix Codex MCP tool approvals for the two application-guarded SQL tools, wait for the selected saved database connection, and separate AI list headings from prose while preserving unsupported inline markup as visible text.

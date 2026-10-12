@@ -7,7 +7,7 @@ use std::{future::Future, pin::Pin};
 pub(super) mod grid;
 pub use grid::{
     Change, DEFAULT_GRID_PAGE_SIZE, Filter, FilterJoin, FilterSet, MAX_FILTER_CONDITIONS,
-    MAX_GRID_PAGE_SIZE, PageOptions, cell_where, copy_row, edit_preview,
+    MAX_GRID_PAGE_SIZE, PageOptions, cell_where, copy_row, copy_update, edit_preview,
 };
 
 pub const PAGE_SIZE: usize = 100;
@@ -175,6 +175,7 @@ async fn catalog(
     let mut notices = Vec::new();
     let mut queries: Vec<(&str, String)> = Vec::new();
     match kind {
+        DatabaseKind::External => return Err("drivers.operation_unsupported".into()),
  DatabaseKind::MySql if version.starts_with("4.")=>{
    for r in c.query(&format!("SHOW TABLE STATUS FROM {}",quote(kind,db))).await?.values { objects.push(Object{schema:String::new(),name:value(&r,0),kind:"table".into(),comment:r.last().cloned().flatten().unwrap_or_default(),parent:String::new()}); }
    return Ok(Reply::Catalog{objects,notice:"MySQL 4.x：可查看表、列、主键和索引；该版本不支持视图、触发器、存储过程和事件".into()});
@@ -257,6 +258,7 @@ pub(super) async fn schema(
     let name = qualified(kind, db, object);
     let mut s = Schema::default();
     match kind {
+        DatabaseKind::External => return Err("drivers.operation_unsupported".into()),
         DatabaseKind::MySql => {
             for r in c
                 .query(&format!("SHOW FULL COLUMNS FROM {name}"))
@@ -795,6 +797,7 @@ pub fn categories(kind: DatabaseKind, version: &str) -> Vec<&'static str> {
         DatabaseKind::Sqlite => vec!["table", "view", "index", "trigger"],
         DatabaseKind::ClickHouse => vec!["table", "view", "index"],
         DatabaseKind::Redis => vec![],
+        DatabaseKind::External => vec!["table", "view"],
     }
 }
 pub fn create_template(kind: DatabaseKind, db: &str, table: &Object, category: &str) -> String {

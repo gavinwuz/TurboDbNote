@@ -15,6 +15,7 @@ pub enum Kind {
     Note,
     Connection,
     Query,
+    Metadata,
     Create,
     Export,
     Import,
@@ -26,6 +27,7 @@ impl Kind {
             Self::Note => "output.operation.note",
             Self::Connection => "output.operation.connection",
             Self::Query => "output.operation.query",
+            Self::Metadata => "output.operation.metadata",
             Self::Create => "output.operation.create",
             Self::Export => "output.operation.export",
             Self::Import => "output.operation.import",
@@ -37,6 +39,7 @@ impl Kind {
             Self::Note => "note",
             Self::Connection => "connection",
             Self::Query => "query",
+            Self::Metadata => "metadata",
             Self::Create => "create",
             Self::Export => "export",
             Self::Import => "import",
@@ -81,12 +84,15 @@ impl Phase {
 #[derive(Clone)]
 pub struct Record {
     pub task: Uuid,
+    pub context: String,
     pub source: Option<Uuid>,
     pub target: Option<Uuid>,
     pub kind: Kind,
     pub phase: Phase,
     pub elapsed_ms: u64,
     pub rows: u64,
+    pub affected_rows: Option<u64>,
+    pub command: bool,
     pub bytes: u64,
     pub failure: &'static str,
 }
@@ -94,19 +100,22 @@ impl Record {
     pub fn new(task: Uuid, kind: Kind, phase: Phase) -> Self {
         Self {
             task,
+            context: String::new(),
             source: None,
             target: None,
             kind,
             phase,
             elapsed_ms: 0,
             rows: 0,
+            affected_rows: None,
+            command: false,
             bytes: 0,
             failure: "-",
         }
     }
     pub fn line(&self) -> String {
         format!(
-            "{} task={} source={} target={} {} {} elapsed_ms={} rows={} bytes={} class={}\n",
+            "{} task={} source={} target={} {} {} elapsed_ms={} rows={} bytes={} class={} affected_rows={} command={}\n",
             chrono::Utc::now().to_rfc3339(),
             self.task,
             self.source
@@ -120,13 +129,23 @@ impl Record {
             self.elapsed_ms,
             self.rows,
             self.bytes,
-            self.failure
+            self.failure,
+            self.affected_rows
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "unavailable".into()),
+            self.command
         )
     }
 }
 pub fn failure_class(error: &str) -> &'static str {
     let s = error.to_lowercase();
-    if s.contains("取消") {
+    if s.starts_with("sql 执行失败，请检查语法、权限及对象") {
+        "operation"
+    } else if s.contains("1064") {
+        "syntax"
+    } else if s.contains("1146") {
+        "schema"
+    } else if s.contains("取消") {
         "cancelled"
     } else if s.contains("1045") || s.contains("凭据") || s.contains("认证") {
         "authentication"
@@ -212,6 +231,23 @@ impl Journal {
     }
 }
 
+pub fn failure_key(class: &str) -> &'static str {
+    match class {
+        "syntax" => "output.failure.syntax",
+        "schema" => "output.failure.schema",
+        "cancelled" => "output.failure.cancelled",
+        "authentication" => "output.failure.authentication",
+        "tls" => "output.failure.tls",
+        "permission" => "output.failure.permission",
+        "network" => "output.failure.network",
+        "driver" => "output.failure.driver",
+        "exists" => "output.failure.exists",
+        "timeout" => "output.failure.timeout",
+        "file" => "output.failure.file",
+        _ => "output.failure.operation",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -242,6 +278,14 @@ mod tests {
     }
     #[test]
     fn raw_error_details_never_enter_journal() {
+        assert_eq!(
+            failure_class(
+                "SQL 执行失败，请检查语法、权限及对象是否存在；写入可能已生效，请勿盲目重试"
+            ),
+            "operation"
+        );
+        assert_eq!(failure_class("mysql.error.syntax_1064"), "syntax");
+        assert_eq!(failure_class("mysql.error.table_missing_1146"), "schema");
         let mut record = Record::new(Uuid::new_v4(), Kind::Connection, Phase::Failed);
         record.failure = failure_class("ERROR 1045 authentication: hidden-detail");
         let text = record.line();

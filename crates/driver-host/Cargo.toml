@@ -1,0 +1,24 @@
+[package]
+name = "turbodbnote-driver-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio = { version = "=1.48.0", features = ["rt", "net", "time", "macros", "io-util", "io-std"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+futures-util = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "rustls", "winauth", "chrono"] }
+mongodb = { version = "3", default-features = false, features = ["compat-3-0-0", "rustls-tls"] }
+scylla = { version = "1", features = ["rustls-023"] }
+odbc-api = { version = "19", default-features = false, features = ["odbc_version_3_80"] }
+oracle = "0.6"
+zeroize = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+rustls-native-certs = "0.8"
+chrono = "0.4"

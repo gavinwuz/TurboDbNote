@@ -145,6 +145,7 @@ fn main() {
                 kind: OperationKind::CreateDatabase {
                     name: name.clone(),
                     charset: String::new(),
+                    collation: String::new(),
                 },
             })
             .unwrap();

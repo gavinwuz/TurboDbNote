@@ -5,6 +5,7 @@ use gpui_component::{
     ActiveTheme, Disableable, IconName, Selectable, StyledExt, WindowExt,
     button::Button,
     dock::{Panel, PanelEvent},
+    menu::{DropdownMenu, PopupMenuItem},
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -96,6 +97,11 @@ impl SettingsView {
             }),
             chat,
         }
+    }
+    #[cfg(target_os = "windows")]
+    pub fn sync_close_to_tray(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.configuration
+            .update(cx, |form, cx| form.sync_close_to_tray(value, cx));
     }
     pub fn select_sql(&mut self, cx: &mut Context<Self>) {
         self.category = Category::Database;
@@ -233,8 +239,37 @@ impl Render for SettingsView {
                     }),
             );
             let content = if self.database_tab == 2 {
-                let mut list = div().v_flex().gap_2();
-                for kind in turbodbn_services::DatabaseKind::ALL {
+                let group = self.drivers.read(cx).selected_group;
+                let label = turbodbn_services::driver_catalog::GROUPS
+                    .iter()
+                    .find(|(id, _)| *id == group)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("drivers.group.all");
+                let drivers = self.drivers.clone();
+                let mut list = div().v_flex().gap_2().child(
+                    Button::new("settings-driver-group")
+                        .label(t(cx, label))
+                        .dropdown_caret(true)
+                        .dropdown_menu(move |mut menu, _, cx| {
+                            for &(id, label) in turbodbn_services::driver_catalog::GROUPS {
+                                let drivers = drivers.clone();
+                                menu = menu.item(PopupMenuItem::new(t(cx, label)).on_click(
+                                    move |_, _, cx| {
+                                        drivers.update(cx, |this, cx| {
+                                            this.selected_group = id;
+                                            cx.notify();
+                                        })
+                                    },
+                                ));
+                            }
+                            menu
+                        }),
+                );
+                for driver in turbodbn_services::driver_catalog::DRIVERS
+                    .iter()
+                    .filter(|d| d.in_group(group))
+                {
+                    let kind = driver.kind;
                     list = list.child(
                         div()
                             .h_flex()
@@ -242,7 +277,7 @@ impl Render for SettingsView {
                             .p_3()
                             .border_b_1()
                             .border_color(cx.theme().border)
-                            .child(kind.label())
+                            .child(driver.name)
                             .child(div().flex_1())
                             .child(if kind == turbodbn_services::DatabaseKind::MySql {
                                 crate::locale::tr(
@@ -253,6 +288,8 @@ impl Render for SettingsView {
                                         t(cx, self.drivers.read(cx).status_key()).as_ref(),
                                     )],
                                 )
+                            } else if kind == turbodbn_services::DatabaseKind::External {
+                                t(cx, turbodbn_services::external_driver::status_key())
                             } else {
                                 t(cx, "settings2.builtin")
                             }),

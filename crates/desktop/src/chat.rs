@@ -83,9 +83,49 @@ impl AiLog {
         let class = if event.failure == "-" {
             String::new()
         } else {
-            format!(" · {}", event.failure)
+            format!(
+                " · {}",
+                crate::locale::t(cx, crate::operation_log::failure_key(event.failure))
+            )
         };
-        let text = if event.rows == 0 && event.bytes == 0 {
+        let text = if event.command {
+            crate::locale::tr(
+                cx,
+                "output.operation.command",
+                &[
+                    ("task", &task),
+                    ("kind", kind.as_ref()),
+                    ("phase", phase.as_ref()),
+                    ("elapsed", &event.elapsed_ms.to_string()),
+                    (
+                        "count",
+                        &event
+                            .affected_rows
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| {
+                                crate::locale::t(cx, "output.operation.unavailable").to_string()
+                            }),
+                    ),
+                ],
+            )
+        } else if matches!(event.kind, crate::operation_log::Kind::Query)
+            && matches!(event.phase, crate::operation_log::Phase::Succeeded)
+        {
+            crate::locale::tr(
+                cx,
+                "output.operation.query_result",
+                &[
+                    ("task", &task),
+                    ("phase", phase.as_ref()),
+                    ("elapsed", &event.elapsed_ms.to_string()),
+                    ("rows", &event.rows.to_string()),
+                ],
+            )
+        } else if event.rows == 0
+            && event.bytes == 0
+            && (!matches!(event.phase, crate::operation_log::Phase::Succeeded)
+                || matches!(event.kind, crate::operation_log::Kind::Metadata))
+        {
             crate::locale::tr(
                 cx,
                 "output.operation.line_brief",
@@ -113,6 +153,21 @@ impl AiLog {
             )
         }
         .to_string();
+        let text = if !event.context.is_empty() {
+            format!("{} · {}", text, event.context)
+        } else if let Some(source) = event.source {
+            format!(
+                "{} · {}",
+                text,
+                crate::locale::tr(
+                    cx,
+                    "output.operation.source",
+                    &[("id", &source.simple().to_string()[..8])]
+                )
+            )
+        } else {
+            text
+        };
         self.push(
             text,
             matches!(event.phase, crate::operation_log::Phase::Failed),
@@ -164,6 +219,20 @@ impl Panel for AiLog {
     fn toolbar_buttons(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<Vec<Button>> {
         let directory = self.journal.directory.clone();
         Some(vec![
+            Button::new("copy-output")
+                .ghost()
+                .icon(IconName::Copy)
+                .tooltip(crate::locale::t(cx, "output.copy_all"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        this.lines
+                            .iter()
+                            .map(|l| format!("{} {}", l.time, l.text))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ));
+                    crate::feedback::success(crate::locale::t(cx, "feedback.copied"), cx);
+                })),
             Button::new("open-operation-logs")
                 .ghost()
                 .icon(IconName::FolderOpen)
@@ -234,7 +303,7 @@ impl Panel for AiLog {
     }
 }
 impl Render for AiLog {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("output-log")
             .v_flex()
@@ -275,34 +344,52 @@ impl Render for AiLog {
                                 .child(crate::locale::t(cx, "output.empty")),
                         )
                     })
-                    .children(self.lines.iter().enumerate().map(|(index, line)| {
-                        div()
-                            .id(("log-line", index))
-                            .h_flex()
-                            .items_start()
-                            .gap_2()
-                            .child(
+                    .children(
+                        self.lines
+                            .iter()
+                            .map(|l| (l.time.clone(), l.text.clone(), l.error))
+                            .collect::<Vec<_>>()
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, (time, text, error))| {
                                 div()
-                                    .flex_shrink_0()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(line.time.clone()),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_color(if line.error {
-                                        cx.theme().danger
-                                    } else {
-                                        cx.theme().foreground
-                                    })
-                                    .child(format!(
-                                        "{}{}",
-                                        if line.error { "[ERROR] " } else { "" },
-                                        line.text
-                                    )),
-                            )
-                    })),
+                                    .id(("log-line", index))
+                                    .h_flex()
+                                    .items_start()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(time.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .text_color(if error {
+                                                cx.theme().danger
+                                            } else {
+                                                cx.theme().foreground
+                                            })
+                                            .child(
+                                                TextView::html(
+                                                    ("output-selectable", index),
+                                                    SharedString::from(format!(
+                                                        "<span>{}{}</span>",
+                                                        if error { "[ERROR] " } else { "" },
+                                                        text.replace('&', "&amp;")
+                                                            .replace('<', "&lt;")
+                                                            .replace('>', "&gt;")
+                                                    )),
+                                                    window,
+                                                    cx,
+                                                )
+                                                .selectable(true),
+                                            ),
+                                    )
+                            }),
+                    ),
             )
     }
 }

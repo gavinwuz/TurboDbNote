@@ -15,12 +15,12 @@ use gpui_component::{
     table::{Table, TableState},
     text::TextView,
 };
-use turbodbn_core::{Cell, CellContent, QueryState, QueryStatus, TaskStatus};
+use turbodbn_core::{Cell, CellContent, QueryState, QueryStatus};
 use turbodbn_services::{
     DatabaseKind,
     database::{
         Operation, OperationKind, OperationResult,
-        notebook_query::Plan,
+        notebook_query::{ExecutionSummary, Plan},
         workbench::{Action, Reply, Request, Rows},
     },
     mysql::{Event, Session},
@@ -29,6 +29,8 @@ use uuid::Uuid;
 
 #[path = "cell_assist.rs"]
 mod assist;
+#[path = "markdown_tools.rs"]
+pub(super) mod markdown_tools;
 
 pub enum CellEvent {
     Changed,
@@ -44,6 +46,8 @@ pub struct BatchScope {
 }
 pub struct CellView {
     cell: Cell,
+    markdown_last: Option<markdown_tools::FormatMemo>,
+    task_list: Option<Entity<crate::task_list::TaskList>>,
     editor: Entity<InputState>,
     title: Entity<InputState>,
     database: Entity<InputState>,
@@ -82,10 +86,14 @@ pub struct CellView {
     elapsed: u64,
     operation: Option<(Uuid, std::time::Instant)>,
     notice: String,
+    note_name: String,
     policy_help: bool,
     grid: Entity<TableState<QueryGrid>>,
     document: Option<Entity<crate::result_document::ResultDocument>>,
     json_mode: bool,
+    execution_summary: Option<ExecutionSummary>,
+    execution_grid: Entity<TableState<QueryGrid>>,
+    executing_write: Option<String>,
     results: Option<Entity<crate::table_view::TableView>>,
     _results_observer: Option<Subscription>,
     page_size: Entity<InputState>,
@@ -236,9 +244,40 @@ impl CellView {
                 .col_selectable(false)
                 .col_movable(false)
         });
+        let task_list = if let CellContent::Task {
+            items,
+            status,
+            due_at,
+            remind_at,
+            ..
+        } = &cell.content
+        {
+            let description = editor.read(cx).value().to_string();
+            let task = cx.new(|cx| {
+                crate::task_list::TaskList::new(
+                    items.clone(),
+                    description,
+                    (*status, *due_at, *remind_at),
+                    cx,
+                )
+            });
+            subscriptions.push(cx.subscribe(
+                &task,
+                |this, _, _: &crate::task_list::Changed, cx| {
+                    this.revision += 1;
+                    cx.emit(CellEvent::Changed);
+                    cx.notify();
+                },
+            ));
+            Some(task)
+        } else {
+            None
+        };
         Self {
             query: QueryState::new(cell.id),
             cell,
+            markdown_last: None,
+            task_list,
             editor,
             title,
             database,
@@ -276,10 +315,15 @@ impl CellView {
             elapsed: 0,
             operation: None,
             notice: String::new(),
+            note_name: String::new(),
             policy_help: false,
             grid,
             document: None,
             json_mode: false,
+            execution_summary: None,
+            execution_grid: cx
+                .new(|cx| TableState::new(QueryGrid::new(Rows::default(), 0), window, cx)),
+            executing_write: None,
             results: None,
             _results_observer: None,
             page_size,
@@ -456,7 +500,11 @@ impl CellView {
                 let _ = owner.update(cx, |this, cx| {
                     this.json_mode = json;
                     if json {
-                        let rows = this.grid.read(cx).delegate().rows.clone();
+                        let rows = this
+                            .execution_summary
+                            .as_ref()
+                            .map(ExecutionSummary::json_rows)
+                            .unwrap_or_else(|| this.grid.read(cx).delegate().rows.clone());
                         this.document = Some(cx.new(|cx| {
                             crate::result_document::ResultDocument::new(rows, window, cx)
                         }));
@@ -475,7 +523,10 @@ impl CellView {
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 cx.write_to_clipboard(ClipboardItem::new_string(
-                    this.editor.read(cx).value().to_string(),
+                    this.task_list
+                        .as_ref()
+                        .map(|task| task.read(cx).text())
+                        .unwrap_or_else(|| this.editor.read(cx).value().to_string()),
                 ));
                 feedback::success(t(cx, "feedback.copied"), cx);
             }))
@@ -657,8 +708,20 @@ impl CellView {
                 *database = (!value.is_empty()).then_some(value);
             }
             CellContent::Markdown { source } => *source = self.editor.read(cx).value().to_string(),
-            CellContent::Task { description, .. } => {
-                *description = self.editor.read(cx).value().to_string()
+            CellContent::Task {
+                description,
+                items,
+                status,
+                ..
+            } => {
+                if let Some(task) = &self.task_list {
+                    let snapshot = task.read(cx).snapshot();
+                    *items = snapshot.0;
+                    *description = snapshot.1;
+                    *status = snapshot.2;
+                } else {
+                    *description = self.editor.read(cx).value().to_string();
+                }
             }
         }
         cell
@@ -693,6 +756,20 @@ impl CellView {
             results.update(cx, |results, cx| results.cancel_result(false, cx));
         }
         if let Some((id, started)) = self.operation.take() {
+            if let Some(operation) = self.executing_write.take() {
+                self.set_execution_summary(
+                    Some(ExecutionSummary {
+                        operation,
+                        status: "cancelled".into(),
+                        affected_rows: None,
+                        matched_rows: None,
+                        changed_rows: None,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        count_source: None,
+                    }),
+                    cx,
+                );
+            }
             self.log(
                 id,
                 crate::operation_log::Phase::Cancelled,
@@ -846,6 +923,21 @@ impl CellView {
             self.finish_batch(false, cx);
             return;
         }
+        if self.execution_summary.take().is_some() {
+            self.document = None;
+            self.json_mode = false;
+        }
+        self.executing_write = match &action {
+            Action::NoteExecute { plan, .. } if !plan.read_only => Some(
+                turbodbn_services::database::notebook_query::command_required(
+                    saved.profile.kind,
+                    &plan.sql,
+                )
+                .unwrap_or("command")
+                .to_ascii_uppercase(),
+            ),
+            _ => None,
+        };
         let token = self.query.begin();
         self.operation = Some((token.request_id, std::time::Instant::now()));
         self.elapsed = 0;
@@ -970,6 +1062,9 @@ impl CellView {
                                             this.operation = None;
                                             let rows = result.rows.values.len() as u64;
                                             let read_only = result.read_only;
+                                            let affected = result.affected_rows;
+                                            this.executing_write = None;
+                                            this.set_execution_summary(result.execution.as_deref().cloned(), cx);
                                             let elapsed_ms = result.elapsed_ms;
                                             if let Some(meta) = &result.grid
                                                 && let Some(object) = &meta.object
@@ -1025,16 +1120,21 @@ impl CellView {
                                                 )
                                                 .to_string()
                                             } else {
-                                                t(cx, "notes.command_done").to_string()
+                                                crate::locale::tr(cx, "notes.command_result", &[("count", &affected.map(|n| n.to_string()).unwrap_or_else(|| t(cx, "output.operation.unavailable").to_string())), ("elapsed", &elapsed_ms.to_string())]).to_string()
                                             };
-                                            this.log(
-                                                token.request_id,
-                                                crate::operation_log::Phase::Succeeded,
-                                                elapsed_ms,
-                                                rows,
-                                                None,
-                                                cx,
-                                            );
+                                            if !read_only {
+                                                feedback::success(this.notice.clone(), cx);
+                                            }
+                                            if let Some(log) = this.connections.read(cx).output.clone() {
+                                                let mut record = crate::operation_log::Record::new(token.request_id, crate::operation_log::Kind::Query, crate::operation_log::Phase::Succeeded);
+                                                record.source = Some(saved.profile.id);
+                                                record.context = this.log_context(cx);
+                                                record.elapsed_ms = elapsed_ms;
+                                                record.rows = rows;
+                                                record.affected_rows = affected;
+                                                record.command = !read_only;
+                                                log.update(cx, |log, cx| log.operation(record, cx));
+                                            }
                                             this.finish_batch(true, cx);
                                         }
                                         _ => this.failed(
@@ -1077,12 +1177,30 @@ impl CellView {
             return;
         }
         self.session = None;
-        self.operation = None;
+        let elapsed = self
+            .operation
+            .take()
+            .map(|(_, started)| started.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        if let Some(operation) = self.executing_write.take() {
+            self.set_execution_summary(
+                Some(ExecutionSummary {
+                    operation,
+                    status: "outcome_unknown".into(),
+                    affected_rows: None,
+                    matched_rows: None,
+                    changed_rows: None,
+                    elapsed_ms: elapsed,
+                    count_source: None,
+                }),
+                cx,
+            );
+        }
         self.notice = error.clone();
         self.log(
             token.request_id,
             crate::operation_log::Phase::Failed,
-            0,
+            elapsed,
             0,
             Some(&error),
             cx,
@@ -1203,6 +1321,31 @@ impl CellView {
             );
         }
     }
+    pub(crate) fn set_note_name(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.note_name = name.into();
+        if let Some(task) = &self.task_list {
+            task.update(cx, |task, _| task.note_name = name.into());
+        }
+    }
+    fn log_context(&self, cx: &App) -> String {
+        let connection = self
+            .connection_id()
+            .and_then(|id| self.connections.read(cx).note_profile(id))
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let title = self.cell.title.trim();
+        format!(
+            "{} · {} · #{}{}",
+            connection,
+            self.note_name,
+            self.position.0 + 1,
+            if title.is_empty() {
+                String::new()
+            } else {
+                format!(" · {title}")
+            }
+        )
+    }
     fn log(
         &self,
         id: Uuid,
@@ -1216,6 +1359,7 @@ impl CellView {
             let mut record =
                 crate::operation_log::Record::new(id, crate::operation_log::Kind::Query, phase);
             record.source = self.connection_id();
+            record.context = self.log_context(cx);
             record.elapsed_ms = elapsed;
             record.rows = rows;
             if let Some(error) = error {
@@ -1223,6 +1367,64 @@ impl CellView {
             }
             log.update(cx, |log, cx| log.operation(record, cx));
         }
+    }
+    fn set_execution_summary(&mut self, summary: Option<ExecutionSummary>, cx: &mut Context<Self>) {
+        if let Some(summary) = &summary {
+            self.results = None;
+            self._results_observer = None;
+            self.grid.update(cx, |grid, cx| {
+                *grid.delegate_mut() = QueryGrid::new(Rows::default(), 0);
+                grid.refresh(cx);
+            });
+            let unavailable = t(cx, "output.operation.unavailable").to_string();
+            let mut rows = Rows {
+                columns: vec![
+                    t(cx, "result.execution.operation").to_string(),
+                    t(cx, "result.execution.status").to_string(),
+                    t(cx, "result.execution.affected").to_string(),
+                    t(cx, "result.execution.elapsed").to_string(),
+                ],
+                values: vec![vec![
+                    Some(summary.operation.clone()),
+                    Some(
+                        t(
+                            cx,
+                            if summary.status == "succeeded" {
+                                "output.operation.succeeded"
+                            } else if summary.status == "cancelled" {
+                                "result.execution.cancelled"
+                            } else {
+                                "result.execution.unknown"
+                            },
+                        )
+                        .to_string(),
+                    ),
+                    Some(
+                        summary
+                            .affected_rows
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| unavailable.clone()),
+                    ),
+                    Some(format!("{} ms", summary.elapsed_ms)),
+                ]],
+            };
+            for (key, count) in [
+                ("result.execution.matched", summary.matched_rows),
+                ("result.execution.changed", summary.changed_rows),
+            ] {
+                if let Some(count) = count {
+                    rows.columns.push(t(cx, key).to_string());
+                    rows.values[0].push(Some(count.to_string()));
+                }
+            }
+            self.execution_grid.update(cx, |grid, cx| {
+                *grid.delegate_mut() = QueryGrid::new(rows, 0);
+                grid.refresh(cx);
+            });
+            self.document = None;
+            self.json_mode = false;
+        }
+        self.execution_summary = summary;
     }
     fn copy(&self, cx: &mut Context<Self>) {
         if let Some(value) = self.grid.read(cx).delegate().selected_value() {
@@ -1603,6 +1805,40 @@ impl Render for CellView {
             .border_1()
             .border_color(if editing { marker } else { cx.theme().border })
             .track_focus(&self.focus)
+            .capture_action(cx.listener(
+                |this, _: &crate::cell::markdown_tools::Bold, window, cx| {
+                    if this.editing && this.editor.read(cx).focus_handle(cx).is_focused(window) {
+                        this.markdown_format(crate::cell::markdown_tools::Format::Bold, window, cx);
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &crate::cell::markdown_tools::Italic, window, cx| {
+                    if this.editing && this.editor.read(cx).focus_handle(cx).is_focused(window) {
+                        this.markdown_format(
+                            crate::cell::markdown_tools::Format::Italic,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            ))
+            .capture_action(cx.listener(
+                |this, _: &crate::cell::markdown_tools::Link, window, cx| {
+                    if this.editing && this.editor.read(cx).focus_handle(cx).is_focused(window) {
+                        this.markdown_format(crate::cell::markdown_tools::Format::Link, window, cx);
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                },
+            ))
             .tab_index(0)
             .when(editing, |el| {
                 el.child(
@@ -1705,6 +1941,29 @@ impl Render for CellView {
                     .child(self.copy_source_button(cx)),
             );
         }
+        if let Some(task) = &self.task_list {
+            let task = task.clone();
+            if editing {
+                body = body.child(self.toolbar(window, cx));
+            } else {
+                body = body.child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(self.mode_button(cx))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_ellipsis()
+                                .overflow_hidden()
+                                .child(self.title.read(cx).value()),
+                        )
+                        .child(self.copy_source_button(cx)),
+                );
+            }
+            return body.child(task);
+        }
         if editing {
             body = body.child(self.toolbar(window, cx));
             if sql
@@ -1741,12 +2000,17 @@ impl Render for CellView {
         }
         if editing {
             let lines = self.editor.read(cx).value().lines().count().clamp(3, 12);
+            if md {
+                body = body.child(self.markdown_toolbar(cx));
+            }
             body = body.child(
-                feedback::editable_multiline(&self.editor, busy || self.batch_locked, cx)
-                    .appearance(false)
-                    .bordered(false)
-                    .focus_bordered(false)
-                    .h(px(lines as f32 * 22. + 16.)),
+                div().when(md, |el| el.key_context("NoteMarkdown")).child(
+                    feedback::editable_multiline(&self.editor, busy || self.batch_locked, cx)
+                        .appearance(false)
+                        .bordered(false)
+                        .focus_bordered(false)
+                        .h(px(lines as f32 * 22. + 16.)),
+                ),
             );
         } else {
             let source = self.editor.read(cx).value();
@@ -1847,43 +2111,54 @@ impl Render for CellView {
                     }),
             );
         }
-        if let CellContent::Task { status, .. } = self.cell.content {
-            let key = match status {
-                TaskStatus::Pending => "notebook.task.pending",
-                TaskStatus::InProgress => "notebook.task.in_progress",
-                TaskStatus::Completed => "notebook.task.completed",
-            };
-            body = body.child(if editing {
-                Button::new("note-task-status")
-                    .small()
-                    .ghost()
-                    .icon(IconName::CircleCheck)
-                    .label(t(cx, key))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        if let CellContent::Task { status, .. } = &mut this.cell.content {
-                            *status = match status {
-                                TaskStatus::Pending => TaskStatus::InProgress,
-                                TaskStatus::InProgress => TaskStatus::Completed,
-                                TaskStatus::Completed => TaskStatus::Pending,
-                            };
-                        }
-                        this.revision += 1;
-                        cx.emit(CellEvent::Changed);
-                        cx.notify();
-                    }))
-                    .into_any_element()
-            } else {
-                div()
-                    .text_sm()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(cx, key))
-                    .into_any_element()
-            });
-        }
         if let Some(results) = &self.results {
             body = body.child(div().h(px(380.)).min_w_0().child(results.clone()));
         }
-        if self.results.is_some() || !self.grid.read(cx).delegate().rows.columns.is_empty() {
+        if self.execution_summary.is_some() {
+            body = body.child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(self.document_controls(cx))
+                    .child(
+                        Button::new("copy-execution-summary")
+                            .small()
+                            .ghost()
+                            .icon(IconName::Copy)
+                            .label(t(cx, "result.execution.copy"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(summary) = &this.execution_summary {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        serde_json::to_string_pretty(summary).unwrap_or_default(),
+                                    ));
+                                    feedback::success(t(cx, "feedback.copied"), cx);
+                                }
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t(cx, "result.execution.count_help")),
+                    ),
+            );
+            if self.json_mode
+                && let Some(document) = &self.document
+            {
+                body = body.child(div().h(px(260.)).w_full().child(document.clone()));
+            } else {
+                body = body.child(
+                    div()
+                        .h(px(112.))
+                        .w_full()
+                        .child(Table::new(&self.execution_grid)),
+                );
+            }
+        }
+        if self.execution_summary.is_some()
+            || self.results.is_some()
+            || !self.grid.read(cx).delegate().rows.columns.is_empty()
+        {
             body = body.child(
                 Button::new("clear-note-results")
                     .small()
@@ -1896,6 +2171,7 @@ impl Render for CellView {
                             feedback::error(t(cx, "grid.pending"), cx);
                             return;
                         }
+                        this.execution_summary = None;
                         this.results = None;
                         this._results_observer = None;
                         this.grid.update(cx, |grid, cx| {
@@ -1912,11 +2188,14 @@ impl Render for CellView {
         }
         if self.results.is_none()
             && sql
+            && (self.execution_summary.is_none()
+                || !self.grid.read(cx).delegate().rows.columns.is_empty())
             && (!self.notice.is_empty()
                 || busy
                 || !self.grid.read(cx).delegate().rows.columns.is_empty())
         {
             if self.json_mode
+                && self.execution_summary.is_none()
                 && let Some(document) = &self.document
             {
                 body = body.child(div().h(px(300.)).w_full().child(document.clone()));
@@ -1955,68 +2234,70 @@ impl Render for CellView {
                         ),
                 );
             }
-            let stale = self.last_revision != self.revision;
-            let previous = self.last_offset.saturating_sub(self.query.page_size);
-            let next = self.last_offset + self.query.page_size;
-            body = body.child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .child(self.document_controls(cx))
-                    .when(busy && !editing, |el| {
-                        el.child(
-                            Button::new("read-stop-query")
-                                .small()
+            if self.execution_summary.is_none() {
+                let stale = self.last_revision != self.revision;
+                let previous = self.last_offset.saturating_sub(self.query.page_size);
+                let next = self.last_offset + self.query.page_size;
+                body = body.child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(self.document_controls(cx))
+                        .when(busy && !editing, |el| {
+                            el.child(
+                                Button::new("read-stop-query")
+                                    .small()
+                                    .ghost()
+                                    .icon(gpui_component::Icon::default().path("icons/stop.svg"))
+                                    .tooltip(t(cx, "notes.stop"))
+                                    .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                            )
+                        })
+                        .child(
+                            Button::new("note-previous")
                                 .ghost()
-                                .icon(gpui_component::Icon::default().path("icons/stop.svg"))
-                                .tooltip(t(cx, "notes.stop"))
-                                .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
+                                .icon(IconName::ChevronLeft)
+                                .disabled(busy || stale || self.last_offset == 0)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run(previous, window, cx)
+                                })),
                         )
-                    })
-                    .child(
-                        Button::new("note-previous")
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .disabled(busy || stale || self.last_offset == 0)
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.run(previous, window, cx)
-                            })),
-                    )
-                    .child((self.last_offset / self.query.page_size + 1).to_string())
-                    .child(
-                        Button::new("note-next")
-                            .ghost()
-                            .icon(IconName::ChevronRight)
-                            .disabled(busy || stale || !self.more)
-                            .on_click(
-                                cx.listener(move |this, _, window, cx| this.run(next, window, cx)),
-                            ),
-                    )
-                    .child(
-                        Input::new(&self.page_size)
-                            .cleanable(!busy)
-                            .w(px(64.))
-                            .disabled(busy),
-                    )
-                    .child(
-                        Button::new("note-copy-value")
-                            .ghost()
-                            .icon(IconName::Copy)
-                            .tooltip(t(cx, "grid.copy.cell"))
-                            .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(if self.notice.is_empty() {
-                                String::new()
-                            } else {
-                                format!("{} · {} ms", self.notice, self.elapsed)
-                            }),
-                    ),
-            );
+                        .child((self.last_offset / self.query.page_size + 1).to_string())
+                        .child(
+                            Button::new("note-next")
+                                .ghost()
+                                .icon(IconName::ChevronRight)
+                                .disabled(busy || stale || !self.more)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.run(next, window, cx)
+                                })),
+                        )
+                        .child(
+                            Input::new(&self.page_size)
+                                .cleanable(!busy)
+                                .w(px(64.))
+                                .disabled(busy),
+                        )
+                        .child(
+                            Button::new("note-copy-value")
+                                .ghost()
+                                .icon(IconName::Copy)
+                                .tooltip(t(cx, "grid.copy.cell"))
+                                .on_click(cx.listener(|this, _, _, cx| this.copy(cx))),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if self.notice.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("{} · {} ms", self.notice, self.elapsed)
+                                }),
+                        ),
+                );
+            }
         }
         body.when(self.policy_help, |body| {
             body.child(

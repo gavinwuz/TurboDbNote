@@ -157,8 +157,12 @@ impl HttpDatabase {
                     vec![p.database.clone()]
                 },
             )),
-            OperationKind::CreateDatabase { name, charset } => {
-                if !charset.is_empty() {
+            OperationKind::CreateDatabase {
+                name,
+                charset,
+                collation,
+            } => {
+                if !charset.is_empty() || !collation.is_empty() {
                     return Err("ClickHouse 不支持库级字符集设置".into());
                 }
                 validate_name(p.kind, name)?;

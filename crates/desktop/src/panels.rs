@@ -3,7 +3,6 @@ use gpui_component::{
     ActiveTheme, IconName, StyledExt,
     button::{Button, ButtonVariants},
     dock::{Panel, PanelEvent},
-    input::{Input, InputState},
 };
 
 pub struct WorkbenchPanel {
@@ -12,8 +11,9 @@ pub struct WorkbenchPanel {
     focus: FocusHandle,
     content: PanelContent,
     detail: Option<crate::feedback::DetailRequest>,
-    detail_input: Option<Entity<InputState>>,
     detail_mode: bool,
+    detail_grid: Option<Entity<gpui_component::table::TableState<crate::query_grid::QueryGrid>>>,
+    detail_json: Option<Entity<crate::result_document::ResultDocument>>,
 }
 
 enum PanelContent {
@@ -28,31 +28,51 @@ enum PanelContent {
 }
 
 impl WorkbenchPanel {
-    fn set_detail_value(&mut self, text: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.detail_input = Some(cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .default_value(text)
-        }));
-    }
     pub fn show_detail(
         &mut self,
         detail: crate::feedback::DetailRequest,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.detail_input = Some(cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .default_value(detail.text.clone())
+        let rows = turbodbn_services::database::workbench::Rows {
+            columns: vec![
+                crate::locale::t(cx, "details.field").to_string(),
+                crate::locale::t(cx, "details.value").to_string(),
+            ],
+            values: detail
+                .entries
+                .iter()
+                .map(|(k, v)| vec![Some(k.clone()), Some(v.clone())])
+                .collect(),
+        };
+        self.detail_grid = Some(cx.new(|cx| {
+            gpui_component::table::TableState::new(
+                crate::query_grid::QueryGrid::new(rows, 0),
+                window,
+                cx,
+            )
         }));
+        self.detail_json = Some(cx.new(|cx| {
+            crate::result_document::ResultDocument::new(
+                turbodbn_services::database::workbench::Rows {
+                    columns: vec!["json".into()],
+                    values: vec![vec![Some(detail.text.clone())]],
+                },
+                window,
+                cx,
+            )
+        }));
+        let refresh = detail.refresh;
         self.detail = Some(detail);
-        self.detail_mode = false;
+        if !refresh {
+            self.detail_mode = false;
+        }
         cx.notify();
     }
     pub fn clear_detail(&mut self, cx: &mut Context<Self>) {
         self.detail = None;
-        self.detail_input = None;
+        self.detail_grid = None;
+        self.detail_json = None;
         cx.notify();
     }
     pub fn database_objects(
@@ -64,8 +84,9 @@ impl WorkbenchPanel {
             title: "database.objects.title",
             focus: cx.focus_handle(),
             detail: None,
-            detail_input: None,
             detail_mode: false,
+            detail_grid: None,
+            detail_json: None,
             content: PanelContent::DatabaseObjects(view),
         }
     }
@@ -99,8 +120,9 @@ impl WorkbenchPanel {
             focus: cx.focus_handle(),
             content: PanelContent::NoteHome(home),
             detail: None,
-            detail_input: None,
             detail_mode: false,
+            detail_grid: None,
+            detail_json: None,
         }
     }
 
@@ -116,8 +138,9 @@ impl WorkbenchPanel {
             title,
             focus: cx.focus_handle(),
             detail: None,
-            detail_input: None,
             detail_mode: false,
+            detail_grid: None,
+            detail_json: None,
             content: PanelContent::Info { heading, body },
         }
     }
@@ -183,7 +206,9 @@ impl Render for WorkbenchPanel {
             .id(self.name)
             .track_focus(&self.focus)
             .size_full()
-            .overflow_y_scroll()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
             .v_flex()
             .gap_4()
             .p_4()
@@ -235,14 +260,13 @@ impl Render for WorkbenchPanel {
                         .selectable(true),
                     );
             }
-            let input = self.detail_input.clone().unwrap();
             let text = detail.text.clone();
             return content
                 .child(
                     div()
                         .h_flex()
                         .gap_2()
-                        .child(div().flex_1().child(detail.title))
+                        .child(div().flex_1().min_w_0().child(detail.title))
                         .child(
                             Button::new("details-table")
                                 .ghost()
@@ -252,22 +276,17 @@ impl Render for WorkbenchPanel {
                                     cx.notify();
                                 })),
                         )
-                        .child(
-                            Button::new("details-text")
-                                .ghost()
-                                .label(crate::locale::t(cx, "grid.structure.text"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.detail_mode = true;
-                                    if let Some(detail) = &this.detail {
-                                        this.set_detail_value(detail.text.clone(), window, cx);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
+                        .child(Button::new("details-json").ghost().label("JSON").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.detail_mode = true;
+                                cx.notify();
+                            }),
+                        ))
                         .child(
                             Button::new("details-copy")
                                 .ghost()
                                 .icon(IconName::Copy)
+                                .tooltip(crate::locale::t(cx, "feedback.copy"))
                                 .on_click(move |_, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(text.clone()));
                                     crate::feedback::success(
@@ -278,71 +297,21 @@ impl Render for WorkbenchPanel {
                         ),
                 )
                 .when(!self.detail_mode, |el| {
+                    el.child(div().flex_1().min_h_0().w_full().child(
+                        gpui_component::table::Table::new(self.detail_grid.as_ref().unwrap()),
+                    ))
+                })
+                .when(self.detail_mode, |el| {
                     el.child(
                         div()
-                            .id("detail-fields")
                             .flex_1()
                             .min_h_0()
-                            .overflow_y_scroll()
-                            .v_flex()
-                            .gap_1()
-                            .children(detail.entries.into_iter().enumerate().map(
-                                |(i, (name, value))| {
-                                    let selected = value.clone();
-                                    let copy = value.clone();
-                                    div()
-                                        .h_flex()
-                                        .gap_2()
-                                        .child(
-                                            Button::new(("copy-detail-value", i))
-                                                .ghost()
-                                                .icon(IconName::Copy)
-                                                .tooltip(crate::locale::t(cx, "grid.copy.cell"))
-                                                .on_click(move |_, _, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(copy.clone()),
-                                                    );
-                                                    crate::feedback::success(
-                                                        crate::locale::t(cx, "feedback.copied"),
-                                                        cx,
-                                                    );
-                                                }),
-                                        )
-                                        .child(
-                                            Button::new(("detail-field", i))
-                                                .ghost()
-                                                .label(name)
-                                                .on_click(cx.listener(
-                                                    move |this, _, window, cx| {
-                                                        this.set_detail_value(
-                                                            selected.clone(),
-                                                            window,
-                                                            cx,
-                                                        );
-                                                        cx.notify();
-                                                    },
-                                                )),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .max_h(px(80.))
-                                                .overflow_hidden()
-                                                .whitespace_normal()
-                                                .child(value.chars().take(300).collect::<String>()),
-                                        )
-                                },
-                            )),
+                            .w_full()
+                            .child(self.detail_json.as_ref().unwrap().clone()),
                     )
-                })
-                .child(
-                    Input::new(&input)
-                        .disabled(true)
-                        .when(self.detail_mode, |input| input.flex_1().min_h_0())
-                        .when(!self.detail_mode, |input| input.h(px(320.)).flex_shrink_0()),
-                );
+                });
         }
+
         match &self.content {
             PanelContent::NoteHome(view) => div()
                 .id("note-home-panel")
