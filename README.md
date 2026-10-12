@@ -72,3 +72,5 @@ For the next release, add bilingual Unreleased notes, commit features on the cle
 Licensed under [Apache-2.0](LICENSE). Bundled third-party components retain their respective licenses.
 
 Future Windows releases include an Inno Setup installer alongside the portable ZIP and SHA256 checksums. See [release instructions](docs/releasing.md). Current binaries remain unsigned.
+
+[Privacy Policy](PRIVACY.md)

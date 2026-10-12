@@ -72,3 +72,5 @@ cargo clippy --locked -j 1 --workspace --all-targets -- -D warnings
 采用 [Apache-2.0](LICENSE) 许可，随包第三方组件保留各自许可。
 
 后续 Windows 版本同时发布 Inno Setup 安装包、绿色 ZIP 与 SHA256 校验，详见[发布流程](docs/releasing.zh-CN.md)。当前程序仍未签名。
+
+[隐私政策](PRIVACY.zh-CN.md)
