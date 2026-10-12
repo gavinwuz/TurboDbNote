@@ -128,10 +128,7 @@ This build is unsigned. Read RELEASE-NOTES.md before use.
     Invoke-Checked $IsccPath @("/DAppVersion=$version", "/DSourceDir=$stage", "/DOutputDir=$output",
         "/DIconFile=$(Join-Path $root 'crates/desktop/assets/turbodbnote.ico')", (Join-Path $root 'installer/turbodbnote.iss'))
     if (-not (Test-Path -LiteralPath $setup)) { throw 'Installer was not generated' }
-    @($zip, $setup) | ForEach-Object {
-        $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
-        "$hash  $([IO.Path]::GetFileName($_))"
-    } | Set-Content -LiteralPath $checksum -Encoding ascii
+    Write-ReleaseChecksums -Paths @($zip, $setup) -OutputFile $checksum
     Write-Output "Package: $zip"
     Write-Output "Installer: $setup"
     Write-Output "Checksums: $checksum"

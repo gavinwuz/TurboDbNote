@@ -15,3 +15,12 @@ function Get-VersionReleaseNotes {
     if (-not $body) { throw "Empty [$Version] section in $ChangelogPath" }
     return "# TurboDBNote v$Version`n`n$body`n"
 }
+
+function Write-ReleaseChecksums {
+    param([Parameter(Mandatory)][string[]]$Paths, [Parameter(Mandatory)][string]$OutputFile)
+    $lines = @($Paths | ForEach-Object {
+        $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+        "$hash  $([IO.Path]::GetFileName($_))"
+    })
+    [IO.File]::WriteAllText($OutputFile, ($lines -join "`n") + "`n", [Text.Encoding]::ASCII)
+}
