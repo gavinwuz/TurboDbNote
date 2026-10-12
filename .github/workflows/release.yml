@@ -71,7 +71,14 @@ jobs:
         run: |
           python scripts/run-cargo.py test --locked -j 1 -p turbodbnote --bin turbodbnote -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          ./scripts/package-windows.ps1 -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          try {
+            ./scripts/package-windows.ps1 -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          } catch {
+            $details = $_.Exception.Message -replace '(?i)(password|secret|token|api[_-]?key|authorization).*', '[sensitive detail omitted]'
+            $details = $details.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Host "::error title=Windows packaging::$details"
+            throw
+          }
       - name: Verify isolated driver contracts
         run: python scripts/verify-driver-host.py --runtime dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-windows-x64/drivers/native
       - name: Open the packaged Windows window in isolation
