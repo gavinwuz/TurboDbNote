@@ -3,6 +3,7 @@
 import hashlib
 import json
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,7 @@ def main():
     version = tomllib.loads((ROOT / "Cargo.toml").read_text())["workspace"]["package"]["version"]
     check(version)
     run("cargo", "build", "--locked", "--release", "-j", "1", "-p", "turbodbnote", "-p", "turbodbnote-driver-host", "--bins")
+    print("::notice title=Linux packaging::Native Release binaries built successfully", flush=True)
     name = f"TurboDBNote-v{version}-linux-x64"
     output = ROOT / "dist"
     stage = output / name
@@ -43,6 +45,7 @@ def main():
         if "not found" in dependencies:
             raise SystemExit("A packaged binary has unresolved runtime dependencies")
         (stage / (binary.name + "-dependencies.txt")).write_text(dependencies)
+    print("::notice title=Linux packaging::Runtime dependency checks passed", flush=True)
     for filename in ["LICENSE", "README.md", "README.zh-CN.md"]:
         shutil.copy2(ROOT / filename, stage / filename)
     (stage / "RELEASE-NOTES.md").write_text(notes(version, "en"), encoding="utf-8")
@@ -50,6 +53,7 @@ def main():
     (stage / "README.txt").write_text("Run ./turbodbnote after extraction. Linux x64, Ubuntu 22.04/glibc 2.35 baseline.\nRequires a working X11/Wayland session, Vulkan graphics, libxkbcommon, fontconfig and unixODBC.\nPasswords are session-only on Linux. Windows tray and bundled legacy MySQL DLL are Windows-only.\nApplication data uses the normal per-user config directory. AI requires a separately installed CLI.\nSee RELEASE-NOTES.md and the included dependency inventories.\n", encoding="utf-8")
     (stage / "BUILD-INFO.json").write_text(json.dumps(dict(version=version, commit=subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(), target="x86_64-unknown-linux-gnu"), indent=2))
     run("git", "archive", "--format=tar.gz", "--output=" + str(stage / "sources.tar.gz"), "HEAD", "Cargo.toml", "Cargo.lock", "crates", "scripts", "LICENSE", "README.md", "README.zh-CN.md", "CHANGELOG.md", "CHANGELOG.zh-CN.md")
+    print("::notice title=Linux packaging::Source archive created", flush=True)
     with tarfile.open(archive, "w:gz") as tar:
         tar.add(stage, arcname=stage.name)
     with archive.open("rb") as source:
@@ -59,4 +63,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (Exception, SystemExit) as error:
+        message = str(error)
+        if re.search(r"(?i)(password|secret|token|api[_-]?key|authorization)\s*[:=]", message):
+            message = "Sensitive diagnostic values omitted"
+        message = (type(error).__name__ + ": " + message)[:600]
+        message = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+        print("::error title=Linux packaging::" + message, flush=True)
+        raise

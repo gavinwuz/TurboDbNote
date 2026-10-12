@@ -1,0 +1,27 @@
+name: Read failed build diagnostics
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Failed job ID in this repository'
+        required: true
+        type: string
+  push:
+    branches: ['**']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  diagnose:
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[diagnose]')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Read redacted failure details
+        env:
+          GH_TOKEN: ${{ github.token }}
+          JOB_ID: ${{ inputs.job_id }}
+        run: python3 scripts/read-build-diagnostics.py
