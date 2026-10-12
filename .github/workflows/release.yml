@@ -10,6 +10,10 @@ on:
         description: 'Publish after both platforms pass'
         type: boolean
         default: false
+      replace_existing:
+        description: 'Explicitly delete an existing release and its tag after replacement packages pass'
+        type: boolean
+        default: false
   push:
     branches: ["**"]
     tags: ['v*']
@@ -161,6 +165,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.metadata.outputs.version }}
+          REPLACE_EXISTING: ${{ inputs.replace_existing || (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && contains(github.event.head_commit.message, '[replace-release]')) }}
         run: |
           python3 scripts/release.py --version "$VERSION" --publication --notes release-notes.md
           cd candidate/windows
@@ -174,7 +179,10 @@ jobs:
           sha256sum *.zip *.exe *.tar.gz > SHA256SUMS.txt
           cd ..
           if gh release view "v$VERSION" >/dev/null 2>&1; then
-            echo 'This version already has a release; refusing to overwrite it.'
-            exit 1
+            if [ "$REPLACE_EXISTING" != 'true' ]; then
+              echo 'This version already has a release; refusing to overwrite it.'
+              exit 1
+            fi
+            gh release delete "v$VERSION" --yes --cleanup-tag
           fi
-          gh release create "v$VERSION" upload/* --target "$GITHUB_SHA" --title "TurboDBNote v$VERSION" --notes-file release-notes.md --latest
+          gh release create "v$VERSION" upload/* --target "$GITHUB_SHA" --title "v$VERSION" --notes-file release-notes.md --latest

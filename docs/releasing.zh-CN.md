@@ -329,3 +329,5 @@ cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts --
 官方参考：[Foundation 条件](https://signpath.org/terms.html)、[GitHub Actions 接入](https://docs.signpath.io/trusted-build-systems/github)。
 
 Windows 绿色 ZIP 排除 `sources/` 与 `drivers/mysql-5.1.73-winx64/mysql-5.1.73-source.tar.gz`，驱动运行文件及许可证保留。排除的材料另打包为 `*-windows-x64-sources.zip` 并作为 Release 独立附件公开，统一纳入 SHA256SUMS.txt；安装包继续保留原有源码材料。因此后续发布为四个包加校验清单。
+
+Release 标题与生成的版本标题仅显示 `v<版本号>`。已发布版本替换仅在明确授权时使用：手动触发同时勾选 publish 与 replace_existing，或默认分支提交同时带 `[release]`、`[replace-release]`。两平台构建和校验全部通过后，先删除旧 Release 与标签，再按新提交重新创建；期间旧下载链接可能短暂不可用。普通发布仍拒绝覆盖；若删除后创建失败，对同一源码重新运行发布。

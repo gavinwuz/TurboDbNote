@@ -17,7 +17,7 @@ def notes(version, language):
     matches = re.findall(pattern, text, re.MULTILINE | re.DOTALL)
     if len(matches) != 1 or not matches[0].strip():
         raise ValueError("Expected one nonempty changelog section for this version")
-    return f"# TurboDBNote v{version}\n\n{matches[0].strip()}\n"
+    return f"# v{version}\n\n{matches[0].strip()}\n"
 
 
 def check(version):
