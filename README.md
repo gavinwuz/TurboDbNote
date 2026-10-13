@@ -74,3 +74,5 @@ Licensed under [Apache-2.0](LICENSE). Bundled third-party components retain thei
 Future Windows releases include an Inno Setup installer alongside the portable ZIP and SHA256 checksums. See [release instructions](docs/releasing.md). Current binaries remain unsigned.
 
 [Privacy Policy](PRIVACY.md)
+
+Modern MySQL version routing accepts 5.6, 5.7, 8.x and 9.x (including 8.4.5). Connection eligibility does not imply real-server acceptance for every release; authentication and TLS checks remain enforced.

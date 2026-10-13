@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Allow modern MySQL 8.x and 9.x version families, including 8.4.5, without claiming real-server acceptance for every release.
+
 - Publish the Windows installer and a separate source-material ZIP; exclude application and MySQL source archives from the portable ZIP.
 
 ## [0.1.0] - 2026-10-12

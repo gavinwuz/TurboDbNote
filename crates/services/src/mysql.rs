@@ -211,7 +211,10 @@ pub fn modern_version(version: &str) -> bool {
     let mut parts = version.split('.');
     let major = parts.next().and_then(|s| s.parse::<u32>().ok());
     let minor = parts.next().and_then(|s| s.parse::<u32>().ok());
-    matches!((major, minor), (Some(5), Some(6 | 7)) | (Some(8), Some(0)))
+    matches!(
+        (major, minor),
+        (Some(5), Some(6 | 7)) | (Some(8 | 9), Some(_))
+    )
 }
 pub fn uses_legacy(profile: &Profile) -> bool {
     profile.kind == DatabaseKind::MySql
@@ -406,7 +409,7 @@ async fn open(profile: &Profile, password: &str) -> Result<(MySqlConnection, Ser
     let version: String = row.try_get("version").map_err(error_message)?;
     if !modern_version(&version) {
         return Err(format!(
-            "检测到 {version}，当前现代适配器仅验收目标 MySQL 5.6/5.7/8.0；其他版本需兼容验证"
+            "检测到 {version}，现代适配器支持的版本系列为 MySQL 5.6/5.7/8.x/9.x；此服务器版本需使用对应适配器或另行兼容验证"
         ));
     }
     let tls = sqlx::query("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
@@ -655,7 +658,16 @@ mod tests {
     }
     #[test]
     fn version_routing_does_not_claim_legacy_support() {
-        for v in ["5.6.51", "5.7.44-log", "8.0.32"] {
+        for v in [
+            "5.6.51",
+            "5.7.44-log",
+            "8.0.32",
+            "8.4.5",
+            "8.4.5-commercial",
+            "8.9.0",
+            "9.0.1",
+            "9.5.0",
+        ] {
             assert!(modern_version(v));
         }
         for v in [
@@ -663,7 +675,9 @@ mod tests {
             "4.1.22",
             "5.5.62",
             "10.6.0-MariaDB",
-            "8.4.0",
+            "10.0.0",
+            "8.4.5-MariaDB",
+            "8.invalid",
             "garbage",
         ] {
             assert!(!modern_version(v));

@@ -53,3 +53,5 @@ Before H2 removal, native Windows GUI validation confirmed a Rust HTTP worker's 
 - [Rust Oracle / OCI requirements](https://github.com/kubo/rust-oracle)
 
 Oracle system-trust TCPS reference: https://docs.oracle.com/en/database/oracle/oracle-database/21/dbseg/configuring-secure-sockets-layer-authentication.html
+
+Modern MySQL routing accepts 5.6, 5.7, 8.x and 9.x server version families; 8.4.5 is no longer rejected solely by its version. MariaDB and unknown major versions are not implicitly accepted as MySQL. Authentication/TLS checks remain unchanged. Version-routing tests are not real-server acceptance: MySQL 8.4/9.x authentication, metadata, notebook queries, guarded writes and transfer tools still need isolated server verification for the exact releases. No server or credential changes are performed automatically.

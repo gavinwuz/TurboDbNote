@@ -74,3 +74,5 @@ cargo clippy --locked -j 1 --workspace --all-targets -- -D warnings
 后续 Windows 版本同时发布 Inno Setup 安装包、绿色 ZIP 与 SHA256 校验，详见[发布流程](docs/releasing.zh-CN.md)。当前程序仍未签名。
 
 [隐私政策](PRIVACY.zh-CN.md)
+
+现代 MySQL 版本路由支持 5.6、5.7、8.x、9.x（含 8.4.5）；允许连接不等于所有版本已完成真实服务端验收，认证和 TLS 仍按实际能力校验。
