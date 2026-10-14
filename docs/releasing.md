@@ -13,7 +13,7 @@ Future releases publish a Windows portable ZIP, Inno Setup installer EXE and Lin
 ./scripts/release.ps1 -Version 0.1.1
 ```
 
-On Linux: `python3 scripts/prepare-release.py 0.1.1` (Python 3.11+).
+On Linux: `cargo run --quiet --locked -j 1 -p turbodbnote-tools -- prepare-release 0.1.1` (Rust toolchain).
 
 The command updates Cargo/lockfile, Windows VERSIONINFO, release metadata, README versions and changelogs; creates an English release commit; and pushes it. The `[release]` marker triggers `.github/workflows/release.yml`. It does not create an early tag.
 
@@ -33,7 +33,7 @@ Git push authorization is required once on the developer machine; the Actions jo
 
 Windows: `./scripts/package-windows.ps1 -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'` using PowerShell 7 and the standard SDK/toolchain.
 
-Linux: install the packages listed in the release workflow, then `python3 scripts/package-linux.py`. Existing output paths are rejected. Generated source archives include explicitly selected project sources and never root `config/` or user data.
+Linux: install the packages listed in the release workflow, then `cargo run --quiet --locked -j 1 -p turbodbnote-tools -- package-linux`. Existing output paths are rejected. Generated source archives include explicitly selected project sources and never root `config/` or user data.
 
 Driver contract verification uses the Rust example directly on both platforms (no Python dependency for this check):
 

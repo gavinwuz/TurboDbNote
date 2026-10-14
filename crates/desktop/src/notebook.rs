@@ -11,7 +11,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, StyledExt,
+    ActiveTheme, Disableable, IconName, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
     dock::{Panel, PanelEvent},
     input::{Input, InputEvent, InputState},
@@ -66,6 +66,7 @@ pub struct NoteView {
     save_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     cell_subscriptions: std::collections::HashMap<EntityId, Subscription>,
+    import_subscription: Option<Subscription>,
     _preferences: Subscription,
     _connections_observer: Subscription,
 }
@@ -77,6 +78,85 @@ impl Focusable for NoteView {
     }
 }
 impl NoteView {
+    pub(super) fn import_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_queries(cx) || self.picking || self.saving {
+            return;
+        }
+        self.picking = true;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(t(cx, "script.import")),
+        });
+        cx.spawn_in(window, async move |owner, cx| {
+            let result = paths.await;
+            let _ = owner.update_in(cx, |this, window, cx| {
+                this.picking = false;
+                cx.emit(NoteEvent::Ready);
+                if let Ok(Ok(Some(paths))) = result
+                    && let Some(source) = paths.first()
+                {
+                    let note = this.snapshot(cx);
+                    let path = this.path.clone();
+                    let revision = this.revision;
+                    let dialect = this
+                        .note
+                        .default_connection_id
+                        .and_then(|id| this.connections.read(cx).note_profile(id))
+                        .and_then(|profile| turbodbn_services::sql_script::dialect(profile.kind));
+                    let output = this.connections.read(cx).output.clone();
+                    let importer = cx.new(|cx| {
+                        crate::script_import::ImportView::new(
+                            source.clone(),
+                            path.clone(),
+                            note,
+                            dialect,
+                            output,
+                            window,
+                            cx,
+                        )
+                    });
+                    this.import_subscription = Some(cx.subscribe_in(
+                        &importer,
+                        window,
+                        move |this, _, event: &crate::script_import::Imported, window, cx| {
+                            if this.revision != revision
+                                || this.path != path
+                                || this.active_queries(cx)
+                            {
+                                feedback::error(t(cx, "notes.preview_changed"), cx);
+                                return;
+                            }
+                            for cell in &event.cells {
+                                this.push_cell(cell.clone(), window, cx);
+                            }
+                            this.changed(cx);
+                            event
+                                .accepted
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                        },
+                    ));
+                    let cancel = importer.downgrade();
+                    window.open_dialog(cx, move |dialog, _, cx| {
+                        let cancel = cancel.clone();
+                        dialog
+                            .title(t(cx, "script.import"))
+                            .w(px(650.))
+                            .overlay_closable(false)
+                            .on_cancel(move |_, _, cx| {
+                                let _ = cancel.update(cx, |this, cx| this.cancel(cx));
+                                true
+                            })
+                            .child(importer.clone())
+                    });
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
     pub fn new(
         mut loaded: Loaded,
         path: PathBuf,
@@ -166,6 +246,7 @@ impl NoteView {
             save_task: None,
             _subscriptions: subscriptions,
             cell_subscriptions: Default::default(),
+            import_subscription: None,
             _preferences: observer,
             _connections_observer: connections_observer,
         };
@@ -180,7 +261,15 @@ impl NoteView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Entity<CellView> {
-        let entity = cx.new(|cx| CellView::new(cell, self.connections.clone(), window, cx));
+        let entity = cx.new(|cx| {
+            CellView::new(
+                cell,
+                self.connections.clone(),
+                self.path.clone(),
+                window,
+                cx,
+            )
+        });
         let database = self.default_database.read(cx).value().trim().to_owned();
         entity.update(cx, |cell, cx| {
             cell.set_defaults(self.note.default_connection_id, database, cx)
@@ -193,6 +282,9 @@ impl NoteView {
                 window,
                 move |this, _, event, window, cx| match event {
                     CellEvent::Changed => this.changed(cx),
+                    CellEvent::SelectTarget => cx.defer_in(window, |this, window, cx| {
+                        this.select_script_target(window, cx)
+                    }),
                     CellEvent::BatchFinished { token, success } => {
                         this.batch_finished(id, *token, *success, window, cx)
                     }
@@ -406,6 +498,7 @@ impl NoteView {
         self.error.clear();
         let written = path.clone();
         let work = cx.background_executor().spawn(async move {
+            turbodbn_services::sql_script::copy_resources(&previous, &written, &snapshot)?;
             let hash = note_store::save(&written, &snapshot, hash)?;
             let mut retired = false;
             if retire
@@ -431,6 +524,9 @@ impl NoteView {
                             feedback::error(t(cx, "notes.rename_partial"), cx);
                         }
                         this.path = path;
+                        for cell in &this.cells {
+                            cell.update(cx, |cell, cx| cell.set_note_path(this.path.clone(), cx));
+                        }
                         this.hash = hash;
                         this.saved_revision = revision;
                         cx.emit(PanelEvent::LayoutChanged);
@@ -472,7 +568,7 @@ impl NoteView {
         cx.notify();
     }
     fn save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.picking {
+        if self.saving || self.picking || self.cells.iter().any(|cell| cell.read(cx).indexing(cx)) {
             return;
         }
         self.picking = true;

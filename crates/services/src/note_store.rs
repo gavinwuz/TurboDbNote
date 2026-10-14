@@ -143,6 +143,7 @@ pub fn archive(path: &Path, expected: Option<[u8; 32]>) -> Result<PathBuf, Strin
         uuid::Uuid::new_v4(),
         path.file_name().ok_or("笔记文件名无效")?.to_string_lossy()
     ));
+    crate::sql_script::copy_resources(path, &archived, &loaded.note)?;
     fs::rename(path, &archived).map_err(io_error)?;
     Ok(archived)
 }

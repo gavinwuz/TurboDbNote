@@ -15,6 +15,7 @@ mod result_grid;
 pub use result_grid::{GridAction, GridSource, grid_request};
 
 pub const DEFAULT_PAGE_SIZE: usize = 20;
+pub const SCRIPT_MAX_BYTES: usize = workbench::script_context::MAX_BYTES;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
     pub sql: String,
@@ -26,6 +27,15 @@ pub struct Plan {
 pub struct Guard {
     pub object: Object,
     pub stamp: Option<String>,
+}
+pub fn guard_hash(guard: &Guard) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update([u8::from(guard.stamp.is_some())]);
+    if let Some(stamp) = &guard.stamp {
+        digest.update(stamp.as_bytes());
+    }
+    digest.finalize().into()
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ResultPage {
@@ -42,7 +52,7 @@ pub struct ResultPage {
     pub read_only: bool,
 }
 /// Execution metadata only: never include SQL, credentials or raw server errors.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExecutionSummary {
     pub operation: String,
     pub status: String,
@@ -51,6 +61,16 @@ pub struct ExecutionSummary {
     pub changed_rows: Option<u64>,
     pub elapsed_ms: u64,
     pub count_source: Option<String>,
+    #[serde(default)]
+    pub objects: Vec<Object>,
+    #[serde(default)]
+    pub created_tables: Option<u64>,
+    #[serde(default)]
+    pub skipped_tables: Option<u64>,
+    #[serde(default)]
+    pub mixed_write: bool,
+    #[serde(default)]
+    pub table_create: bool,
 }
 impl ExecutionSummary {
     pub fn json_rows(&self) -> Rows {
@@ -61,10 +81,18 @@ impl ExecutionSummary {
     }
 }
 fn parse(kind: DatabaseKind, sql: &str) -> Result<Statement, String> {
+    parse_for(kind, sql, false)
+}
+fn parse_for(kind: DatabaseKind, sql: &str, script: bool) -> Result<Statement, String> {
     if sql.trim().is_empty()
-        || sql.len() > 60_000
+        || sql.len()
+            > if script {
+                workbench::script_context::MAX_BYTES
+            } else {
+                60_000
+            }
         || sql.contains('\0')
-        || sql.contains("/*!")
+        || !script && sql.contains("/*!")
         || sql.contains("/*M!")
     {
         return Err("SQL 为空、超过 60 KB 或包含不支持的执行注释".into());
@@ -228,6 +256,65 @@ fn inspect(s: &Statement, kind: DatabaseKind) -> Result<Inspection, String> {
     }
     Ok(info)
 }
+pub fn validate_script_statement(kind: DatabaseKind, sql: &str) -> Result<bool, String> {
+    let expanded;
+    let sql = if kind == DatabaseKind::MySql {
+        expanded = workbench::script_context::expand(sql, None)?;
+        &expanded
+    } else {
+        sql
+    };
+    if kind == DatabaseKind::MySql && workbench::script_context::keys_target(sql)?.is_some() {
+        return Ok(false);
+    }
+    if kind == DatabaseKind::MySql
+        && let Some(control) = workbench::script_context::control(sql)?
+    {
+        return Ok(!control.confirm());
+    }
+    if mysql_metadata(kind, sql) {
+        return Ok(true);
+    }
+    let statement = parse_for(kind, sql, true)?;
+    inspect(&statement, kind).map(|inspection| !inspection.writes)
+}
+pub fn script_requires_confirmation(
+    kind: DatabaseKind,
+    sql: &str,
+    legacy: bool,
+) -> Result<bool, String> {
+    if !validate_script_statement(kind, sql)? {
+        return Ok(true);
+    }
+    if (legacy || kind == DatabaseKind::MySql) && !mysql_metadata(kind, sql) {
+        let expanded = workbench::script_context::expand(sql, None)?;
+        if workbench::script_context::control(&expanded)?.is_some() {
+            return Ok(false);
+        }
+        return inspect(&parse_for(kind, &expanded, true)?, kind).map(|info| info.functions);
+    }
+    Ok(false)
+}
+pub fn validate_script_target(kind: DatabaseKind, sql: &str, database: &str) -> Result<(), String> {
+    workbench::script_context::validate_target(kind, sql, database)?;
+    if kind == DatabaseKind::MySql {
+        let expanded = workbench::script_context::expand(sql, None)?;
+        if let Some(parts) = workbench::script_context::keys_target(&expanded)? {
+            object(kind, database, &parts).map_err(|_| "script.error.database_mismatch")?;
+            return Ok(());
+        }
+        if workbench::script_context::control(&expanded)?.is_none() {
+            if mysql_metadata(kind, &expanded) {
+                return Ok(());
+            }
+            let statement = parse_for(kind, &expanded, true)?;
+            for parts in inspect(&statement, kind)?.tables {
+                object(kind, database, &parts).map_err(|_| "script.error.database_mismatch")?;
+            }
+        }
+    }
+    Ok(())
+}
 fn object(kind: DatabaseKind, database: &str, parts: &[String]) -> Result<Object, String> {
     let (schema, name) = match parts {
         [name] => (
@@ -341,7 +428,39 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
     ("show_tables", "SHOW TABLES", true),
     ("show_status", "SHOW STATUS", true),
     ("show_variables", "SHOW VARIABLES", true),
+    ("show_databases", "SHOW DATABASES", true),
 ];
+pub const SCRIPT_COMMANDS: &[(&str, &str, bool)] = &[
+    ("script_session", "USE / SET SESSION", true),
+    ("script_transaction", "BEGIN / COMMIT / ROLLBACK", true),
+    ("script_lock", "LOCK / UNLOCK TABLES", false),
+];
+
+pub fn script_command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
+    if kind == DatabaseKind::MySql {
+        let expanded = workbench::script_context::expand(sql, None).ok()?;
+        if workbench::script_context::keys_target(&expanded)
+            .ok()?
+            .is_some()
+        {
+            return Some("alter");
+        }
+        if let Some(control) = workbench::script_context::control(&expanded).ok()? {
+            return Some(control.permission());
+        }
+        return script_sql_command(kind, &expanded);
+    }
+    script_sql_command(kind, sql)
+}
+fn script_sql_command(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
+    if sql.len() <= 60_000 {
+        return command_required(kind, sql);
+    }
+    match parse_for(kind, sql, true).ok()? {
+        Statement::Insert(_) => Some("insert"),
+        _ => None,
+    }
+}
 
 pub fn command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
     if let Some(key) = extension_required(kind, sql) {
@@ -370,7 +489,12 @@ pub fn command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
 
 /// Vetted optional read-only categories. No arbitrary SQL-prefix escape hatch.
 pub fn extension_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
-    if kind != DatabaseKind::MySql {
+    if kind != DatabaseKind::MySql
+        || sql.len() > 60_000
+        || sql.contains('\0')
+        || sql.contains("/*!")
+        || sql.contains("/*M!")
+    {
         return None;
     }
     use sqlparser::tokenizer::{Token, Tokenizer};
@@ -383,7 +507,7 @@ pub fn extension_required(kind: DatabaseKind, sql: &str) -> Option<&'static str>
     if tokens.last() == Some(&Token::SemiColon) {
         tokens.pop();
     }
-    if tokens.len() != 2 {
+    if tokens.len() < 2 {
         return None;
     }
     let word = |t: &Token| match t {
@@ -393,11 +517,22 @@ pub fn extension_required(kind: DatabaseKind, sql: &str) -> Option<&'static str>
     if word(&tokens[0]).as_deref() != Some("SHOW") {
         return None;
     }
-    match word(&tokens[1]).as_deref() {
-        Some("TABLES") => Some("show_tables"),
-        Some("STATUS") => Some("show_status"),
-        Some("VARIABLES") => Some("show_variables"),
-        _ => None,
+    let scoped = matches!(word(&tokens[1]).as_deref(), Some("SESSION" | "GLOBAL"));
+    let index = if scoped { 2 } else { 1 };
+    let category = match word(tokens.get(index)?).as_deref() {
+        Some("TABLES") if !scoped => "show_tables",
+        Some("STATUS") => "show_status",
+        Some("VARIABLES") => "show_variables",
+        Some("DATABASES" | "SCHEMAS") if !scoped => "show_databases",
+        _ => return None,
+    };
+    let suffix = &tokens[index + 1..];
+    if suffix.is_empty()
+        || matches!(suffix, [like, Token::SingleQuotedString(_)] if word(like).as_deref() == Some("LIKE") && !sql.contains('\\'))
+    {
+        Some(category)
+    } else {
+        None
     }
 }
 // MySQL metadata reads have their own bounded result path, never SELECT pagination.
@@ -498,6 +633,16 @@ pub async fn prepare(
     version: &str,
     sql: &str,
 ) -> Result<Plan, String> {
+    prepare_inner(c, kind, database, version, sql, false).await
+}
+async fn prepare_inner(
+    c: &mut impl Access,
+    kind: DatabaseKind,
+    database: &str,
+    version: &str,
+    sql: &str,
+    script: bool,
+) -> Result<Plan, String> {
     if mysql_metadata(kind, sql) {
         return Ok(Plan {
             sql: sql.trim().into(),
@@ -506,7 +651,7 @@ pub async fn prepare(
             guards: vec![],
         });
     }
-    let stmt = parse(kind, sql)?;
+    let stmt = parse_for(kind, sql, script)?;
     let info = inspect(&stmt, kind)?;
     let legacy = kind == DatabaseKind::MySql && !crate::mysql::modern_version(version);
     let mut guards = Vec::new();
@@ -523,9 +668,80 @@ pub async fn prepare(
     Ok(Plan {
         sql: sql.trim().to_owned(),
         read_only: !info.writes,
-        confirm: info.writes || (legacy && info.functions),
+        confirm: info.writes
+            || ((legacy || script && kind == DatabaseKind::MySql) && info.functions),
         guards,
     })
+}
+pub async fn prepare_script(
+    c: &mut impl Access,
+    kind: DatabaseKind,
+    database: &str,
+    version: &str,
+    sql: &str,
+) -> Result<Plan, String> {
+    validate_script_target(kind, sql, database)?;
+    let expanded = if kind == DatabaseKind::MySql {
+        workbench::script_context::expand(
+            sql,
+            Some(workbench::script_context::version_number(version)?),
+        )?
+    } else {
+        sql.into()
+    };
+    let empty = expanded.trim().trim_matches(';').trim().is_empty();
+    if empty
+        || kind == DatabaseKind::MySql && workbench::script_context::control(&expanded)?.is_some()
+    {
+        if !empty && !crate::mysql::modern_version(version) {
+            return Err("script.error.legacy".into());
+        }
+        let confirm = if empty {
+            false
+        } else {
+            workbench::script_context::control(&expanded)?
+                .unwrap()
+                .confirm()
+        };
+        return Ok(Plan {
+            sql: sql.trim().into(),
+            read_only: !confirm,
+            confirm,
+            guards: vec![],
+        });
+    }
+    if kind == DatabaseKind::MySql && crate::mysql::modern_version(version) {
+        let mode = c.query("SELECT @@SESSION.sql_mode").await?;
+        let mode = mode
+            .values
+            .first()
+            .and_then(|r| r.first())
+            .and_then(Option::as_ref)
+            .ok_or("script.error.mode")?;
+        if mode.split(',').any(|m| {
+            matches!(
+                m.trim().to_ascii_uppercase().as_str(),
+                "NO_BACKSLASH_ESCAPES" | "ANSI_QUOTES"
+            )
+        }) {
+            return Err("script.error.mode".into());
+        }
+    }
+    if kind == DatabaseKind::MySql
+        && let Some(parts) = workbench::script_context::keys_target(&expanded)?
+    {
+        let object = resolved_object(c, kind, database, &parts).await?;
+        let stamp = stamp(c, kind, database, &object).await?;
+        return Ok(Plan {
+            sql: sql.trim().into(),
+            read_only: false,
+            confirm: true,
+            guards: vec![Guard { object, stamp }],
+        });
+    }
+    let mut plan = prepare_inner(c, kind, database, version, &expanded, true).await?;
+    plan.sql = sql.trim().into();
+    Ok(plan)
 }
 /// Plain EXPLAIN only: ANALYZE is never appended and the original statement must be a query.
 pub async fn explain(
@@ -703,14 +919,139 @@ pub async fn execute(
     confirmed: bool,
     page: (usize, usize),
 ) -> Result<ResultPage, String> {
+    execute_inner(c, kind, database, version, plan, confirmed, page, false).await
+}
+pub async fn execute_script(
+    c: &mut impl Access,
+    kind: DatabaseKind,
+    database: &str,
+    version: &str,
+    plan: &Plan,
+    confirmed: bool,
+) -> Result<ResultPage, String> {
+    let expected = prepare_script(c, kind, database, version, &plan.sql).await?;
+    if expected.read_only != plan.read_only
+        || expected.confirm != plan.confirm
+        || expected.guards.len() != plan.guards.len()
+        || expected
+            .guards
+            .iter()
+            .zip(&plan.guards)
+            .any(|(a, b)| a.object != b.object || a.stamp != b.stamp)
+    {
+        return Err("notes.preview_changed".into());
+    }
+    if expected.confirm && !confirmed {
+        return Err("notes.preview_changed".into());
+    }
+    let expanded = if kind == DatabaseKind::MySql {
+        workbench::script_context::expand(
+            &plan.sql,
+            Some(workbench::script_context::version_number(version)?),
+        )?
+    } else {
+        plan.sql.clone()
+    };
+    let empty = expanded.trim().trim_matches(';').trim().is_empty();
+    if empty
+        || kind == DatabaseKind::MySql && workbench::script_context::control(&expanded)?.is_some()
+    {
+        let started = Instant::now();
+        if plan.confirm && !confirmed {
+            return Err("notes.preview_changed".into());
+        }
+        if !empty {
+            c.query(&expanded)
+                .await
+                .map_err(|_| "script.error.execution")?;
+        }
+        return Ok(ResultPage {
+            execution: Some(Box::new(ExecutionSummary {
+                operation: "SESSION".into(),
+                status: "succeeded".into(),
+                elapsed_ms: started.elapsed().as_millis() as u64,
+                ..Default::default()
+            })),
+            affected_rows: None,
+            grid: None,
+            rows: Rows::default(),
+            more: false,
+            offset: 0,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            read_only: plan.read_only,
+        });
+    }
+    let mut expanded_plan = plan.clone();
+    expanded_plan.sql = expanded;
+    if kind == DatabaseKind::MySql
+        && workbench::script_context::keys_target(&expanded_plan.sql)?.is_some()
+    {
+        let start = Instant::now();
+        c.query(&expanded_plan.sql)
+            .await
+            .map_err(|_| "script.error.execution")?;
+        return Ok(ResultPage {
+            execution: Some(Box::new(ExecutionSummary {
+                operation: "ALTER".into(),
+                status: "succeeded".into(),
+                affected_rows: None,
+                matched_rows: None,
+                changed_rows: None,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                count_source: None,
+                objects: plan
+                    .guards
+                    .iter()
+                    .take(32)
+                    .map(|g| g.object.clone())
+                    .collect(),
+                ..Default::default()
+            })),
+            affected_rows: None,
+            grid: None,
+            rows: Rows::default(),
+            more: false,
+            offset: 0,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            read_only: false,
+        });
+    }
+    execute_inner(
+        c,
+        kind,
+        database,
+        version,
+        &expanded_plan,
+        confirmed,
+        (0, 20),
+        true,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn execute_inner(
+    c: &mut impl Access,
+    kind: DatabaseKind,
+    database: &str,
+    version: &str,
+    plan: &Plan,
+    confirmed: bool,
+    page: (usize, usize),
+    script: bool,
+) -> Result<ResultPage, String> {
     let (offset, size) = page;
     if mysql_metadata(kind, &plan.sql) {
         if !plan.read_only || !plan.guards.is_empty() || offset != 0 {
             return Err("notes.metadata.invalid".into());
         }
-        return metadata_result(c, &plan.sql).await;
+        let mut result = metadata_result(c, &plan.sql).await?;
+        if script {
+            result.more = result.rows.values.len() > 20;
+            result.rows.values.truncate(20);
+        }
+        return Ok(result);
     }
-    let stmt = parse(kind, &plan.sql)?;
+    let stmt = parse_for(kind, &plan.sql, script)?;
     let info = inspect(&stmt, kind)?;
     if info.writes == plan.read_only {
         return Err("SQL 预览状态无效，请重新执行".into());
@@ -748,12 +1089,12 @@ pub async fn execute(
         }
     }
     let start = Instant::now();
-    let sql = if plan.read_only {
+    let sql = if plan.read_only && !script {
         page_sql(kind, &plan.sql, offset, size)?
     } else {
         plan.sql.clone()
     };
-    if plan.read_only && !legacy {
+    if plan.read_only && !legacy && (!script || kind != DatabaseKind::MySql) {
         c.query(match kind {
             DatabaseKind::Sqlite => "PRAGMA query_only=ON",
             DatabaseKind::PostgreSql => "BEGIN READ ONLY",
@@ -761,8 +1102,8 @@ pub async fn execute(
         })
         .await?;
     }
-    let result = c.query(&sql).await;
-    if plan.read_only && !legacy {
+    let result = c.query_counted(&sql).await;
+    if plan.read_only && !legacy && (!script || kind != DatabaseKind::MySql) {
         let _ = c
             .query(if kind == DatabaseKind::Sqlite {
                 "PRAGMA query_only=OFF"
@@ -771,7 +1112,7 @@ pub async fn execute(
             })
             .await;
     }
-    let mut rows = result.map_err(|error| {
+    let (mut rows, driver_affected) = result.map_err(|error| {
         if kind == DatabaseKind::MySql
             && matches!(
                 error.as_str(),
@@ -783,19 +1124,47 @@ pub async fn execute(
             "SQL 执行失败，请检查语法、权限及对象是否存在；写入可能已生效，请勿盲目重试".to_string()
         }
     })?;
+    let (created_tables, skipped_tables) = if let Statement::CreateTable(create) = &stmt {
+        if !create.if_not_exists {
+            (Some(1), Some(0))
+        } else if kind == DatabaseKind::MySql {
+            // Read diagnostics before any other statement can clear the CREATE result.
+            match c.query("SHOW WARNINGS LIMIT 32").await {
+                Ok(warnings)
+                    if warnings
+                        .values
+                        .iter()
+                        .any(|r| r.get(1).and_then(|v| v.as_deref()) == Some("1050")) =>
+                {
+                    (Some(0), Some(1))
+                }
+                Ok(warnings) if warnings.values.len() < 32 => (Some(1), Some(0)),
+                _ => (None, None),
+            }
+        } else {
+            // Success alone cannot distinguish conditional creation from a skipped table.
+            (None, None)
+        }
+    } else {
+        (None, None)
+    };
+    let mixed_write =
+        matches!(&stmt, Statement::Insert(insert) if insert.on.is_some() || insert.replace_into);
     // Read the session counter immediately, before metadata queries can replace it.
     // SQLite changes() retains old DML counts after DDL, so only inspect DML.
     let affected_rows = if !plan.read_only {
         let dml = matches!(
-            parse(kind, &plan.sql)?,
+            parse_for(kind, &plan.sql, script)?,
             Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_)
         );
         let counter = match kind {
-            DatabaseKind::MySql => Some("SELECT ROW_COUNT()"),
+            DatabaseKind::MySql if dml => Some("SELECT ROW_COUNT()"),
             DatabaseKind::Sqlite if dml => Some("SELECT changes()"),
             _ => None,
         };
-        if let Some(counter) = counter {
+        if dml && driver_affected.is_some() {
+            driver_affected
+        } else if let Some(counter) = counter {
             c.query(counter)
                 .await
                 .ok()
@@ -811,7 +1180,7 @@ pub async fn execute(
     }
     let more = plan.read_only && rows.values.len() > size;
     rows.values.truncate(size);
-    let grid = if plan.read_only {
+    let grid = if plan.read_only && !script {
         let info = result_grid::source_info(c, kind, database, &plan.sql, &rows.columns)
             .await
             .unwrap_or_else(|_| result_grid::readonly(&rows.columns));
@@ -825,15 +1194,35 @@ pub async fn execute(
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let execution = (!plan.read_only).then(|| {
         Box::new(ExecutionSummary {
-            operation: command_required(kind, &plan.sql)
-                .unwrap_or("command")
-                .to_ascii_uppercase(),
+            operation: (if script {
+                script_command_required(kind, &plan.sql)
+            } else {
+                command_required(kind, &plan.sql)
+            })
+            .unwrap_or("command")
+            .to_ascii_uppercase(),
             status: "succeeded".into(),
             affected_rows,
             matched_rows: None,
             changed_rows: None,
             elapsed_ms,
-            count_source: affected_rows.map(|_| "session_counter".into()),
+            count_source: affected_rows.map(|_| {
+                if driver_affected.is_some() {
+                    "driver_result".into()
+                } else {
+                    "session_counter".into()
+                }
+            }),
+            objects: plan
+                .guards
+                .iter()
+                .take(32)
+                .map(|g| g.object.clone())
+                .collect(),
+            created_tables,
+            skipped_tables,
+            mixed_write,
+            table_create: matches!(&stmt, Statement::CreateTable(_)),
         })
     });
     Ok(ResultPage {
@@ -851,6 +1240,147 @@ pub async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mysql_script_create_counts_distinguish_created_and_skipped_tables() {
+        struct Mock {
+            exists: bool,
+            skipped: bool,
+            warning_reads: u64,
+            row_counter_reads: u64,
+        }
+        impl Access for Mock {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                Box::pin(async move {
+                    let rows = |columns: &[&str], values: &[&str]| Rows {
+                        columns: columns.iter().map(|v| v.to_string()).collect(),
+                        values: vec![values.iter().map(|v| Some(v.to_string())).collect()],
+                    };
+                    if sql == "SELECT @@SESSION.sql_mode" {
+                        return Ok(rows(&["mode"], &[""]));
+                    }
+                    if sql.starts_with("SHOW CREATE TABLE") {
+                        return if self.exists {
+                            Ok(rows(
+                                &["Table", "Create Table"],
+                                &["items", "CREATE TABLE items(id INT)"],
+                            ))
+                        } else {
+                            Err(crate::mysql::TABLE_MISSING.into())
+                        };
+                    }
+                    if sql.starts_with("CREATE TABLE IF NOT EXISTS") {
+                        self.skipped = self.exists;
+                        self.exists = true;
+                        return Ok(Rows::default());
+                    }
+                    if sql == "SHOW WARNINGS LIMIT 32" {
+                        self.warning_reads += 1;
+                        return Ok(if self.skipped {
+                            rows(&["Level", "Code", "Message"], &["Note", "1050", "omitted"])
+                        } else {
+                            Rows::default()
+                        });
+                    }
+                    if sql == "SELECT ROW_COUNT()" {
+                        self.row_counter_reads += 1;
+                        return Ok(rows(&["count"], &["0"]));
+                    }
+                    Err("unexpected fixture request".into())
+                })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for exists in [false, true] {
+                    let mut db = Mock {
+                        exists,
+                        skipped: false,
+                        warning_reads: 0,
+                        row_counter_reads: 0,
+                    };
+                    let plan = prepare_script(
+                        &mut db,
+                        DatabaseKind::MySql,
+                        "fixture",
+                        "8.0.32",
+                        "CREATE TABLE IF NOT EXISTS items(id INT)",
+                    )
+                    .await
+                    .unwrap();
+                    let result = execute_script(
+                        &mut db,
+                        DatabaseKind::MySql,
+                        "fixture",
+                        "8.0.32",
+                        &plan,
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                    let summary = result.execution.unwrap();
+                    assert_eq!(summary.created_tables, Some(u64::from(!exists)));
+                    assert_eq!(summary.skipped_tables, Some(u64::from(exists)));
+                    assert!(summary.table_create);
+                    assert_eq!(summary.objects[0].name, "items");
+                    assert!(summary.affected_rows.is_none());
+                    assert_eq!(db.warning_reads, 1);
+                    assert_eq!(db.row_counter_reads, 0);
+                }
+            });
+    }
+    #[test]
+    fn sqlite_script_reports_dml_and_keeps_conditional_creation_unknown() {
+        use sqlx::Connection;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut db = sqlx::SqliteConnection::connect("sqlite::memory:")
+                    .await
+                    .unwrap();
+                for (sql, affected, created) in [
+                    ("CREATE TABLE items(id INT PRIMARY KEY)", None, Some(1)),
+                    (
+                        "CREATE TABLE IF NOT EXISTS items(id INT PRIMARY KEY)",
+                        None,
+                        None,
+                    ),
+                    ("INSERT INTO items VALUES(1),(2)", Some(2), None),
+                    ("UPDATE items SET id=3 WHERE id=2", Some(1), None),
+                    ("DELETE FROM items WHERE id=3", Some(1), None),
+                ] {
+                    let plan = prepare_script(&mut db, DatabaseKind::Sqlite, "main", "3", sql)
+                        .await
+                        .unwrap();
+                    let result =
+                        execute_script(&mut db, DatabaseKind::Sqlite, "main", "3", &plan, true)
+                            .await
+                            .unwrap();
+                    let summary = result.execution.unwrap();
+                    assert_eq!(summary.affected_rows, affected);
+                    assert_eq!(summary.created_tables, created);
+                    assert_eq!(summary.objects[0].name, "items");
+                }
+                let plan = prepare_script(
+                    &mut db,
+                    DatabaseKind::Sqlite,
+                    "main",
+                    "3",
+                    "INSERT INTO items VALUES(1) ON CONFLICT(id) DO UPDATE SET id=excluded.id",
+                )
+                .await
+                .unwrap();
+                let result =
+                    execute_script(&mut db, DatabaseKind::Sqlite, "main", "3", &plan, true)
+                        .await
+                        .unwrap();
+                assert!(result.execution.unwrap().mixed_write);
+            });
+    }
     #[test]
     fn sqlite_affected_rows_do_not_reuse_previous_dml_for_ddl() {
         use sqlx::Connection;
@@ -997,14 +1527,10 @@ mod tests {
             )
             .await
             .unwrap();
-            assert_eq!(result.affected_rows, Some(0));
+            assert_eq!(result.affected_rows, None);
             assert_eq!(
                 db.calls,
-                vec![
-                    "SHOW CREATE TABLE `fixture`.`items_%'``x`",
-                    sql,
-                    "SELECT ROW_COUNT()"
-                ]
+                vec!["SHOW CREATE TABLE `fixture`.`items_%'``x`", sql,]
             );
             for error in [
                 crate::mysql::SQL_SYNTAX_ERROR,
@@ -1071,7 +1597,7 @@ mod tests {
             }
         }
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            for sql in ["SHOW CREATE TABLE `seach_works`;\n# 递归方法链\n-- SHOW INDEX FROM `seach_works`;", "SHOW INDEX FROM `t`", "SHOW KEYS IN db.t", "SHOW FULL COLUMNS FROM t FROM db", "SHOW CREATE VIEW db.v"] {
+            for sql in ["SHOW CREATE TABLE `seach_works`;\n# 递归方法链\n-- SHOW INDEX FROM `seach_works`;", "SHOW INDEX FROM `t`", "SHOW KEYS IN db.t", "SHOW FULL COLUMNS FROM t FROM db", "SHOW CREATE VIEW db.v", "SHOW DATABASES", "SHOW SCHEMAS LIKE 'test%'", "SHOW VARIABLES LIKE 'skip_show_database'", "SHOW SESSION VARIABLES LIKE 'character_set_%'", "SHOW GLOBAL STATUS LIKE 'Threads_%'"] {
                 let mut db=Capture(vec![]);
                 let plan=prepare(&mut db,DatabaseKind::MySql,"db","5.5",sql).await.unwrap();
                 assert!(plan.read_only && !plan.confirm);
@@ -1472,6 +1998,212 @@ mod tests {
 mod command_policy_tests {
     use super::*;
     #[test]
+    fn mysql_dump_keys_require_alter_confirmation_and_recheck_schema() {
+        let sql = "/*!40000 ALTER TABLE `account` ENABLE KEYS */;";
+        assert_eq!(
+            script_command_required(DatabaseKind::MySql, sql),
+            Some("alter")
+        );
+        assert_eq!(
+            validate_script_statement(DatabaseKind::MySql, sql),
+            Ok(false)
+        );
+        assert!(
+            validate_script_target(
+                DatabaseKind::MySql,
+                "ALTER TABLE other.account DISABLE KEYS",
+                "app"
+            )
+            .is_err()
+        );
+        assert!(
+            workbench::script_context::keys_target(
+                "ALTER TABLE account ENABLE KEYS; DROP TABLE account"
+            )
+            .is_err()
+        );
+        struct Fake {
+            ddl: String,
+            executed: usize,
+        }
+        impl Access for Fake {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                let rows = if sql == "SELECT @@SESSION.sql_mode" {
+                    Rows {
+                        columns: vec!["mode".into()],
+                        values: vec![vec![Some(String::new())]],
+                    }
+                } else if sql.starts_with("SHOW CREATE TABLE") {
+                    Rows {
+                        columns: vec!["Table".into(), "Create Table".into()],
+                        values: vec![vec![Some("account".into()), Some(self.ddl.clone())]],
+                    }
+                } else {
+                    self.executed += 1;
+                    Rows::default()
+                };
+                Box::pin(async move { Ok(rows) })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut fake = Fake {
+                    ddl: "CREATE TABLE account(id INT)".into(),
+                    executed: 0,
+                };
+                let plan = prepare_script(&mut fake, DatabaseKind::MySql, "app", "8.0.32", sql)
+                    .await
+                    .unwrap();
+                assert!(
+                    execute_script(
+                        &mut fake,
+                        DatabaseKind::MySql,
+                        "app",
+                        "8.0.32",
+                        &plan,
+                        false
+                    )
+                    .await
+                    .is_err()
+                );
+                assert_eq!(fake.executed, 0);
+                execute_script(&mut fake, DatabaseKind::MySql, "app", "8.0.32", &plan, true)
+                    .await
+                    .unwrap();
+                assert_eq!(fake.executed, 1);
+                fake.ddl = "CREATE TABLE account(id INT,changed INT)".into();
+                assert!(
+                    execute_script(&mut fake, DatabaseKind::MySql, "app", "8.0.32", &plan, true)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(fake.executed, 1);
+            });
+    }
+    #[test]
+    fn mysql_script_unknown_functions_require_confirmation_without_readonly_wrappers() {
+        assert!(
+            script_requires_confirmation(DatabaseKind::MySql, "SELECT risky_udf()", false).unwrap()
+        );
+        assert!(
+            !script_requires_confirmation(DatabaseKind::MySql, "SELECT COUNT(*) FROM t", false)
+                .unwrap()
+        );
+        struct Fake {
+            calls: Vec<String>,
+        }
+        impl Access for Fake {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                self.calls.push(sql.into());
+                Box::pin(async {
+                    Ok(Rows {
+                        columns: vec!["mode".into()],
+                        values: vec![vec![Some(String::new())]],
+                    })
+                })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut fake = Fake { calls: vec![] };
+                let plan = prepare_script(
+                    &mut fake,
+                    DatabaseKind::MySql,
+                    "app",
+                    "8.0.32",
+                    "SELECT risky_udf()",
+                )
+                .await
+                .unwrap();
+                assert!(plan.confirm);
+                assert!(
+                    execute_script(
+                        &mut fake,
+                        DatabaseKind::MySql,
+                        "app",
+                        "8.0.32",
+                        &plan,
+                        false
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(
+                    fake.calls
+                        .iter()
+                        .all(|sql| sql == "SELECT @@SESSION.sql_mode")
+                );
+            });
+    }
+    #[test]
+    fn script_executes_original_sql_in_one_sqlite_session_and_requires_confirmation() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use sqlx::Connection;
+                let mut db = sqlx::SqliteConnection::connect("sqlite::memory:")
+                    .await
+                    .unwrap();
+                for sql in [
+                    "CREATE TABLE script_test(id INTEGER PRIMARY KEY)",
+                    "INSERT INTO script_test VALUES (1),(2),(3)",
+                ] {
+                    let plan = prepare(&mut db, DatabaseKind::Sqlite, "main", "3", sql)
+                        .await
+                        .unwrap();
+                    assert!(
+                        execute_script(&mut db, DatabaseKind::Sqlite, "main", "3", &plan, false)
+                            .await
+                            .is_err()
+                    );
+                    execute_script(&mut db, DatabaseKind::Sqlite, "main", "3", &plan, true)
+                        .await
+                        .unwrap();
+                }
+                let plan = prepare(
+                    &mut db,
+                    DatabaseKind::Sqlite,
+                    "main",
+                    "3",
+                    "SELECT id FROM script_test ORDER BY id LIMIT 1 OFFSET 1",
+                )
+                .await
+                .unwrap();
+                let result =
+                    execute_script(&mut db, DatabaseKind::Sqlite, "main", "3", &plan, false)
+                        .await
+                        .unwrap();
+                assert_eq!(result.rows.values, vec![vec![Some("2".into())]]);
+                assert!(result.grid.is_none());
+                let plan = prepare(
+                    &mut db,
+                    DatabaseKind::Sqlite,
+                    "main",
+                    "3",
+                    "DELETE FROM script_test",
+                )
+                .await
+                .unwrap();
+                sqlx::query("ALTER TABLE script_test ADD COLUMN changed INT")
+                    .execute(&mut db)
+                    .await
+                    .unwrap();
+                assert!(
+                    execute_script(&mut db, DatabaseKind::Sqlite, "main", "3", &plan, true)
+                        .await
+                        .is_err()
+                );
+            });
+    }
+    #[test]
     fn categories_use_parsed_statements_and_metadata_whitelist() {
         let cases = [
             ("-- comment\nSELECT 1", Some("select")),
@@ -1480,6 +2212,26 @@ mod command_policy_tests {
             ("UPDATE users SET name='a'", Some("update")),
             ("WITH t AS (SELECT 1) SELECT * FROM t", Some("select")),
             ("SHOW VARIABLES", Some("show_variables")),
+            (
+                "SHOW VARIABLES LIKE 'skip_show_database'",
+                Some("show_variables"),
+            ),
+            (
+                "SHOW SESSION VARIABLES LIKE 'character_set_%'",
+                Some("show_variables"),
+            ),
+            ("SHOW GLOBAL STATUS LIKE 'Threads_%'", Some("show_status")),
+            (
+                "SHOW DATABASES; -- manual detection",
+                Some("show_databases"),
+            ),
+            ("SHOW SCHEMAS LIKE 'test%'", Some("show_databases")),
+            ("SHOW DATABASES WHERE sleep(1)", None),
+            ("SHOW VARIABLES LIKE 'x'; SET GLOBAL x=1", None),
+            ("SHOW VARIABLES LIKE concat('a','b')", None),
+            ("SHOW VARIABLES LIKE 'x\\'; DROP TABLE users; -- ';", None),
+            ("SHOW DATABASES /*!50000 WHERE sleep(1) */", None),
+            ("SHOW SESSION DATABASES", None),
             ("SELECT 1; DROP TABLE users", None),
             ("/*!50000 DROP TABLE users */", None),
             ("SET GLOBAL x=1", None),

@@ -20,6 +20,7 @@ pub enum Kind {
     Export,
     Import,
     Copy,
+    Update,
 }
 impl Kind {
     pub fn key(self) -> &'static str {
@@ -32,6 +33,7 @@ impl Kind {
             Self::Export => "output.operation.export",
             Self::Import => "output.operation.import",
             Self::Copy => "output.operation.copy",
+            Self::Update => "output.operation.update",
         }
     }
     fn code(self) -> &'static str {
@@ -44,6 +46,7 @@ impl Kind {
             Self::Export => "export",
             Self::Import => "import",
             Self::Copy => "copy",
+            Self::Update => "update",
         }
     }
 }
@@ -51,6 +54,7 @@ impl Kind {
 pub enum Phase {
     Started,
     Preview,
+    Prepared,
     Progress,
     Succeeded,
     Failed,
@@ -62,6 +66,7 @@ impl Phase {
         match self {
             Self::Started => "output.operation.started",
             Self::Preview => "output.operation.preview",
+            Self::Prepared => "output.operation.prepared",
             Self::Progress => "output.operation.progress",
             Self::Succeeded => "output.operation.succeeded",
             Self::Failed => "output.operation.failed",
@@ -73,6 +78,7 @@ impl Phase {
         match self {
             Self::Started => "started",
             Self::Preview => "preview",
+            Self::Prepared => "prepared",
             Self::Progress => "progress",
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",

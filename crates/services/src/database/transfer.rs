@@ -1649,7 +1649,8 @@ fn restore_sqlite(
     }
 }
 
-fn service_operation(
+/// Run one explicit adapter operation with cancellation; drops its private session on return.
+pub fn service_operation(
     endpoint: &Endpoint,
     kind: crate::database::OperationKind,
     c: &Control,
@@ -2277,6 +2278,11 @@ mod tests {
         .run(control.clone(), &tx)
         .unwrap();
         assert!(std::fs::metadata(&dump).unwrap().len() > 768 * 1024);
+        assert!(
+            std::fs::read_to_string(&dump)
+                .unwrap()
+                .contains("CREATE TABLE IF NOT EXISTS items")
+        );
         sqlite_import(&dump, &restored, &control, &tx).unwrap();
         let copied = rusqlite::Connection::open(&restored).unwrap();
         let (text, blob, derived): (String, Vec<u8>, String) = copied

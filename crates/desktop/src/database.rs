@@ -1210,24 +1210,54 @@ impl DatabaseView {
                                         info.elapsed_ms
                                     );
                                     if discover {
-                                        this.status = format!(
-                                            "检测到 {} 个数据库，可在数据库下拉中选择",
-                                            info.databases.len()
-                                        );
+                                        this.status = crate::locale::tr(
+                                            cx,
+                                            "dbwork.detect.done",
+                                            &[("count", &info.databases.len().to_string())],
+                                        )
+                                        .to_string();
                                     }
                                     if let Some(error) = &info.database_list_error {
-                                        this.status.push_str(&format!(" · {error}"));
+                                        this.status = crate::locale::tr(
+                                            cx,
+                                            "dbwork.detect.partial",
+                                            &[
+                                                ("count", &info.databases.len().to_string()),
+                                                (
+                                                    "error",
+                                                    crate::locale::message(cx, error).as_ref(),
+                                                ),
+                                            ],
+                                        )
+                                        .to_string();
+                                        this.operation_log(
+                                            id,
+                                            crate::operation_log::Kind::Metadata,
+                                            crate::operation_log::Phase::Failed,
+                                            Some(error),
+                                            cx,
+                                        );
                                     }
                                     this.states.insert(
                                         id,
-                                        if discover {
+                                        if info.database_list_error.is_some() {
+                                            "dbwork.detect.incomplete"
+                                        } else if discover {
                                             "已检测"
                                         } else {
                                             "测试通过"
                                         }
                                         .into(),
                                     );
-                                    feedback::success(this.status.clone(), cx);
+                                    feedback::notify(
+                                        if info.database_list_error.is_some() {
+                                            gpui_component::notification::NotificationType::Warning
+                                        } else {
+                                            gpui_component::notification::NotificationType::Success
+                                        },
+                                        this.status.clone(),
+                                        cx,
+                                    );
                                     this.info.insert(id, info);
                                     this.sessions.remove(&id);
                                     if let Some((mode, remember)) = trial
@@ -1503,6 +1533,12 @@ impl DatabaseView {
     }
     pub(crate) fn editor_busy(&self) -> bool {
         self.saving
+    }
+    pub(crate) fn update_blocked(&self, cx: &App) -> bool {
+        self.dirty(cx)
+            || !self.typed_drafts.is_empty()
+            || self.saving
+            || self.active_operation.is_some()
     }
     pub(crate) fn discard_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.typed_drafts.clear();
@@ -2395,7 +2431,7 @@ impl Render for DatabaseView {
                         .child(format!("{} {} · 会话 {} · {} ms",self.editing.driver_label(),info.version,info.session_id,info.elapsed_ms))
                         .child(format!("字符集：{} · 数据库：{}",info.charset,info.database.as_deref().unwrap_or("未选择")))
                         .child(format!("TLS：{}",if info.tls_cipher.is_empty(){"未加密"}else{&info.tls_cipher}))
-                        .when_some(info.database_list_error.as_ref(),|el,error|el.child(error.clone()))))
+                        .when_some(info.database_list_error.as_ref(),|el,error|el.child(crate::locale::message(cx,error)))))
             }).into_any_element()
     }
 }

@@ -34,6 +34,7 @@ pub(super) mod markdown_tools;
 
 pub enum CellEvent {
     Changed,
+    SelectTarget,
     BatchFinished { token: Uuid, success: bool },
     Remove,
     Move(i32),
@@ -99,12 +100,17 @@ pub struct CellView {
     page_size: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
     _connections: Subscription,
+    script: Option<Entity<crate::script_cell::ScriptView>>,
+    script_running: bool,
+    script_run_id: u64,
+    _script_subscription: Option<Subscription>,
 }
 impl EventEmitter<CellEvent> for CellView {}
 impl CellView {
     pub fn new(
         mut cell: Cell,
         connections: Entity<DatabaseView>,
+        note_path: std::path::PathBuf,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -113,6 +119,7 @@ impl CellView {
                 std::mem::take(source)
             }
             CellContent::Task { description, .. } => std::mem::take(description),
+            CellContent::SqlScript { .. } => String::new(),
         };
         let sql = matches!(cell.content, CellContent::Sql { .. });
         let wrap = cx
@@ -141,7 +148,9 @@ impl CellView {
             InputState::new(window, cx)
                 .placeholder(t(cx, "notes.database"))
                 .default_value(match &cell.content {
-                    CellContent::Sql { database, .. } => database.clone().unwrap_or_default(),
+                    CellContent::Sql { database, .. } | CellContent::SqlScript { database, .. } => {
+                        database.clone().unwrap_or_default()
+                    }
                     _ => String::new(),
                 })
         });
@@ -273,7 +282,55 @@ impl CellView {
         } else {
             None
         };
+        let script = if let CellContent::SqlScript { script, .. } = &cell.content {
+            Some(cx.new(|cx| {
+                crate::script_cell::ScriptView::new(
+                    note_path,
+                    script.clone(),
+                    connections.clone(),
+                    window,
+                    cx,
+                )
+            }))
+        } else {
+            None
+        };
+        let script_subscription = script.as_ref().map(|script| {
+            cx.subscribe_in(script, window, |this, _, event, window, cx| match event {
+                crate::script_cell::ScriptEvent::Reindexed(script) => {
+                    if let CellContent::SqlScript {
+                        script: current, ..
+                    } = &mut this.cell.content
+                    {
+                        *current = script.clone();
+                        this.revision += 1;
+                        cx.emit(CellEvent::Changed);
+                        cx.notify();
+                    }
+                }
+                crate::script_cell::ScriptEvent::SelectTarget => {
+                    cx.emit(CellEvent::SelectTarget);
+                }
+                crate::script_cell::ScriptEvent::Run(selected) => {
+                    let selected = *selected;
+                    cx.defer_in(window, move |this, window, cx| {
+                        this.start_script(selected, window, cx);
+                    });
+                }
+                crate::script_cell::ScriptEvent::Finished { run, success } => {
+                    if this.script_run_id == *run {
+                        this.script_running = false;
+                        this.finish_batch(*success, cx);
+                        cx.notify();
+                    }
+                }
+            })
+        });
         Self {
+            script,
+            script_running: false,
+            script_run_id: 0,
+            _script_subscription: script_subscription,
             query: QueryState::new(cell.id),
             cell,
             markdown_last: None,
@@ -337,6 +394,9 @@ impl CellView {
             CellContent::Sql {
                 connection_id: None,
                 ..
+            } | CellContent::SqlScript {
+                connection_id: None,
+                ..
             }
         )
     }
@@ -357,7 +417,13 @@ impl CellView {
             if self.editing {
                 self.publish_ddl_context(false, cx);
             }
-            self.stop(cx);
+            if let Some(script) = &self.script {
+                script.update(cx, |script, cx| script.scope_changed(cx));
+                self.script_running = false;
+                self.revision += 1;
+            } else {
+                self.stop(cx);
+            }
             self.database_names.clear();
             self.picker_context = None;
             if let Some(results) = &self.results {
@@ -366,13 +432,127 @@ impl CellView {
             cx.notify();
         }
     }
+    pub fn set_note_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        if let Some(script) = &self.script {
+            script.update(cx, |script, _| script.path = path);
+        }
+    }
+    fn start_script(
+        &mut self,
+        selected: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.script_running || self.batch_locked && self.batch_token.is_none() {
+            return false;
+        }
+        let Some(script) = self.script.clone() else {
+            return false;
+        };
+        let (saved, database) = match self.binding(cx) {
+            Ok(binding) => binding,
+            Err(error) => {
+                feedback::error(error, cx);
+                return false;
+            }
+        };
+        let (active, run) = script.update(cx, |script, cx| {
+            let active = script.run(saved, database, selected, window, cx);
+            (active, script.generation())
+        });
+        self.script_running = active;
+        self.script_run_id = run;
+        cx.notify();
+        active
+    }
+    fn render_script(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let name = if let CellContent::SqlScript { script, .. } = &self.cell.content {
+            script.name.clone()
+        } else {
+            String::new()
+        };
+        div()
+            .id(SharedString::from(format!("note-script-{}", self.cell.id)))
+            .v_flex()
+            .gap_2()
+            .p_2()
+            .min_w_0()
+            .border_1()
+            .border_color(cx.theme().border)
+            .track_focus(&self.focus)
+            .child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("script-collapse")
+                            .ghost()
+                            .icon(if self.collapsed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .tooltip(t(cx, "notes.collapse_all"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_collapsed(!this.collapsed, cx)
+                            })),
+                    )
+                    .child(gpui_component::Icon::new(IconName::File))
+                    .child(div().flex_1().min_w_0().truncate().child(name.clone()))
+                    .child(
+                        Button::new("script-copy-path")
+                            .ghost()
+                            .icon(IconName::File)
+                            .tooltip(t(cx, "script.copy_path"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(script) = &this.script {
+                                    script.update(cx, |script, cx| script.copy_path(cx));
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new("script-copy-cell")
+                            .ghost()
+                            .icon(IconName::Copy)
+                            .tooltip(t(cx, "notes.cell_copy"))
+                            .disabled(self.batch_locked || self.busy())
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.emit(CellEvent::Insert {
+                                    after: true,
+                                    copy: true,
+                                })
+                            })),
+                    )
+                    .child(
+                        Button::new("script-remove-cell")
+                            .ghost()
+                            .icon(IconName::Delete)
+                            .tooltip(t(cx, "notes.remove_cell"))
+                            .disabled(self.batch_locked || self.busy())
+                            .on_click(cx.listener(|_, _, _, cx| cx.emit(CellEvent::Remove))),
+                    ),
+            )
+            .when(!self.collapsed, |el| {
+                el.child(self.script.as_ref().unwrap().clone())
+            })
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
+                if event.keystroke.key.eq_ignore_ascii_case("f5") && !this.batch_locked {
+                    this.start_script(false, window, cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .into_any_element()
+    }
     pub fn has_sql(&self, cx: &App) -> bool {
-        matches!(self.cell.content, CellContent::Sql { .. })
-            && !self.editor.read(cx).value().trim().is_empty()
+        self.script.is_some()
+            || matches!(self.cell.content, CellContent::Sql { .. })
+                && !self.editor.read(cx).value().trim().is_empty()
     }
     pub fn batch_scope(&self, cx: &App) -> Result<Option<BatchScope>, String> {
-        if !matches!(self.cell.content, CellContent::Sql { .. })
-            || self.editor.read(cx).value().trim().is_empty()
+        if self.script.is_none()
+            && (!matches!(self.cell.content, CellContent::Sql { .. })
+                || self.editor.read(cx).value().trim().is_empty())
         {
             return Ok(None);
         }
@@ -380,6 +560,16 @@ impl CellView {
             return Err(t(cx, "grid.pending").to_string());
         }
         let (connection, _) = self.binding(cx)?;
+        if let CellContent::SqlScript { script, .. } = &self.cell.content {
+            if script.unsupported != 0 {
+                return Err(t(cx, "script.error.unsupported").to_string());
+            }
+            if turbodbn_services::sql_script::dialect(connection.profile.kind)
+                != Some(script.dialect)
+            {
+                return Err(t(cx, "script.error.dialect").to_string());
+            }
+        }
         Ok(Some(BatchScope {
             revision: self.revision,
             connection,
@@ -421,6 +611,9 @@ impl CellView {
         cx.notify();
     }
     pub fn set_batch_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
+        if let Some(script) = &self.script {
+            script.update(cx, |script, cx| script.set_locked(locked, cx));
+        }
         if self.batch_locked != locked {
             self.batch_locked = locked;
             cx.notify();
@@ -700,6 +893,10 @@ impl CellView {
         let mut cell = self.cell.clone();
         cell.title = self.title.read(cx).value().to_string();
         match &mut cell.content {
+            CellContent::SqlScript { database, .. } => {
+                let value = self.database.read(cx).value().trim().to_owned();
+                *database = (!value.is_empty()).then_some(value);
+            }
             CellContent::Sql {
                 source, database, ..
             } => {
@@ -728,11 +925,20 @@ impl CellView {
     }
     pub fn working(&self, cx: &App) -> bool {
         self.busy()
+            || self
+                .script
+                .as_ref()
+                .is_some_and(|s| s.read(cx).is_indexing())
             || self.awaiting_preview
             || self
                 .results
                 .as_ref()
                 .is_some_and(|r| r.read(cx).result_busy())
+    }
+    pub fn indexing(&self, cx: &App) -> bool {
+        self.script
+            .as_ref()
+            .is_some_and(|s| s.read(cx).is_indexing())
     }
     pub fn result_pending(&self, cx: &App) -> bool {
         self.results
@@ -745,9 +951,13 @@ impl CellView {
         }
     }
     pub fn busy(&self) -> bool {
-        matches!(self.query.status, QueryStatus::Running)
+        self.script_running || matches!(self.query.status, QueryStatus::Running)
     }
     pub fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(script) = &self.script {
+            script.update(cx, |script, cx| script.stop(cx));
+            self.script_running = false;
+        }
         self.revision += 1;
         self.awaiting_preview = false;
         self.preview_task = None;
@@ -766,6 +976,7 @@ impl CellView {
                         changed_rows: None,
                         elapsed_ms: started.elapsed().as_millis() as u64,
                         count_source: None,
+                        ..Default::default()
                     }),
                     cx,
                 );
@@ -791,7 +1002,10 @@ impl CellView {
     }
     fn connection_id(&self) -> Option<Uuid> {
         match self.cell.content {
-            CellContent::Sql { connection_id, .. } => connection_id.or(self.inherited_connection),
+            CellContent::Sql { connection_id, .. }
+            | CellContent::SqlScript { connection_id, .. } => {
+                connection_id.or(self.inherited_connection)
+            }
             _ => None,
         }
     }
@@ -819,6 +1033,10 @@ impl CellView {
         Ok((saved, db))
     }
     fn run(&mut self, offset: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script.is_some() {
+            self.start_script(false, window, cx);
+            return;
+        }
         self.policy_help = false;
         if self.result_pending(cx) {
             feedback::error(t(cx, "grid.pending"), cx);
@@ -1192,6 +1410,7 @@ impl CellView {
                     changed_rows: None,
                     elapsed_ms: elapsed,
                     count_source: None,
+                    ..Default::default()
                 }),
                 cx,
             );
@@ -1755,6 +1974,9 @@ impl CellView {
 }
 impl Render for CellView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.script.is_some() {
+            return self.render_script(cx);
+        }
         let sql = matches!(self.cell.content, CellContent::Sql { .. });
         if sql {
             let context = self.assist_context(cx);
@@ -1917,29 +2139,33 @@ impl Render for CellView {
             } else {
                 label.to_string()
             };
-            return body.child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .child(
-                        Button::new("expand-note-cell")
-                            .ghost()
-                            .small()
-                            .justify_start()
-                            .icon(IconName::ChevronRight)
-                            .flex_1()
-                            .min_w_0()
-                            .label(if label.is_empty() {
-                                t(cx, "notes.empty_cell")
-                            } else {
-                                label.into()
-                            })
-                            .tooltip(t(cx, "notes.expand_cell"))
-                            .on_click(cx.listener(|this, _, _, cx| this.set_collapsed(false, cx))),
-                    )
-                    .when(sql, |bar| bar.child(self.ai_button(cx)))
-                    .child(self.copy_source_button(cx)),
-            );
+            return body
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("expand-note-cell")
+                                .ghost()
+                                .small()
+                                .justify_start()
+                                .icon(IconName::ChevronRight)
+                                .flex_1()
+                                .min_w_0()
+                                .label(if label.is_empty() {
+                                    t(cx, "notes.empty_cell")
+                                } else {
+                                    label.into()
+                                })
+                                .tooltip(t(cx, "notes.expand_cell"))
+                                .on_click(
+                                    cx.listener(|this, _, _, cx| this.set_collapsed(false, cx)),
+                                ),
+                        )
+                        .when(sql, |bar| bar.child(self.ai_button(cx)))
+                        .child(self.copy_source_button(cx)),
+                )
+                .into_any_element();
         }
         if let Some(task) = &self.task_list {
             let task = task.clone();
@@ -1962,7 +2188,7 @@ impl Render for CellView {
                         .child(self.copy_source_button(cx)),
                 );
             }
-            return body.child(task);
+            return body.child(task).into_any_element();
         }
         if editing {
             body = body.child(self.toolbar(window, cx));
@@ -2024,20 +2250,11 @@ impl Render for CellView {
             } else if sql || md {
                 if self.reading.as_ref().is_none_or(|(old, _)| old != &source) {
                     let rendered = if sql {
-                        let count = source
-                            .split(|c| c != '~')
-                            .map(str::len)
-                            .max()
-                            .unwrap_or(0)
-                            .max(2)
-                            + 1;
-                        let fence = "~".repeat(count);
-                        let language = if self.assist_context(cx).0 == Some(DatabaseKind::MySql) {
-                            "mysql"
-                        } else {
-                            "sql"
-                        };
-                        format!("{fence}{language}\n{source}\n{fence}").into()
+                        sql_reading(
+                            &source,
+                            self.assist_context(cx).0.unwrap_or(DatabaseKind::Sqlite),
+                        )
+                        .into()
                     } else {
                         source.clone()
                     };
@@ -2312,5 +2529,24 @@ impl Render for CellView {
                     }),
             )
         })
+        .into_any_element()
     }
+}
+
+/// Shared registered SQL highlighting for Note reading and script previews.
+pub(crate) fn sql_reading(source: &str, kind: DatabaseKind) -> String {
+    let count = source
+        .split(|c| c != '~')
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+        .max(2)
+        + 1;
+    let fence = "~".repeat(count);
+    let language = if kind == DatabaseKind::MySql {
+        "mysql"
+    } else {
+        "sql"
+    };
+    format!("{fence}{language}\n{source}\n{fence}")
 }

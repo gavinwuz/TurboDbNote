@@ -66,6 +66,9 @@ impl AssetSource for Assets {
             "icons/note-frame.svg" => Some(include_bytes!("../assets/icons/note-frame.svg")),
             "icons/note-file.svg" => Some(include_bytes!("../assets/icons/note-file.svg")),
             "icons/note-sql.svg" => Some(include_bytes!("../assets/icons/note-sql.svg")),
+            "icons/note-import-sql.svg" => {
+                Some(include_bytes!("../assets/icons/note-import-sql.svg"))
+            }
             "icons/note-md.svg" => Some(include_bytes!("../assets/icons/note-md.svg")),
             "icons/note-save.svg" => Some(include_bytes!("../assets/icons/note-save.svg")),
             "icons/note-run-all.svg" => Some(include_bytes!("../assets/icons/note-run-all.svg")),
@@ -149,6 +152,7 @@ impl AssetSource for Assets {
                 "icons/note-frame.svg",
                 "icons/note-file.svg",
                 "icons/note-sql.svg",
+                "icons/note-import-sql.svg",
                 "icons/note-md.svg",
                 "icons/note-save.svg",
                 "icons/note-run-all.svg",

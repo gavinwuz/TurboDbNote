@@ -32,6 +32,12 @@ impl QueryGrid {
             selected: None,
         }
     }
+    pub fn with_column_widths(mut self, widths: &[f32]) -> Self {
+        for (column, width) in self.columns.iter_mut().skip(1).zip(widths) {
+            column.width = px(*width);
+        }
+        self
+    }
     pub fn selected_value(&self) -> Option<String> {
         let (row, col) = self.selected?;
         self.rows

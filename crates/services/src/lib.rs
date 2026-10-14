@@ -11,6 +11,7 @@ pub mod mysql;
 pub mod mysql_drivers;
 pub mod mysql_legacy;
 pub mod password_protection;
+pub mod updates;
 use std::{future::Future, pin::Pin, sync::Arc};
 use turbodbn_core::QueryToken;
 use uuid::Uuid;
@@ -139,5 +140,6 @@ pub trait AiService: Send + Sync {
 }
 
 pub mod note_store;
+pub mod sql_script;
 
 pub mod sql_mcp;

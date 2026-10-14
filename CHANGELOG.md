@@ -4,6 +4,32 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Replace empty script write-result grids with bounded execution details, cumulative affected-row statistics, preserved query results and on-demand table structure previews.
+
+- Add IF NOT EXISTS to ordinary table DDL in SQL file exports while preserving quoted data, comments and routine bodies.
+
+- Add managed SQL file path copying and persistent execution failure positions with stage/completion details and frozen-source navigation.
+
+- Replace repeated script authorization dialogs with one frozen-script preview, risk summary, bounded source browsing and explicit authorize-and-execute action.
+
+- Explain missing script permissions with command categories and source positions, plus locate/settings actions; remove misleading metadata-query wording.
+
+- Fix modern MySQL database refresh losing the full visible database list when a default database is configured.
+
+- Integrate issue navigation into the script execution toolbar and support guarded MySQL ENABLE/DISABLE KEYS, including executable version comments and automatic index upgrades.
+
+- Add unsupported-statement filtering/navigation, six statements per page, an explicit list scrollbar and a selected-source copy icon.
+
+- Extend MySQL Note scripts with controlled dump headers/footers, explicit database matching, preauthorization, schema fingerprints and session cleanup; explain disabled execution through hover tips.
+
+- Add Note SQL import with managed script attachments, a virtual paged statement list, bounded previews, sequential execution and per-write confirmation.
+- Replace six Python build/release/diagnostic scripts with native Rust developer tools; keep active GUI and asset maintenance checks.
+
+- Fix MySQL database detection for binary-flagged UTF-8 metadata; report incomplete lists as warnings and preserve safe server error categories. Allow bounded Note SHOW DATABASES/SCHEMAS and literal LIKE filters for metadata diagnostics, subject to existing command permissions.
+
+- Add startup/manual stable-release checks, persistent upgrade prompts, version skipping and cancellable in-app downloads with SHA256 verification.
+- Windows installer builds save pending Notes/settings before exiting and launching a separately verified installer; staged edits, connection drafts and active database/Note operations block installation. Portable Windows/Linux updates remain manual.
+
 ## [0.1.1] - 2026-10-13
 
 - Allow modern MySQL 8.x and 9.x version families, including 8.4.5, without claiming real-server acceptance for every release.

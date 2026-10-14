@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Note {
@@ -33,6 +33,11 @@ pub enum CellContent {
         connection_id: Option<Uuid>,
         database: Option<String>,
     },
+    SqlScript {
+        script: SqlScript,
+        connection_id: Option<Uuid>,
+        database: Option<String>,
+    },
     Markdown {
         source: String,
     },
@@ -46,6 +51,47 @@ pub enum CellContent {
         linked_cells: Vec<Uuid>,
         connection_id: Option<Uuid>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SqlDialect {
+    MySql,
+    PostgreSql,
+    Sqlite,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SqlScript {
+    pub name: String,
+    pub source_hash: String,
+    pub index_hash: String,
+    pub bytes: u64,
+    pub statements: u64,
+    pub unsupported: u64,
+    pub writes: u64,
+    pub dialect: SqlDialect,
+}
+impl SqlScript {
+    pub fn valid(&self) -> bool {
+        let hash = |value: &str| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        hash(&self.source_hash)
+            && hash(&self.index_hash)
+            && !self.name.is_empty()
+            && self.name.len() <= 1024
+            && !self.name.chars().any(char::is_control)
+            && self.bytes <= 512 * 1024 * 1024
+            && self.bytes > 0
+            && self.statements <= 1_000_000
+            && self.statements > 0
+            && self.unsupported <= self.statements
+            && self.writes <= self.statements - self.unsupported
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -107,6 +153,8 @@ pub enum NoteError {
     MetadataTooLong,
     #[error("任务项数据无效或超过上限")]
     InvalidTask,
+    #[error("SQL 脚本引用无效")]
+    InvalidScript,
 }
 
 impl Note {
@@ -129,7 +177,7 @@ impl Note {
             schema_version: u32,
         }
         let version: Version = serde_json::from_str(json)?;
-        if ![1, SCHEMA_VERSION].contains(&version.schema_version) {
+        if ![1, 2, SCHEMA_VERSION].contains(&version.schema_version) {
             return Err(NoteError::UnsupportedVersion(version.schema_version));
         }
         let mut note: Self = serde_json::from_str(json)?;
@@ -152,6 +200,11 @@ impl Note {
         }
         let mut ids = HashSet::new();
         for cell in &self.cells {
+            if let CellContent::SqlScript { script, .. } = &cell.content
+                && !script.valid()
+            {
+                return Err(NoteError::InvalidScript);
+            }
             if let CellContent::Task { items, .. } = &cell.content {
                 if items.len() > 1000 {
                     return Err(NoteError::InvalidTask);
@@ -225,6 +278,15 @@ impl Cell {
     }
     pub fn empty_sibling(&self) -> Self {
         let content = match &self.content {
+            CellContent::SqlScript {
+                connection_id,
+                database,
+                ..
+            } => CellContent::Sql {
+                source: String::new(),
+                connection_id: *connection_id,
+                database: database.clone(),
+            },
             CellContent::Sql {
                 connection_id,
                 database,
@@ -262,10 +324,51 @@ impl Cell {
 mod tests {
     use super::*;
     #[test]
+    fn script_references_roundtrip_without_source_and_legacy_v2_migrates() {
+        let mut note = Note::new("script");
+        let script = SqlScript {
+            name: "import.sql".into(),
+            source_hash: "a".repeat(64),
+            index_hash: "b".repeat(64),
+            bytes: 1024,
+            statements: 100,
+            unsupported: 0,
+            writes: 10,
+            dialect: SqlDialect::Sqlite,
+        };
+        note.cells.push(Cell {
+            id: Uuid::new_v4(),
+            title: String::new(),
+            content: CellContent::SqlScript {
+                script,
+                connection_id: None,
+                database: None,
+            },
+        });
+        assert_eq!(Note::from_json(&note.to_json().unwrap()).unwrap(), note);
+        let duplicate = note.cells[0].duplicate();
+        assert_ne!(duplicate.id, note.cells[0].id);
+        assert_eq!(duplicate.content, note.cells[0].content);
+        let CellContent::SqlScript { script, .. } = &mut note.cells[0].content else {
+            unreachable!()
+        };
+        script.source_hash = "../invalid".into();
+        assert!(note.to_json().is_err());
+        let note = Note::new("legacy");
+        let legacy = note
+            .to_json()
+            .unwrap()
+            .replace("\"schema_version\": 3", "\"schema_version\": 2");
+        assert_eq!(
+            Note::from_json(&legacy).unwrap().schema_version,
+            SCHEMA_VERSION
+        );
+    }
+    #[test]
     fn checklist_migration_roundtrip_and_copy_keep_independent_identity() {
         let legacy = r#"{"schema_version":1,"id":"c19902b9-30ef-4657-8d14-b6ef704a0261","title":"task","cells":[{"id":"73e6f2f0-e92c-419b-a7cb-a385af974be7","title":"legacy","content":{"type":"task","description":"- first\n- second","status":"in_progress","due_at":null,"remind_at":null,"linked_cells":[],"connection_id":null}}]}"#;
         let mut note = Note::from_json(legacy).unwrap();
-        assert_eq!(note.schema_version, 2);
+        assert_eq!(note.schema_version, SCHEMA_VERSION);
         let CellContent::Task {
             items, description, ..
         } = &mut note.cells[0].content

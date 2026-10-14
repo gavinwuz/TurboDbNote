@@ -52,8 +52,10 @@ pub struct Workspace {
     _tab_subscription: Subscription,
     _feedback_subscription: Subscription,
     update_status: String,
-    checking_update: bool,
-    update_task: Option<Task<()>>,
+    updates: Entity<crate::updates::UpdateView>,
+    _update_subscription: Subscription,
+    pending_install: Option<turbodbn_services::updates::Download>,
+    install_launching: bool,
     _settings_subscription: Subscription,
     _status_observe: Subscription,
     navigation: Entity<WorkbenchPanel>,
@@ -249,6 +251,7 @@ impl Workspace {
                 SettingsRequest::Open(category) => this.open_settings(*category, window, cx),
                 SettingsRequest::CancelClose => {
                     this.closing_window = false;
+                    this.pending_install = None;
                     this.pending_close.clear();
                 }
                 SettingsRequest::Close => {
@@ -256,7 +259,7 @@ impl Workspace {
                         this.closing_window = false;
                         cx.defer_in(window, |this, window, cx| {
                             if this.prepare_close(window, cx) {
-                                window.remove_window();
+                                this.finish_close(window, cx);
                             }
                         });
                         return;
@@ -529,6 +532,7 @@ impl Workspace {
                             this.pending_note_close = None;
                         }
                         this.closing_notes_window = false;
+                        this.pending_install = None;
                         return;
                     }
                     cx.defer_in(window, |this, window, cx| {
@@ -551,6 +555,44 @@ impl Workspace {
             cx.notify();
         });
         let status_observe = cx.observe(&ai, |_, _, cx| cx.notify());
+        let updates =
+            cx.new(|cx| crate::updates::UpdateView::new(database.read(cx).output.clone(), cx));
+        let update_subscription = cx.subscribe_in(
+            &updates,
+            window,
+            |this, _, event: &crate::updates::Install, window, cx| {
+                if this.install_launching || this.pending_install.is_some() {
+                    crate::feedback::notify(
+                        gpui_component::notification::NotificationType::Info,
+                        t(cx, "updates.install.preparing"),
+                        cx,
+                    );
+                    return;
+                }
+                let download = event.0.clone();
+                let owner = cx.entity().downgrade();
+                crate::feedback::confirm_labels(
+                    t(cx, "updates.install.title"),
+                    t(cx, "updates.install.confirm"),
+                    t(cx, "updates.action.later"),
+                    t(cx, "updates.action.install"),
+                    window,
+                    cx,
+                    move |window, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            this.pending_install = Some(download.clone());
+                            if this.prepare_close(window, cx) {
+                                this.finish_close(window, cx);
+                            }
+                        });
+                    },
+                );
+            },
+        );
+        let startup_updates = updates.clone();
+        cx.defer_in(window, move |_, window, cx| {
+            startup_updates.update(cx, |updates, cx| updates.check(true, window, cx))
+        });
         Self {
             notes,
             note_panels: Default::default(),
@@ -587,8 +629,10 @@ impl Workspace {
                 .load_error
                 .clone()
                 .unwrap_or_default(),
-            checking_update: false,
-            update_task: None,
+            updates,
+            _update_subscription: update_subscription,
+            pending_install: None,
+            install_launching: false,
             dock,
             ai,
             settings,
@@ -647,6 +691,9 @@ impl Workspace {
     }
 
     pub fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.install_launching {
+            return false;
+        }
         #[cfg(not(target_os = "windows"))]
         {
             self.prepare_close(window, cx)
@@ -729,7 +776,7 @@ impl Workspace {
         self.tray = None;
         crate::windows_tray::restore(window);
         if self.prepare_close(window, cx) {
-            window.remove_window();
+            self.finish_close(window, cx);
         }
     }
     #[cfg(target_os = "windows")]
@@ -803,7 +850,29 @@ impl Workspace {
     }
 
     pub fn prepare_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.pending_install.is_some()
+            && (self.database.read(cx).update_blocked(cx)
+                || self
+                    .table_panels
+                    .values()
+                    .any(|table| table.read(cx).update_blocked())
+                || self
+                    .note_panels
+                    .values()
+                    .any(|note| note.read(cx).running(cx)))
+        {
+            self.pending_install = None;
+            crate::feedback::error(t(cx, "updates.install.blocked"), cx);
+            return false;
+        }
         let running = self.notes.read(cx).running(cx);
+        if self.pending_install.is_some() && self.notes.read(cx).pending(cx) {
+            // The install confirmation explicitly authorizes saving, even with autosave disabled.
+            // Running queries and staged results were rejected above; never stop/discard them here.
+            self.closing_notes_window = true;
+            self.notes.update(cx, |notes, cx| notes.flush(cx));
+            return false;
+        }
         if running || self.notes.read(cx).pending(cx) {
             if running
                 || !cx
@@ -878,9 +947,104 @@ impl Workspace {
         if self.closing_notes_window && !self.notes.read(cx).pending(cx) {
             self.closing_notes_window = false;
             if self.prepare_close(window, cx) {
-                window.remove_window();
+                self.finish_close(window, cx);
             }
         }
+    }
+    fn finish_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(download) = self.pending_install.take() {
+            self.install_launching = true;
+            let id = uuid::Uuid::new_v4();
+            let started = std::time::Instant::now();
+            let failure_message = t(cx, "updates.error.install_after_exit").to_string();
+            self.updates.update(cx, |updates, cx| {
+                updates.log(
+                    id,
+                    crate::operation_log::Phase::Started,
+                    started,
+                    0,
+                    "-",
+                    cx,
+                )
+            });
+            crate::feedback::notify(
+                gpui_component::notification::NotificationType::Info,
+                t(cx, "updates.install.preparing"),
+                cx,
+            );
+            let work = cx.background_executor().spawn(async move {
+                crate::updates::launch_installer_helper(&download, failure_message)
+            });
+            cx.spawn_in(window, async move |owner, cx| {
+                let result = work.await;
+                let _ = owner.update_in(cx, |this, window, cx| {
+                    this.install_launching = false;
+                    match result {
+                        Err(_) => {
+                            this.updates.update(cx, |updates, cx| {
+                                updates.log(
+                                    id,
+                                    crate::operation_log::Phase::Failed,
+                                    started,
+                                    0,
+                                    "update_install",
+                                    cx,
+                                )
+                            });
+                            crate::feedback::error(t(cx, "updates.error.install"), cx);
+                        }
+                        Ok(mut helper) => {
+                            if this.database.read(cx).update_blocked(cx)
+                                || this
+                                    .table_panels
+                                    .values()
+                                    .any(|table| table.read(cx).update_blocked())
+                                || this
+                                    .note_panels
+                                    .values()
+                                    .any(|note| note.read(cx).running(cx))
+                                || this.notes.read(cx).pending(cx)
+                                || this.settings.read(cx).pending(cx)
+                            {
+                                this.updates.update(cx, |updates, cx| {
+                                    updates.log(
+                                        id,
+                                        crate::operation_log::Phase::Cancelled,
+                                        started,
+                                        0,
+                                        "-",
+                                        cx,
+                                    )
+                                });
+                                cx.background_executor()
+                                    .spawn(async move {
+                                        let _ = helper.kill();
+                                        let _ = helper.wait();
+                                    })
+                                    .detach();
+                                crate::feedback::error(t(cx, "updates.install.blocked"), cx);
+                            } else {
+                                // This records a verified handoff, not completion of installation.
+                                this.updates.update(cx, |updates, cx| {
+                                    updates.log(
+                                        id,
+                                        crate::operation_log::Phase::Prepared,
+                                        started,
+                                        0,
+                                        "-",
+                                        cx,
+                                    )
+                                });
+                                window.remove_window();
+                            }
+                        }
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
+        window.remove_window();
     }
     fn rebuild_tabs(&mut self, center: bool, window: &mut Window, cx: &mut Context<Self>) {
         let order = if center {
@@ -1078,37 +1242,6 @@ impl Workspace {
         self.rebuild_tabs(false, window, cx);
         cx.notify();
     }
-    fn check_update(&mut self, cx: &mut Context<Self>) {
-        turbodbn_diagnostics::track(turbodbn_diagnostics::Event::UpdateChecked);
-        if self.checking_update {
-            return;
-        }
-        self.checking_update = true;
-        self.update_status = t(cx, "common.status.loading").to_string();
-        let work = cx
-            .background_executor()
-            .spawn(async { catalog::latest_release() });
-        self.update_task = Some(cx.spawn(async move |view, cx| {
-            let result = work.await;
-            let _ = view.update(cx, |this, cx| {
-                this.checking_update = false;
-                this.update_status = match result {
-                    Ok(catalog::ReleaseStatus::NoRelease) => t(cx, "updates.status.no_release"),
-                    Ok(catalog::ReleaseStatus::Available(version)) => {
-                        crate::locale::tr(cx, "updates.status.available", &[("version", &version)])
-                    }
-                    Ok(catalog::ReleaseStatus::Current(version)) => {
-                        crate::locale::tr(cx, "updates.status.current", &[("version", &version)])
-                    }
-                    Err(error) => crate::locale::message(cx, &error),
-                }
-                .to_string();
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-
     fn visibility(&self, cx: &App) -> [bool; 3] {
         REGIONS.map(|region| self.dock.read(cx).is_dock_open(region, cx))
     }
@@ -1260,8 +1393,12 @@ impl Render for Workspace {
                         .item(
                             PopupMenuItem::new(t(cx, "help.action.check_updates"))
                                 .icon(crate::assets::refresh_icon())
-                                .on_click(move |_, _, cx| {
-                                    update.update(cx, |this, cx| this.check_update(cx))
+                                .on_click(move |_, window, cx| {
+                                    update.update(cx, |this, cx| {
+                                        this.updates.update(cx, |updates, cx| {
+                                            updates.check(false, window, cx)
+                                        });
+                                    })
                                 }),
                         )
                         .item(

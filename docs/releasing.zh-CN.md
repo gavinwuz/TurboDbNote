@@ -45,8 +45,8 @@ git merge --ff-only feat/mysql-driver
 确认 `0.1.0` 元数据与说明完整：
 
 ```powershell
-python scripts/test-release.py
-python scripts/release.py --version 0.1.0 --notes target/release-notes-0.1.0.md
+cargo test --locked -j 1 -p turbodbnote-tools
+cargo run --quiet --locked -j 1 -p turbodbnote-tools -- release --version 0.1.0 --notes target/release-notes-0.1.0.md
 ```
 
 `0.1.0` 已是当前 workspace 版本，不要对首次发布调用 `release.ps1 -Version 0.1.0`；这个入口用于升级到更高版本。
@@ -134,7 +134,7 @@ Windows PowerShell 7：
 Linux：
 
 ```bash
-python3 scripts/prepare-release.py 0.1.1
+cargo run --quiet --locked -j 1 -p turbodbnote-tools -- prepare-release 0.1.1
 ```
 
 脚本自动完成：
@@ -279,7 +279,7 @@ Windows：已有标准安装位置的 Inno Setup 6、Windows SDK、MSVC、CMake�
 Linux：按 `.github/workflows/release.yml` 安装所需原生依赖后执行：
 
 ```bash
-python3 scripts/package-linux.py
+cargo run --quiet --locked -j 1 -p turbodbnote-tools -- package-linux
 ```
 
 输出进入 `dist`。脚本拒绝覆盖已有输出，保留符号与源码材料；不要为重新打包删除用户笔记、数据库或配置。项目根目录受保护的 `config/` 配置不应读取或进入源码归档。
@@ -288,10 +288,10 @@ python3 scripts/package-linux.py
 
 - [双平台工作流](../.github/workflows/release.yml)
 - [Windows 一键发布入口](../scripts/release.ps1)
-- [跨平台发布准备脚本](../scripts/prepare-release.py)
-- [版本检查与发布说明生成](../scripts/release.py)
+- [跨平台发布准备脚本](../scripts/dev-tools/src/release.rs)
+- [版本检查与发布说明生成](../scripts/dev-tools/src/release.rs)
 - [Windows 打包脚本](../scripts/package-windows.ps1)
-- [Linux 打包脚本](../scripts/package-linux.py)
+- [Linux 打包脚本](../scripts/dev-tools/src/package.rs)
 - [GitHub Actions](https://github.com/gavinwuz/TurboDbNote/actions/workflows/release.yml)
 - [GitHub Releases](https://github.com/gavinwuz/TurboDbNote/releases)
 

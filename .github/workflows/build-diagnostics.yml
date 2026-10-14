@@ -17,11 +17,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.92.0
       - name: Read redacted failure details
         env:
           GH_TOKEN: ${{ github.token }}
           JOB_ID: ${{ inputs.job_id }}
-        run: python3 scripts/read-build-diagnostics.py
+        run: cargo run --quiet --locked -j 1 -p turbodbnote-tools -- build-diagnostics

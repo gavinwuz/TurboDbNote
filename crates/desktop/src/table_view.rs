@@ -84,6 +84,9 @@ pub struct TableView {
     baseline: Option<Rows>,
 }
 impl TableView {
+    pub(crate) fn update_blocked(&self) -> bool {
+        !self.changes.is_empty() || self.committing || self.busy || self.counting
+    }
     pub fn new(
         key: String,
         source: WeakEntity<DatabaseView>,

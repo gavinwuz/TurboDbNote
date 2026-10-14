@@ -30,18 +30,16 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: python3 scripts/test-release.py
+      - uses: dtolnay/rust-toolchain@1.92.0
+      - run: cargo test --locked -j 1 -p turbodbnote-tools
       - id: version
         env:
           REQUESTED_VERSION: ${{ inputs.version }}
         run: |
-          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["workspace"]["package"]["version"])')
+          version=$(cargo run --quiet --locked -j 1 -p turbodbnote-tools -- version)
           if [ -n "$REQUESTED_VERSION" ] && [ "$REQUESTED_VERSION" != "$version" ]; then exit 1; fi
           if [[ "$GITHUB_REF" == refs/tags/* ]] && [ "${GITHUB_REF#refs/tags/}" != "v$version" ]; then exit 1; fi
-          python3 scripts/release.py --version "$version"
+          cargo run --quiet --locked -j 1 -p turbodbnote-tools -- release --version "$version"
           echo "version=$version" >> "$GITHUB_OUTPUT"
   windows:
     needs: metadata
@@ -73,7 +71,7 @@ jobs:
       - name: Verify and package
         shell: pwsh
         run: |
-          python scripts/run-cargo.py test --locked -j 1 -p turbodbnote --bin turbodbnote -- --test-threads=1
+          cargo run --quiet --locked -j 1 -p turbodbnote-tools -- run-cargo test --locked -j 1 -p turbodbnote --bin turbodbnote -- --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           try {
             ./scripts/package-windows.ps1 -IsccPath 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
@@ -126,11 +124,11 @@ jobs:
       - name: Verify Rust workspace
         run: |
           cargo fmt --all -- --check
-          python3 scripts/run-cargo.py check --locked -j 1 --workspace --all-targets
-          python3 scripts/run-cargo.py test --locked -j 1 --workspace -- --test-threads=1
-          python3 scripts/run-cargo.py clippy --locked -j 1 --workspace --all-targets -- -D warnings
+          cargo run --quiet --locked -j 1 -p turbodbnote-tools -- run-cargo check --locked -j 1 --workspace --all-targets
+          cargo run --quiet --locked -j 1 -p turbodbnote-tools -- run-cargo test --locked -j 1 --workspace -- --test-threads=1
+          cargo run --quiet --locked -j 1 -p turbodbnote-tools -- run-cargo clippy --locked -j 1 --workspace --all-targets -- -D warnings
       - name: Build archive
-        run: python3 scripts/package-linux.py
+        run: cargo run --quiet --locked -j 1 -p turbodbnote-tools -- package-linux
       - name: Verify isolated driver contracts
         run: cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts -- dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-linux-x64/drivers/native
       - name: Open the packaged window in isolated X11
@@ -150,9 +148,7 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@1.92.0
       - uses: actions/download-artifact@v4
         with:
           name: release-windows
@@ -167,7 +163,7 @@ jobs:
           VERSION: ${{ needs.metadata.outputs.version }}
           REPLACE_EXISTING: ${{ inputs.replace_existing || (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && contains(github.event.head_commit.message, '[replace-release]')) }}
         run: |
-          python3 scripts/release.py --version "$VERSION" --publication --notes release-notes.md
+          cargo run --quiet --locked -j 1 -p turbodbnote-tools -- release --version "$VERSION" --publication --notes release-notes.md
           cd candidate/windows
           sha256sum --check SHA256SUMS.txt
           cd ../linux

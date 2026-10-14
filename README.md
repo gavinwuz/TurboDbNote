@@ -29,6 +29,8 @@ A native SQL Notebook and database workbench built with Rust and GPUI. Write SQL
 
 Capabilities vary. Note SQL execution supports MySQL/PostgreSQL/SQLite. External adapters offer connection, object browsing and bounded read-only previews; Doris is read-only. Access/DB2 require the corresponding ODBC provider; Oracle requires OCI. See [driver capabilities and prerequisites](docs/database-drivers.md).
 
+MySQL database detection reads binary-flagged UTF-8 metadata without treating encoding failures as permission failures. Notes support bounded `SHOW DATABASES`/`SHOW SCHEMAS`, plus literal `LIKE` filters for `SHOW TABLES`/`SHOW STATUS`/`SHOW VARIABLES`; STATUS/VARIABLES also accept SESSION/GLOBAL scope. These commands honor Settings → Database → SQL permissions and do not change server grants.
+
 ## Install
 
 - **Windows 10 1809+ / Windows 11 x64:** extract the portable ZIP and run `turbodbnote.exe`. Keep the bundled `drivers` and license material with the executable. Future releases provide source materials as a separate download. Windows 7 is unsupported; binaries are unsigned.
@@ -37,7 +39,7 @@ Capabilities vary. Note SQL execution supports MySQL/PostgreSQL/SQLite. External
 
 Notes are saved as standalone `.note` files. Settings, navigation and connection metadata use `connections.db`. Windows portable data lives beside the executable under `data`; Linux uses the per-user configuration directory. Windows passwords use current-user DPAPI encryption; Linux passwords stay in session memory and must be re-entered after restart. Do not copy Windows encrypted credentials expecting them to work under a different user or on Linux.
 
-Windows tray hosting, integrated SQL Server authentication and the bundled legacy MySQL DLL are Windows-only. Redis cluster browsing covers the connected node. Reminders work while the application is running and the note is open. Automatic updates are not included.
+Windows tray hosting, integrated SQL Server authentication and the bundled legacy MySQL DLL are Windows-only. Redis cluster browsing covers the connected node. Reminders work while the application is running and the note is open. Stable releases are checked in the background at startup, at most once per 24 hours; Help → Check for updates always checks immediately. New versions offer release notes, skip/later actions and an explicit in-app download with progress, cancellation and SHA256 verification. Windows installer builds can save pending Notes/settings and exit before launching the verified installer; resolve connection drafts and staged edits or running database/Note operations first. Portable Windows and Linux packages are downloaded for manual replacement. Check/download events appear in Output. SHA256 checks integrity, not an independent release signature; installation is never automatic.
 
 ## Develop
 
@@ -67,7 +69,7 @@ The serial test setting avoids Windows credential-test interference. CI checks n
 - [Diagnostics and verification boundaries](docs/crashsight-integration.md)
 - [Release preparation and packaging](docs/releasing.md)
 
-For the next release, add bilingual Unreleased notes, commit features on the clean default branch and run `./scripts/release.ps1 -Version 0.1.1` (Linux: `python3 scripts/prepare-release.py 0.1.1`). Actions tests, packages and publishes only after both platforms pass. Version tags are immutable; existing releases are not overwritten.
+For the next release, add bilingual Unreleased notes, commit features on the clean default branch and run `./scripts/release.ps1 -Version 0.1.1` (Linux: `cargo run --quiet --locked -j 1 -p turbodbnote-tools -- prepare-release 0.1.1`). Actions tests, packages and publishes only after both platforms pass. Version tags are immutable; existing releases are not overwritten.
 
 Licensed under [Apache-2.0](LICENSE). Bundled third-party components retain their respective licenses.
 
@@ -76,3 +78,11 @@ Future Windows releases include an Inno Setup installer alongside the portable Z
 [Privacy Policy](PRIVACY.md)
 
 Modern MySQL version routing accepts 5.6, 5.7, 8.x and 9.x (including 8.4.5). Connection eligibility does not imply real-server acceptance for every release; authentication and TLS checks remain enforced.
+
+SQL import is available in the Note toolbar: one managed script cell with a virtual, paged statement list. UTF-8 files up to 512 MiB / 1,000,000 statements are indexed on disk; supported statements execute sequentially with one explicit frozen-script authorization. Small scripts can optionally become ordinary SQL cells. Copy the sibling `.turbodbnote-scripts` directory when moving a Note manually. See [Note workbench](docs/note-workbench.md) and [native developer tools](docs/native-tooling.md).
+
+Note MySQL script execution supports a single database, bounded UTF-8 session settings, common dump save/restore variables, version comments, table locks and transactions. The frozen script and its risk summary are authorized once before execution; database mismatches require explicit target selection. Script statements are bounded to 1 MiB, while ordinary SQL cells retain 60 KB.
+
+SQL file exports create ordinary tables only if missing (`IF NOT EXISTS`); existing structures are not compared or changed, and data statements retain their original behavior.
+
+Script cells show cumulative execution statistics and the latest 500 statement details, retain the latest genuine query result, and read up to 512 fields for a selected table on demand. Unknown counts are explicit; affected rows are not committed totals. MySQL conditional creation uses server diagnostics to distinguish new and skipped tables.

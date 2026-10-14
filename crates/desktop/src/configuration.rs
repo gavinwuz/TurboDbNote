@@ -458,7 +458,13 @@ impl Configuration {
 
         if self.database_tab == 1 {
             body = body.child(t(cx, "settings.sql_policy_default"));
-            for &(key, label, _) in turbodbn_services::database::notebook_query::COMMANDS {
+            for &(key, label, _) in turbodbn_services::database::notebook_query::COMMANDS
+                .iter()
+                .chain(turbodbn_services::database::notebook_query::SCRIPT_COMMANDS)
+            {
+                if key == "script_session" {
+                    body = body.child(t(cx, "script.permissions_hint"));
+                }
                 body = body.child(
                     gpui_component::checkbox::Checkbox::new(key)
                         .label(label)

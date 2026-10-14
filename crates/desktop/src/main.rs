@@ -25,12 +25,17 @@ mod panels;
 mod preferences;
 mod query_grid;
 mod result_document;
+mod script_authorize;
+mod script_cell;
+mod script_import;
+mod script_results;
 mod settings;
 mod table_view;
 mod tabs;
 mod task_list;
 use turbodbn_services::database::transfer;
 mod typography;
+mod updates;
 #[cfg(target_os = "windows")]
 mod windows_icon;
 #[cfg(target_os = "windows")]
@@ -41,6 +46,10 @@ use gpui::*;
 use gpui_component::{Root, TitleBar};
 
 fn main() {
+    #[cfg(target_os = "windows")]
+    if updates::run_installer_helper() {
+        return;
+    }
     #[cfg(target_os = "windows")]
     let _install_guard =
         windows_icon::install_guard().expect("Unable to register running application");

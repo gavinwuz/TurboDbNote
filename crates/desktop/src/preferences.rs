@@ -10,6 +10,7 @@ impl DatabasePreferences {
                 self.sql_extensions.iter().any(|v| v == key)
                     || turbodbn_services::database::notebook_query::COMMANDS
                         .iter()
+                        .chain(turbodbn_services::database::notebook_query::SCRIPT_COMMANDS)
                         .any(|(id, _, enabled)| *id == key && *enabled)
             },
             |commands| commands.iter().any(|v| v == key),
@@ -18,6 +19,7 @@ impl DatabasePreferences {
     pub fn set_command(&mut self, key: &str, enabled: bool) {
         let mut commands = turbodbn_services::database::notebook_query::COMMANDS
             .iter()
+            .chain(turbodbn_services::database::notebook_query::SCRIPT_COMMANDS)
             .filter(|(id, _, _)| self.command_enabled(id))
             .map(|(id, _, _)| (*id).to_owned())
             .collect::<Vec<_>>();
@@ -436,13 +438,16 @@ mod command_permissions_tests {
         let mut prefs = super::DatabasePreferences::default();
         assert!(prefs.command_enabled("select"));
         assert!(prefs.command_enabled("show_create"));
+        assert!(prefs.command_enabled("show_databases"));
         assert!(!prefs.command_enabled("delete"));
         prefs.set_command("select", false);
         prefs.set_command("update", true);
+        prefs.set_command("show_databases", false);
         let saved = serde_json::to_string(&prefs).unwrap();
         let loaded: super::DatabasePreferences = serde_json::from_str(&saved).unwrap();
         assert!(!loaded.command_enabled("select"));
         assert!(loaded.command_enabled("update"));
         assert!(!loaded.command_enabled("delete"));
+        assert!(!loaded.command_enabled("show_databases"));
     }
 }

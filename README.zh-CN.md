@@ -29,6 +29,8 @@
 
 能力依驱动而异。Note SQL 执行支持 MySQL/PostgreSQL/SQLite；外部适配器提供连接、对象浏览与有界只读预览，Doris 为只读。Access/DB2 需对应 ODBC 提供程序，Oracle 需 OCI 客户端。详见[驱动能力与前置条件](docs/database-drivers.md)。
 
+MySQL 数据库检测兼容带 BINARY 标记的 UTF-8 元数据，编码失败与权限拒绝分别提示。Note 支持有界 `SHOW DATABASES`/`SHOW SCHEMAS`，以及 `SHOW TABLES`/`SHOW STATUS`/`SHOW VARIABLES` 的 LIKE 字符串筛选；STATUS/VARIABLES 可带 SESSION/GLOBAL 范围。上述指令遵循设置 → 数据库 → SQL 命令许可，不修改服务端授权。
+
 ## 安装
 
 - **Windows 10 1809+／Windows 11 x64：** 解压便携 ZIP 后运行 `turbodbnote.exe`，保留同目录的 `drivers` 与许可／源码材料。不支持 Windows 7，程序尚未签名。
@@ -37,7 +39,7 @@
 
 笔记保存为独立 `.note` 文件，设置、导航和连接元数据使用 `connections.db`。Windows 便携版数据位于程序旁的 `data`，Linux 使用当前用户配置目录。Windows 密码使用当前用户 DPAPI 加密；Linux 密码仅保留在会话内存，重启后需重新输入。Windows 加密凭据不能直接迁移给其它用户或 Linux 使用。
 
-托盘、SQL Server 集成认证及随包旧版 MySQL DLL 仅 Windows 提供。Redis 集群浏览限当前连接节点；提醒仅在应用运行且笔记已打开时有效。不提供自动更新。
+托盘、SQL Server 集成认证及随包旧版 MySQL DLL 仅 Windows 提供。Redis 集群浏览限当前连接节点；提醒仅在应用运行且笔记已打开时有效。启动后后台检查稳定新版本，每 24 小时最多一次；帮助 → 检查更新始终立即检查。新版本提供发布说明、跳过／稍后及明确点击后的应用内下载，支持进度、取消和 SHA256 校验。Windows 安装版可保存待保存笔记／设置并退出后启动已校验安装器；须先处理连接草稿、暂存修改及执行中的数据库／笔记任务。Windows 绿色版和 Linux 下载包后手动替换。检查及下载事件记录在输出中。SHA256 用于完整性校验，不等于独立发布签名；不会自动安装。
 
 ## 开发
 
@@ -67,7 +69,7 @@ cargo clippy --locked -j 1 --workspace --all-targets -- -D warnings
 - [诊断与验证边界](docs/crashsight-integration.md)
 - [版本发布与打包](docs/releasing.zh-CN.md)
 
-下次发布时，在双语 Unreleased 中补充说明，将功能提交到干净的默认分支，再运行 `./scripts/release.ps1 -Version 0.1.1`（Linux：`python3 scripts/prepare-release.py 0.1.1`）。Actions 仅在两平台验证通过后打包发布；版本标签不可变，不覆盖已有 Release。
+下次发布时，在双语 Unreleased 中补充说明，将功能提交到干净的默认分支，再运行 `./scripts/release.ps1 -Version 0.1.1`（Linux：`cargo run --quiet --locked -j 1 -p turbodbnote-tools -- prepare-release 0.1.1`）。Actions 仅在两平台验证通过后打包发布；版本标签不可变，不覆盖已有 Release。
 
 采用 [Apache-2.0](LICENSE) 许可，随包第三方组件保留各自许可。
 
@@ -76,3 +78,11 @@ cargo clippy --locked -j 1 --workspace --all-targets -- -D warnings
 [隐私政策](PRIVACY.zh-CN.md)
 
 现代 MySQL 版本路由支持 5.6、5.7、8.x、9.x（含 8.4.5）；允许连接不等于所有版本已完成真实服务端验收，认证和 TLS 仍按实际能力校验。
+
+Note 顶部工具栏支持导入 SQL：默认一个托管脚本单元和虚拟分页语句清单。UTF-8 文件最多 512 MiB／100 万条语句，磁盘索引、顺序执行、整份冻结脚本一次明确授权；小脚本可选拆成普通 SQL 单元。手动搬移笔记时须携带同目录 `.turbodbnote-scripts`。详见 [Note 工作台](docs/note-workbench.md) 与 [原生开发工具](docs/native-tooling.md)。
+
+Note MySQL 脚本支持单库、受控 UTF-8 会话设置、常见导出变量保存恢复、版本注释、表锁和事务；先授权后执行，库不匹配时明确选择目标。脚本单语句上限为 1 MiB，普通 SQL 单元仍为 60 KB。
+
+SQL 文件导出的普通建表语句默认包含 `IF NOT EXISTS`：已有表跳过创建，不校验或修改其结构；数据语句保留原有行为。
+
+SQL 脚本单元展示累计执行统计与最近 500 条明细，保留最近一次真实查询结果，并按需读取所选表的最多 512 个字段。无法确认的计数明确显示未知；影响行数不等同已提交数量。MySQL 条件建表通过服务端诊断区分新增与跳过。

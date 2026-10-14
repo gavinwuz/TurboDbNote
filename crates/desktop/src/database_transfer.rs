@@ -2275,6 +2275,20 @@ impl Render for TransferView {
                 );
             }
         }
+        if self.mode == Mode::Export
+            && self.schema
+            && (!sqlite
+                || std::path::Path::new(self.file.read(cx).value().as_str())
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sql")))
+        {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(crate::locale::t(cx, "transfer.create_if_missing")),
+            );
+        }
         body = body
             .child(
                 div()

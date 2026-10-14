@@ -14,6 +14,12 @@ pub(super) fn write_sql(
     } else {
         b"-- Exported by TurboDBNote\n"
     })?;
+    out.write_all(if crlf {
+        b"-- Existing tables are kept without schema comparison; data statements still execute.\r\n"
+    } else {
+        b"-- Existing tables are kept without schema comparison; data statements still execute.\n"
+    })?;
+    let mut create_prefix = 0u8; // 0: statement start, 1: CREATE, 2: TABLE, 3: other.
     let mut input = std::io::BufReader::new(input).bytes().peekable();
     let mut quote = None;
     let mut escaped = false;
@@ -105,9 +111,50 @@ pub(super) fn write_sql(
                 }
             }
             out.write_all(&tag)?;
+        } else if create_prefix != 3 && (byte.is_ascii_alphanumeric() || byte == b'_') {
+            let mut token = vec![byte];
+            while token.len() < 64
+                && input.peek().is_some_and(|b| {
+                    b.as_ref()
+                        .is_ok_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                })
+            {
+                token.push(input.next().unwrap()?);
+            }
+            if create_prefix == 2 && !token.eq_ignore_ascii_case(b"IF") {
+                out.write_all(b"IF NOT EXISTS ")?;
+            }
+            create_prefix = match create_prefix {
+                0 if token.eq_ignore_ascii_case(b"CREATE") => 1,
+                1 if token.eq_ignore_ascii_case(b"TABLE") => 2,
+                1 if kind == crate::DatabaseKind::PostgreSql
+                    && token.eq_ignore_ascii_case(b"UNLOGGED") =>
+                {
+                    1
+                }
+                _ => 3,
+            };
+            out.write_all(&token)?;
+            previous = *token.last().unwrap();
+            continue;
         } else {
-            if matches!(byte, b'\'' | b'"' | b'`') {
-                quote = Some(byte);
+            if create_prefix == 2
+                && (matches!(byte, b'"' | b'`' | b'[')
+                    || byte == b'\'' && kind == crate::DatabaseKind::Sqlite
+                    || byte >= 128)
+            {
+                out.write_all(b"IF NOT EXISTS ")?;
+                create_prefix = 3;
+            }
+            if byte == b';' {
+                create_prefix = 0;
+            } else if !byte.is_ascii_whitespace() {
+                create_prefix = 3;
+            }
+            if matches!(byte, b'\'' | b'"' | b'`')
+                || byte == b'[' && kind == crate::DatabaseKind::Sqlite
+            {
+                quote = Some(if byte == b'[' { b']' } else { byte });
                 backslash = byte == b'\''
                     && (kind == crate::DatabaseKind::MySql
                         || (kind == crate::DatabaseKind::PostgreSql
@@ -124,6 +171,70 @@ pub(super) fn write_sql(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn table_guards_preserve_original_definitions_and_payloads() {
+        for kind in [
+            crate::DatabaseKind::MySql,
+            crate::DatabaseKind::Sqlite,
+            crate::DatabaseKind::PostgreSql,
+        ] {
+            let sql = b"-- CREATE TABLE comment(x);\n/* ignored */ CREATE /* note */ TABLE `odd;name`(v TEXT DEFAULT 'CREATE TABLE data');\nCREATE TABLE IF NOT EXISTS kept(id INT);\nINSERT INTO kept VALUES('CREATE TABLE literal');";
+            let mut once = Vec::new();
+            write_sql(&sql[..], &mut once, false, kind, || Ok(())).unwrap();
+            let text = String::from_utf8(once.clone()).unwrap();
+            assert!(text.contains("CREATE /* note */ TABLE IF NOT EXISTS `odd;name`"));
+            assert!(text.contains("DEFAULT 'CREATE TABLE data'"));
+            assert!(text.contains("CREATE TABLE IF NOT EXISTS kept"));
+            assert!(!text.contains("IF NOT EXISTS IF NOT EXISTS"));
+            let mut twice = Vec::new();
+            write_sql(&once[..], &mut twice, false, kind, || Ok(())).unwrap();
+            assert!(
+                !String::from_utf8(twice)
+                    .unwrap()
+                    .contains("IF NOT EXISTS IF NOT EXISTS")
+            );
+        }
+    }
+    #[test]
+    fn repeated_sqlite_structure_export_keeps_existing_table_and_data() {
+        let mut out = Vec::new();
+        write_sql(
+            &b"CREATE TABLE [a;b](id INTEGER PRIMARY KEY); CREATE TABLE 'single'(v TEXT);"[..],
+            &mut out,
+            false,
+            crate::DatabaseKind::Sqlite,
+            || Ok(()),
+        )
+        .unwrap();
+        let sql = String::from_utf8(out).unwrap();
+        assert!(sql.contains("CREATE TABLE IF NOT EXISTS 'single'"));
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch(&sql).unwrap();
+        db.execute_batch("INSERT INTO [a;b] VALUES(7);").unwrap();
+        db.execute_batch(&sql).unwrap();
+        assert_eq!(
+            db.query_row("SELECT id FROM [a;b]", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+    }
+    #[test]
+    fn view_placeholders_and_routine_bodies_are_not_rewritten() {
+        let sql = b"CREATE TEMPORARY TABLE placeholder(id INT);\nCREATE VIEW v AS SELECT 'CREATE TABLE t';\nCREATE FUNCTION f() RETURNS void AS $body$BEGIN CREATE TABLE hidden(id INT); END;$body$ LANGUAGE plpgsql;\nCREATE UNLOGGED TABLE real(id INT);";
+        let mut out = Vec::new();
+        write_sql(
+            &sql[..],
+            &mut out,
+            false,
+            crate::DatabaseKind::PostgreSql,
+            || Ok(()),
+        )
+        .unwrap();
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.contains("CREATE TEMPORARY TABLE placeholder"));
+        assert!(text.contains("BEGIN CREATE TABLE hidden"));
+        assert!(text.contains("CREATE UNLOGGED TABLE IF NOT EXISTS real"));
+    }
     #[test]
     fn comments_and_postgres_dollar_strings_are_preserved() {
         let sql =

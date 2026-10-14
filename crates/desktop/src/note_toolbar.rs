@@ -61,6 +61,27 @@ pub(super) fn cell_icon(kind: usize, cx: &App) -> AnyElement {
     }
 }
 impl NoteView {
+    pub(super) fn select_script_target(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let owner = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, window, cx| {
+            let scope = owner
+                .update(cx, |note, cx| note.toolbar_scope(window, cx))
+                .unwrap_or_else(|_| div().into_any_element());
+            dialog
+                .title(t(cx, "script.select_target"))
+                .w(px(600.))
+                .overlay_closable(false)
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .child(t(cx, "script.error.database_mismatch"))
+                        .child(scope)
+                        .child(t(cx, "script.select_target_hint"))
+                        .child(feedback::actions().child(feedback::close_button(cx))),
+                )
+        });
+    }
     pub(super) fn sync_defaults(&mut self, cx: &mut Context<Self>) {
         let database = self.default_database.read(cx).value().trim().to_owned();
         for cell in &self.cells {
@@ -189,6 +210,22 @@ impl NoteView {
                     .disabled(!active)
                     .opacity(if active { 1. } else { 0.4 })
                     .on_click(cx.listener(|this, _, _, cx| this.stop_queries(cx))),
+            )
+            .child(
+                crate::assets::note_tool("import-note-sql")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path("icons/note-import-sql.svg")
+                            .text_color(crate::assets::note_color(0, cx)),
+                    )
+                    .tooltip(t(cx, "script.import"))
+                    .disabled(
+                        active
+                            || self.picking
+                            || self.saving
+                            || self.cells.len() >= note_store::MAX_CELLS,
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| this.import_sql(window, cx))),
             )
             .child(
                 crate::assets::note_tool("collapse-all-note-cells")
@@ -350,7 +387,7 @@ impl NoteView {
     pub(crate) fn file_menu(mut menu: PopupMenu, view: WeakEntity<Self>, cx: &App) -> PopupMenu {
         let locked = view.upgrade().is_none_or(|view| {
             let note = view.read(cx);
-            note.saving || note.picking
+            note.saving || note.picking || note.cells.iter().any(|cell| cell.read(cx).indexing(cx))
         });
         for (action, key, icon) in [
             (FileAction::Rename, "notes.rename", IconName::ALargeSmall),
@@ -388,7 +425,7 @@ impl NoteView {
         }
     }
     fn metadata_dialog(&mut self, project: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if self.saving || self.picking {
+        if self.saving || self.picking || self.cells.iter().any(|cell| cell.read(cx).indexing(cx)) {
             return;
         }
         let value = if project {

@@ -436,17 +436,17 @@ async fn open(profile: &Profile, password: &str) -> Result<(MySqlConnection, Ser
                             error = Some("数据库超过 512 个，请直接输入库名缩小范围".into());
                             break;
                         }
-                        match row.try_get::<String, _>(0) {
-                            Ok(name) => databases.push(name),
-                            Err(_) => {
-                                error = Some("数据库名称解码失败".into());
+                        match crate::database::mysql_text(&row, 0) {
+                            Ok(name) if !name.is_empty() => databases.push(name),
+                            _ => {
+                                error = Some("dbwork.detect.name_decode_failed".into());
                                 break;
                             }
                         }
                     }
                     Ok(None) => break,
-                    Err(_) => {
-                        error = Some("无法读取数据库列表，请检查账号权限；仍可手动输入库名".into());
+                    Err(cause) => {
+                        error = Some(error_message(cause));
                         break;
                     }
                 }
@@ -511,6 +511,7 @@ impl Session {
         let (commands, requests) = async_channel::bounded::<crate::database::Operation>(8);
         let (events, output) = async_channel::bounded(8);
         std::thread::spawn(move || {
+            let mut profile = profile;
             let failure_events = events.clone();
             let task_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -528,18 +529,22 @@ impl Session {
                         Err(error)=>{let _=events.send(Event::Failed(error)).await;}
                         Ok((connection,info)) if test_only=>{drop(connection);let _=events.send(Event::Tested(info)).await;}
                         Ok((mut connection,info))=>{
+                            profile.target_version=info.version.clone();
                             if events.send(Event::Connected(info)).await.is_err(){return;}
+                            let mut script_session=false;
                             let mut heartbeat=tokio::time::interval(Duration::from_secs(30));heartbeat.tick().await;
                             loop {tokio::select!{
                                 _=rx.recv()=>break,
                                 request=requests.recv()=>{
                                     let Ok(request)=request else {break;};let id=request.id;
+                                    script_session|=matches!(&request.kind,crate::database::OperationKind::Workbench(r) if matches!(r.action,crate::database::workbench::Action::ScriptPrepare{..}|crate::database::workbench::Action::ScriptExecute{..}));
                                     let result=tokio::select!{
                                         _=rx.recv()=>break,
                                         result=tokio::time::timeout(duration,crate::database::mysql_operation(&mut connection,&profile,&request))=>result,
                                     };
                                     match result {Ok(result)=>{let _=events.send(Event::Operation{id,result}).await;},Err(_)=>{
-                                        let _=events.send(Event::Operation{id,result:Err("操作超时；建库结果可能已生效，请重连后确认，勿重复提交".into())}).await;break;
+                                        let message=if script_session{"script.error.timeout"}else{"操作超时；建库结果可能已生效，请重连后确认，勿重复提交"};
+                                        let _=events.send(Event::Operation{id,result:Err(message.into())}).await;break;
                                     }}
                                 }
                                 _=heartbeat.tick()=>{
@@ -547,6 +552,13 @@ impl Session {
                                     if !matches!(result,Ok(Ok(()))){let _=events.send(Event::Failed("连接已失效，请重新连接".into())).await;break;}
                                 }
                             }}
+                            if script_session {
+                                let _=tokio::time::timeout(Duration::from_secs(3),async{
+                                    if sqlx::raw_sql("ROLLBACK").execute(&mut connection).await.is_ok(){
+                                        let _=sqlx::raw_sql("UNLOCK TABLES").execute(&mut connection).await;
+                                    }
+                                }).await;
+                            }
                             drop(connection);let _=events.send(Event::Disconnected).await;
                         }
                     }
@@ -579,6 +591,108 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn metadata_text_decodes_binary_flagged_utf8_without_lossy_fallback() {
+        fn packet(socket: &mut std::net::TcpStream, seq: u8, bytes: &[u8]) {
+            let length = (bytes.len() as u32).to_le_bytes();
+            socket
+                .write_all(&[length[0], length[1], length[2], seq])
+                .unwrap();
+            socket.write_all(bytes).unwrap();
+        }
+        fn read_packet(socket: &mut std::net::TcpStream) -> std::io::Result<Vec<u8>> {
+            let mut header = [0; 4];
+            socket.read_exact(&mut header)?;
+            let length = u32::from_le_bytes([header[0], header[1], header[2], 0]) as usize;
+            assert!(length < 65536);
+            let mut bytes = vec![0; length];
+            socket.read_exact(&mut bytes)?;
+            Ok(bytes)
+        }
+        for value in ["测试库".as_bytes().to_vec(), vec![0xff]] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let sent = value.clone();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let capabilities = 0x0008_a201u32;
+                let mut greeting = b"\x0a8.4.5\0".to_vec();
+                greeting.extend_from_slice(&1u32.to_le_bytes());
+                greeting.extend_from_slice(b"12345678\0");
+                greeting.extend_from_slice(&(capabilities as u16).to_le_bytes());
+                greeting.push(33);
+                greeting.extend_from_slice(&2u16.to_le_bytes());
+                greeting.extend_from_slice(&((capabilities >> 16) as u16).to_le_bytes());
+                greeting.push(21);
+                greeting.extend_from_slice(&[0; 10]);
+                greeting.extend_from_slice(b"abcdefghijkl\0mysql_native_password\0");
+                packet(&mut socket, 0, &greeting);
+                read_packet(&mut socket).unwrap();
+                packet(&mut socket, 2, &[0, 0, 0, 2, 0, 0, 0]);
+                while let Ok(command) = read_packet(&mut socket) {
+                    if command.first() == Some(&1) {
+                        break;
+                    }
+                    if command.get(1..) == Some(b"SHOW DATABASES".as_slice()) {
+                        packet(&mut socket, 1, &[1]);
+                        let mut column = Vec::new();
+                        for field in ["def", "", "", "", "Database", "Database"] {
+                            column.push(field.len() as u8);
+                            column.extend_from_slice(field.as_bytes());
+                        }
+                        column.push(12);
+                        column.extend_from_slice(&33u16.to_le_bytes());
+                        column.extend_from_slice(&256u32.to_le_bytes());
+                        column.push(0xfd); // VAR_STRING with the BINARY metadata flag.
+                        column.extend_from_slice(&0x80u16.to_le_bytes());
+                        column.extend_from_slice(&[0; 3]);
+                        packet(&mut socket, 2, &column);
+                        packet(&mut socket, 3, &[0xfe, 0, 0, 2, 0]);
+                        let mut row = vec![sent.len() as u8];
+                        row.extend_from_slice(&sent);
+                        packet(&mut socket, 4, &row);
+                        packet(&mut socket, 5, &[0xfe, 0, 0, 2, 0]);
+                    } else {
+                        // SQLx connection initialization only changes this test session.
+                        packet(&mut socket, 1, &[0, 0, 0, 2, 0, 0, 0]);
+                    }
+                }
+            });
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let options = MySqlConnectOptions::new()
+                        .host("127.0.0.1")
+                        .port(port)
+                        .username("fixture")
+                        .ssl_mode(MySqlSslMode::Disabled)
+                        .charset("utf8")
+                        .disable_statement_logging();
+                    let mut connection = MySqlConnection::connect_with(&options).await.unwrap();
+                    let row = sqlx::raw_sql("SHOW DATABASES")
+                        .fetch_one(&mut connection)
+                        .await
+                        .unwrap();
+                    assert!(
+                        row.try_get::<String, _>(0).is_err(),
+                        "reproduce the original type mismatch"
+                    );
+                    let decoded = crate::database::mysql_text(&row, 0);
+                    if let Ok(expected) = std::str::from_utf8(&value) {
+                        assert_eq!(decoded.unwrap(), expected);
+                    } else {
+                        assert!(decoded.is_err(), "invalid UTF-8 must still fail");
+                    }
+                    connection.close().await.unwrap();
+                });
+            server.join().unwrap();
+        }
+    }
     #[test]
     fn tls_failures_are_typed_without_exposing_certificate_contents() {
         let error = sqlx::Error::Io(std::io::Error::new(

@@ -593,6 +593,10 @@ pub async fn mysql_operation(
     op: &Operation,
 ) -> Result<OperationResult, String> {
     crate::driver_catalog::check_operation(p, op)?;
+    if matches!(&op.kind,OperationKind::Workbench(r) if matches!(r.action,workbench::Action::ScriptPrepare{..}|workbench::Action::ScriptExecute{..}))
+    {
+        return mysql_inner(c, p, op).await;
+    }
     sqlx::query(if matches!(op.kind, OperationKind::Workbench(_)) {
         "SET NAMES utf8mb4"
     } else {
@@ -608,7 +612,7 @@ pub async fn mysql_operation(
         .map_err(db_error)?;
     result
 }
-fn mysql_text(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<String, String> {
+pub(crate) fn mysql_text(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<String, String> {
     // MySQL marks some textual INFORMATION_SCHEMA expressions as BINARY.
     // The connection requests UTF-8, so decode the bytes explicitly and report failures.
     row.try_get_unchecked::<Option<String>, _>(index)
@@ -627,11 +631,11 @@ async fn mysql_inner(
             charset,
             include_data,
         } => copy::mysql(c, source, target, charset, *include_data).await,
-        OperationKind::Workbench(r) => workbench::run(c, p.kind, "5.6+", r)
+        OperationKind::Workbench(r) => workbench::run(c, p.kind, &p.target_version, r)
             .await
             .map(|r| OperationResult::Workbench(Box::new(r))),
         OperationKind::Databases => {
-            if !p.database.is_empty() {
+            if !p.database.is_empty() && !p.list_all_databases {
                 return Ok(OperationResult::Databases(vec![p.database.clone()]));
             }
             let mut out = Vec::new();

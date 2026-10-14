@@ -104,36 +104,6 @@ fn parse_models(value: &Value) -> Result<Vec<String>, String> {
     models.truncate(1000);
     Ok(models)
 }
-pub enum ReleaseStatus {
-    NoRelease,
-    Available(String),
-    Current(String),
-}
-pub fn latest_release() -> Result<ReleaseStatus, String> {
-    let response = client()?
-        .get("https://api.github.com/repos/gavinwuz/TurboDbNote/releases/latest")
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .map_err(|_| "updates.error.request")?;
-    if response.status().as_u16() == 404 {
-        return Ok(ReleaseStatus::NoRelease);
-    }
-    let value = json(response)?;
-    let tag = value
-        .get("tag_name")
-        .and_then(Value::as_str)
-        .ok_or("updates.error.version_missing")?;
-    let latest = semver::Version::parse(tag.trim_start_matches('v'))
-        .map_err(|_| "updates.error.version_invalid")?;
-    let current = semver::Version::parse(env!("CARGO_PKG_VERSION"))
-        .map_err(|_| "updates.error.app_version")?;
-    Ok(if latest > current {
-        ReleaseStatus::Available(tag.to_string())
-    } else {
-        ReleaseStatus::Current(format!("v{current}"))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

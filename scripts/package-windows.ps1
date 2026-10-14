@@ -28,9 +28,12 @@ try {
     if (-not (Test-Path -LiteralPath $IsccPath -PathType Leaf)) { throw "ISCC compiler not found: $IsccPath" }
     $IsccPath = (Resolve-Path -LiteralPath $IsccPath).Path
     Write-Output "GPUI shader compiler: $compiler"
+    & cargo build --locked -j 1 -p turbodbnote-tools
+    if ($LASTEXITCODE -ne 0) { throw 'Native development tools build failed' }
+    $devTools = Join-Path $root 'target/debug/turbodbnote-tools.exe'
     function Invoke-Checked([string]$Program, [string[]]$Arguments) {
         if ($Program -eq 'cargo') {
-            & python (Join-Path $root 'scripts/run-cargo.py') @Arguments
+            & $devTools run-cargo @Arguments
         } else {
             & $Program @Arguments
         }

@@ -5,6 +5,8 @@ use std::{future::Future, pin::Pin};
 
 #[path = "grid.rs"]
 pub(super) mod grid;
+#[path = "script_context.rs"]
+pub mod script_context;
 pub use grid::{
     Change, DEFAULT_GRID_PAGE_SIZE, Filter, FilterJoin, FilterSet, MAX_FILTER_CONDITIONS,
     MAX_GRID_PAGE_SIZE, PageOptions, cell_where, copy_row, copy_update, edit_preview,
@@ -21,8 +23,12 @@ pub struct Rows {
     pub values: Vec<Vec<Option<String>>>,
 }
 pub type Query<'a> = Pin<Box<dyn Future<Output = Result<Rows, String>> + 'a>>;
+pub type CountedQuery<'a> = Pin<Box<dyn Future<Output = Result<(Rows, Option<u64>), String>> + 'a>>;
 pub trait Access {
     fn query<'a>(&'a mut self, sql: &'a str) -> Query<'a>;
+    fn query_counted<'a>(&'a mut self, sql: &'a str) -> CountedQuery<'a> {
+        Box::pin(async move { self.query(sql).await.map(|rows| (rows, None)) })
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Object {
@@ -76,11 +82,18 @@ pub enum Action {
     NotePrepare {
         sql: String,
     },
+    ScriptPrepare {
+        sql: String,
+    },
     NoteExecute {
         plan: super::notebook_query::Plan,
         confirmed: bool,
         offset: usize,
         page_size: usize,
+    },
+    ScriptExecute {
+        plan: super::notebook_query::Plan,
+        confirmed: bool,
     },
     GridPage {
         object: Object,
@@ -456,6 +469,11 @@ pub async fn run(
                 .await
                 .map(Reply::NotePrepared)
         }
+        Action::ScriptPrepare { sql } => {
+            super::notebook_query::prepare_script(c, kind, &r.database, version, sql)
+                .await
+                .map(Reply::NotePrepared)
+        }
         Action::NoteExecute {
             plan,
             confirmed,
@@ -472,6 +490,11 @@ pub async fn run(
         )
         .await
         .map(Reply::NoteResult),
+        Action::ScriptExecute { plan, confirmed } => {
+            super::notebook_query::execute_script(c, kind, &r.database, version, plan, *confirmed)
+                .await
+                .map(Reply::NoteResult)
+        }
         Action::GridPage { object, options } => {
             grid::page(c, kind, version, &r.database, object, options).await
         }
@@ -573,13 +596,24 @@ macro_rules! text_access {
     ($connection:ty) => {
         impl Access for $connection {
             fn query<'a>(&'a mut self, sql: &'a str) -> Query<'a> {
+                Box::pin(async move { self.query_counted(sql).await.map(|(rows, _)| rows) })
+            }
+            fn query_counted<'a>(&'a mut self, sql: &'a str) -> CountedQuery<'a> {
                 Box::pin(async move {
                     use futures_util::TryStreamExt;
                     use sqlx::{Column, Row};
                     let mut result = Rows::default();
                     let mut bytes = 0;
-                    let mut stream = sqlx::raw_sql(sql).fetch(self);
-                    while let Some(row) = stream.try_next().await.map_err(super::db_error)? {
+                    let mut affected = None;
+                    let mut stream = sqlx::raw_sql(sql).fetch_many(self);
+                    while let Some(entry) = stream.try_next().await.map_err(super::db_error)? {
+                        let row = match entry {
+                            sqlx::Either::Left(done) => {
+                                affected = Some(done.rows_affected());
+                                continue;
+                            }
+                            sqlx::Either::Right(row) => row,
+                        };
                         if result.columns.is_empty() {
                             result.columns =
                                 row.columns().iter().map(|c| c.name().into()).collect();
@@ -612,7 +646,7 @@ macro_rules! text_access {
                         }
                         result.values.push(values);
                     }
-                    Ok(result)
+                    Ok((result, affected))
                 })
             }
         }
@@ -622,13 +656,24 @@ text_access!(sqlx::MySqlConnection);
 text_access!(sqlx::PgConnection);
 impl Access for sqlx::SqliteConnection {
     fn query<'a>(&'a mut self, sql: &'a str) -> Query<'a> {
+        Box::pin(async move { self.query_counted(sql).await.map(|(rows, _)| rows) })
+    }
+    fn query_counted<'a>(&'a mut self, sql: &'a str) -> CountedQuery<'a> {
         Box::pin(async move {
             use futures_util::TryStreamExt;
             use sqlx::{Column, Row, TypeInfo, ValueRef};
             let mut result = Rows::default();
             let mut bytes = 0;
-            let mut stream = sqlx::raw_sql(sql).fetch(self);
-            while let Some(row) = stream.try_next().await.map_err(super::db_error)? {
+            let mut affected = None;
+            let mut stream = sqlx::raw_sql(sql).fetch_many(self);
+            while let Some(entry) = stream.try_next().await.map_err(super::db_error)? {
+                let row = match entry {
+                    sqlx::Either::Left(done) => {
+                        affected = Some(done.rows_affected());
+                        continue;
+                    }
+                    sqlx::Either::Right(row) => row,
+                };
                 if result.columns.is_empty() {
                     result.columns = row.columns().iter().map(|c| c.name().into()).collect();
                 }
@@ -666,7 +711,7 @@ impl Access for sqlx::SqliteConnection {
                 }
                 result.values.push(values);
             }
-            Ok(result)
+            Ok((result, affected))
         })
     }
 }
