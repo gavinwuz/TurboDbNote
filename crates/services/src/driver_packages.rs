@@ -112,16 +112,17 @@ pub fn hash(path: &Path, cancelled: &AtomicBool) -> Result<String, String> {
 }
 fn no_link(path: &Path) -> Result<(), String> {
     for ancestor in path.ancestors() {
-        if let Ok(meta) = fs::symlink_metadata(ancestor) {
-            if meta.file_type().is_symlink() {
+        let Ok(meta) = fs::symlink_metadata(ancestor) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            return Err(ERROR.into());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & 0x400 != 0 {
                 return Err(ERROR.into());
-            }
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::MetadataExt;
-                if meta.file_attributes() & 0x400 != 0 {
-                    return Err(ERROR.into());
-                }
             }
         }
     }
