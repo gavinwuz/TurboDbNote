@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-15
+
 - Support independent MongoDB authSource and target-scoped connection tests without requiring admin database listing; classify authentication, permissions and connection failures.
 
 - Add Rust driver component download/offline import, dependency probes and persisted per-driver enable switches; generate full/minimal distributions and reusable offline component archives with a pinned Oracle client.
