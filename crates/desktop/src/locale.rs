@@ -129,6 +129,29 @@ pub fn tr(cx: &App, key: &str, args: &[(&str, &str)]) -> SharedString {
 /// For internally generated semantic status keys or unmodified external text.
 /// Raw backend errors are never treated as legacy translation keys.
 pub fn message(cx: &App, value: &str) -> SharedString {
+    if let Some(details) = value.strip_prefix("components.mismatch:")
+        && details.len() <= 512
+        && let Ok(details) = serde_json::from_str::<serde_json::Value>(details)
+    {
+        let keys = [
+            "version",
+            "platform",
+            "protocol",
+            "expected_version",
+            "expected_platform",
+            "expected_protocol",
+        ];
+        let values = keys.map(|key| {
+            details[key].as_str().map(str::to_owned).unwrap_or_else(|| {
+                details[key]
+                    .as_u64()
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".into())
+            })
+        });
+        let args = std::array::from_fn::<_, 6, _>(|i| (keys[i], values[i].as_str()));
+        return tr(cx, "components.error.mismatch", &args);
+    }
     if english().strings.contains_key(value) {
         t(cx, value)
     } else {

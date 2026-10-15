@@ -4,6 +4,12 @@ use std::{io::Read, path::PathBuf};
 use turbodbn_services::agent::Engine;
 
 impl DatabasePreferences {
+    pub fn timeout_defaults(&self) -> turbodbn_services::timeout_policy::Defaults {
+        turbodbn_services::timeout_policy::Defaults {
+            connect: self.connect_timeout_seconds,
+            execution: self.execution_timeout_seconds,
+        }
+    }
     pub fn command_enabled(&self, key: &str) -> bool {
         self.sql_commands.as_ref().map_or_else(
             || {
@@ -143,6 +149,8 @@ impl Default for AgentExtension {
 #[serde(default)]
 pub struct DatabasePreferences {
     pub page_size: usize,
+    pub connect_timeout_seconds: u64,
+    pub execution_timeout_seconds: u64,
     pub sql_wrap: bool,
     pub sql_enter: bool,
     pub confirm_destructive: bool,
@@ -153,6 +161,8 @@ impl Default for DatabasePreferences {
     fn default() -> Self {
         Self {
             page_size: 200,
+            connect_timeout_seconds: 5,
+            execution_timeout_seconds: turbodbn_core::timeouts::DEFAULT_EXECUTION_SECONDS,
             sql_wrap: true,
             sql_enter: false,
             confirm_destructive: true,
@@ -292,6 +302,30 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn global_timeout_defaults_migrate_and_persist_without_connection_overrides() {
+        let old: DatabasePreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.connect_timeout_seconds, 5);
+        assert_eq!(old.execution_timeout_seconds, 300);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.db");
+        let mut p = Preferences::default();
+        p.database.connect_timeout_seconds = 9;
+        p.database.execution_timeout_seconds = 900;
+        p.save_to(&path).unwrap();
+        let p = Preferences::load_from(&path).unwrap();
+        assert_eq!(
+            p.database.timeout_defaults(),
+            turbodbn_services::timeout_policy::Defaults {
+                connect: 9,
+                execution: 900
+            }
+        );
+        assert!(
+            turbodbn_services::database::defaults(turbodbn_services::DatabaseKind::MySql)
+                .inherit_timeouts
+        );
+    }
     #[test]
     fn sqlite_round_trips_general_providers_and_extensions() {
         let directory = tempfile::tempdir().unwrap();

@@ -10,6 +10,8 @@ pub const MAX_BYTES: usize = 1024 * 1024;
 pub enum Control {
     Use(String),
     Session,
+    Variable,
+    Isolation,
     Lock,
     Unlock,
     Begin,
@@ -20,7 +22,8 @@ impl Control {
     pub fn permission(&self) -> &'static str {
         match self {
             Self::Lock | Self::Unlock => "script_lock",
-            Self::Begin | Self::Commit | Self::Rollback => "script_transaction",
+            Self::Variable => "script_variables",
+            Self::Begin | Self::Commit | Self::Rollback | Self::Isolation => "script_transaction",
             _ => "script_session",
         }
     }
@@ -71,6 +74,39 @@ fn ident(t: &Token) -> Option<String> {
         }
         _ => None,
     }
+}
+/// Strict, script-only DROP TRIGGER grammar; never accepts a second statement.
+pub fn drop_trigger_target(sql: &str) -> Result<Option<Vec<String>>, String> {
+    let ts = tokens(sql)?;
+    if ts.len() < 2
+        || word(&ts[0]).as_deref() != Some("DROP")
+        || word(&ts[1]).as_deref() != Some("TRIGGER")
+    {
+        return Ok(None);
+    }
+    let target = if ts.get(2).and_then(word).as_deref() == Some("IF") {
+        if ts.get(3).and_then(word).as_deref() != Some("EXISTS") {
+            return Err("script.error.syntax".into());
+        }
+        &ts[4..]
+    } else {
+        &ts[2..]
+    };
+    let parts = match target {
+        [name] => vec![ident(name).ok_or("script.error.syntax")?],
+        [schema, Token::Period, name] => vec![
+            ident(schema).ok_or("script.error.syntax")?,
+            ident(name).ok_or("script.error.syntax")?,
+        ],
+        _ => return Err("script.error.syntax".into()),
+    };
+    if parts
+        .iter()
+        .any(|s| s.is_empty() || s.len() > 64 || s.chars().any(char::is_control))
+    {
+        return Err("script.error.syntax".into());
+    }
+    Ok(Some(parts))
 }
 pub fn keys_target(sql: &str) -> Result<Option<Vec<String>>, String> {
     let ts = tokens(sql)?;
@@ -195,6 +231,50 @@ fn literal(name: &str, ts: &[Token]) -> bool {
         _ => false,
     }
 }
+fn user_variable(ts: &[Token]) -> bool {
+    let text = ts.iter().map(ToString::to_string).collect::<String>();
+    text.strip_prefix('@').is_some_and(|name| {
+        !name.is_empty()
+            && name.len() <= 64
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            && !name.as_bytes()[0].is_ascii_digit()
+    })
+}
+/// Produce inspection-only SQL; execution always uses the original frozen statement.
+pub fn variable_select(sql: &str) -> Result<Option<(String, bool)>, String> {
+    let mut ts = tokens(sql)?;
+    if ts.first().and_then(word).as_deref() != Some("SELECT") {
+        return Ok(None);
+    }
+    let Some(into) = ts.iter().position(|t| word(t).as_deref() == Some("INTO")) else {
+        return Ok(None);
+    };
+    let from = ts
+        .iter()
+        .enumerate()
+        .skip(into + 1)
+        .find(|(_, t)| word(t).as_deref() == Some("FROM"))
+        .map(|(i, _)| i)
+        .ok_or("script.error.control")?;
+    if !user_variable(&ts[into + 1..from]) {
+        return Err("script.error.control".into());
+    }
+    ts.drain(into..from);
+    let n = ts.len();
+    let locked = n >= 2
+        && word(&ts[n - 2]).as_deref() == Some("FOR")
+        && word(&ts[n - 1]).as_deref() == Some("UPDATE");
+    if locked {
+        ts.truncate(n - 2);
+    }
+    Ok(Some((
+        ts.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" "),
+        locked,
+    )))
+}
 pub fn control(sql: &str) -> Result<Option<Control>, String> {
     let ts = tokens(sql)?;
     let words = ts
@@ -214,6 +294,42 @@ pub fn control(sql: &str) -> Result<Option<Control>, String> {
             }
         }
         "SET" => {
+            let isolation = words.get(1..).unwrap_or_default();
+            let isolation = isolation
+                .strip_prefix(&["SESSION".into()])
+                .unwrap_or(isolation);
+            if isolation.starts_with(&["TRANSACTION".into(), "ISOLATION".into(), "LEVEL".into()]) {
+                if matches!(
+                    isolation[3..]
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>()
+                        .as_slice(),
+                    ["REPEATABLE", "READ"]
+                        | ["READ", "COMMITTED"]
+                        | ["READ", "UNCOMMITTED"]
+                        | ["SERIALIZABLE"]
+                ) {
+                    return Ok(Some(Control::Isolation));
+                }
+                return bad();
+            }
+            if let Some(eq) = ts.iter().position(|t| *t == Token::Eq)
+                && user_variable(&ts[1..eq])
+                && reference(&ts[1..eq]).is_none()
+            {
+                let rhs = &ts[eq + 1..];
+                let numeric = |t: &Token| matches!(t,Token::Number(n,_) if n.bytes().all(|b|b.is_ascii_digit()) && n.len()<=20);
+                if matches!(rhs,[number] if numeric(number))
+                    || rhs.len() >= 3
+                        && matches!(rhs[rhs.len() - 2], Token::Plus | Token::Minus)
+                        && numeric(&rhs[rhs.len() - 1])
+                        && user_variable(&rhs[..rhs.len() - 2])
+                {
+                    return Ok(Some(Control::Variable));
+                }
+                return bad();
+            }
             if words.get(1).map(String::as_str) == Some("NAMES")
                 || words.get(1..3) == Some(&["CHARACTER".into(), "SET".into()])
             {

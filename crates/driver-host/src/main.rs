@@ -1,5 +1,8 @@
 mod adapter;
 mod document;
+#[cfg(test)]
+mod mongo_fixture;
+mod probe;
 mod protocol;
 mod relational;
 use protocol::*;
@@ -38,12 +41,20 @@ async fn run() -> Result<()> {
     let p = request["profile"].take();
     let timeout =
         std::time::Duration::from_secs(p["timeout_seconds"].as_u64().unwrap_or(10).clamp(1, 60));
+    let execution_timeout = std::time::Duration::from_secs(execution_seconds(&p));
     let mut adapter = tokio::time::timeout(timeout, adapter::Adapter::connect(p, &password))
         .await
         .map_err(|_| FAILED)??;
     password.zeroize();
-    let databases = adapter.databases().await?;
-    emit(json!({"info":{"version":adapter.version,"session_id":0,"charset":"UTF-8","database":adapter.db,"tls_cipher":if string(&adapter.p,"tls")=="Disabled" {""}else{"TLS"},"elapsed_ms":started.elapsed().as_millis() as u64,"databases":databases,"database_list_error":null}})).await?;
+    let (databases, database_list_error) = match adapter.databases().await {
+        Ok(databases) => (databases, None),
+        Err("mongo.error.permission") if !adapter.db.is_empty() => (
+            vec![adapter.db.clone()],
+            Some("mongo.error.list_permission"),
+        ),
+        Err(error) => return Err(error),
+    };
+    emit(json!({"info":{"version":adapter.version,"session_id":0,"charset":"UTF-8","database":adapter.db,"tls_cipher":if string(&adapter.p,"tls")=="Disabled" {""}else{"TLS"},"elapsed_ms":started.elapsed().as_millis() as u64,"databases":databases,"database_list_error":database_list_error}})).await?;
     loop {
         line.clear();
         if (&mut input)
@@ -68,7 +79,9 @@ async fn run() -> Result<()> {
         let result = match serde_json::from_str::<Value>(&line) {
             Ok(v) => match allowed(&v["kind"]) {
                 Ok(()) => {
-                    match tokio::time::timeout(timeout, adapter.operation(&v["kind"])).await {
+                    match tokio::time::timeout(execution_timeout, adapter.operation(&v["kind"]))
+                        .await
+                    {
                         Ok(result) => result,
                         Err(_) => {
                             emit(json!({"Err":FAILED})).await?;
@@ -91,6 +104,11 @@ async fn run() -> Result<()> {
 fn main() {
     std::panic::set_hook(Box::new(|_| {}));
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.len() == 2 && args[0] == "--probe" {
+        println!("{}", probe::run(&args[1]));
+        return;
+    }
     if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

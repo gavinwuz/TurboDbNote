@@ -3,13 +3,16 @@ pub mod agent;
 pub mod claude;
 pub mod codex;
 pub mod codex_discovery;
+pub mod connection_url;
 pub mod credentials;
 pub mod database;
 pub mod driver_catalog;
+pub mod driver_packages;
 pub mod external_driver;
 pub mod mysql;
 pub mod mysql_drivers;
 pub mod mysql_legacy;
+pub mod oracle_bundle;
 pub mod password_protection;
 pub mod updates;
 use std::{future::Future, pin::Pin, sync::Arc};
@@ -143,3 +146,9 @@ pub mod note_store;
 pub mod sql_script;
 
 pub mod sql_mcp;
+
+pub mod db2_bundle;
+
+pub mod access_mode;
+
+pub mod timeout_policy;

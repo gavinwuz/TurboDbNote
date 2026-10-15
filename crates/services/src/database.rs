@@ -108,6 +108,7 @@ pub fn defaults(kind: DatabaseKind) -> Profile {
         }
         .into(),
         name: format!("新建 {} 连接", kind.label()),
+        inherit_timeouts: true,
         ..Default::default()
     }
 }
@@ -243,6 +244,7 @@ pub fn start(
     password: String,
     test: bool,
 ) -> (Session, async_channel::Receiver<Event>) {
+    let profile = profile.resolve_timeouts();
     let (stop, rx) = async_channel::bounded(1);
     let (commands, requests) = async_channel::bounded::<Operation>(8);
     let (events, out) = async_channel::bounded(8);
@@ -258,6 +260,7 @@ pub fn start(
             };
             runtime.block_on(async move {
             let timeout=Duration::from_secs(profile.timeout_seconds.clamp(1,60));
+            let execution_timeout=profile.execution_timeout();
             let opened=tokio::select!{_=rx.recv()=>return,result=tokio::time::timeout(timeout,Backend::open(&profile,&password))=>result};
             drop(password);
             let (mut backend,mut info)=match opened {Ok(Ok(result))=>result,Ok(Err(e))=>{let _=events.send(Event::Failed(e)).await;return;},Err(_)=>{let _=events.send(Event::Failed("连接超时，已取消".into())).await;return;}};
@@ -269,7 +272,7 @@ pub fn start(
                 _=rx.recv()=>break,
                 request=requests.recv()=>{
                     let Ok(request)=request else{break;};let id=request.id;
-                    let result=tokio::select!{_=rx.recv()=>break,result=tokio::time::timeout(timeout,backend.operation(&profile,&request))=>result};
+                    let result=tokio::select!{_=rx.recv()=>break,result=tokio::time::timeout(execution_timeout,backend.operation(&profile,&request))=>result};
                     match result {Ok(result)=>{let _=events.send(Event::Operation{id,result}).await;},Err(_)=>{let _=events.send(Event::Operation{id,result:Err("操作超时；建库结果可能已生效，请重连确认，勿重复提交".into())}).await;break;}}
                 }
                 _=ping.tick()=>{let ok=tokio::select!{_=rx.recv()=>break,result=tokio::time::timeout(Duration::from_secs(5),backend.ping())=>matches!(result,Ok(Ok(())))};if !ok {let _=events.send(Event::Failed("连接已失效，请重新连接".into())).await;break;}}

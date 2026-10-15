@@ -7,6 +7,7 @@ struct Scope {
     host: String,
     port: u16,
     user: String,
+    odbc: Option<turbodbn_core::odbc::Options>,
 }
 impl From<&Profile> for Scope {
     fn from(p: &Profile) -> Self {
@@ -20,6 +21,7 @@ impl From<&Profile> for Scope {
             },
             port: p.port,
             user: p.user.clone(),
+            odbc: (p.driver_id == "odbc").then(|| p.odbc.clone()),
         }
     }
 }
@@ -86,6 +88,19 @@ pub fn input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn odbc_secret_is_invalidated_when_dsn_or_parameters_change() {
+        let mut p = turbodbn_services::driver_catalog::find("odbc")
+            .unwrap()
+            .profile();
+        p.odbc.dsn = "first".into();
+        let secret = Cached::new(&p, "fixture-only".into());
+        p.odbc.dsn = "second".into();
+        assert!(!secret.matches(&p));
+        p.odbc.dsn = "first".into();
+        p.odbc.parameters = "DATABASE=other".into();
+        assert!(!secret.matches(&p));
+    }
     #[test]
     fn retained_secret_is_bound_to_server_and_user_not_display_name() {
         let p = Profile::default();

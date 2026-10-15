@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 pub(super) struct NotebookContext {
     saved: SavedConnection,
+    pub access_mode: turbodbn_services::access_mode::AccessMode,
     plan: Plan,
     confirmed: bool,
     pub source: GridSource,
@@ -20,7 +21,24 @@ pub(super) struct NotebookContext {
     session: Option<Session>,
     task: Option<Task<()>>,
 }
+impl EventEmitter<crate::note_permissions::Advice> for TableView {}
 impl TableView {
+    pub(crate) fn set_note_access_mode(
+        &mut self,
+        mode: turbodbn_services::access_mode::AccessMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(note) = &mut self.notebook else {
+            return;
+        };
+        note.access_mode = mode;
+        self.target.writable = mode != turbodbn_services::access_mode::AccessMode::ReadOnly
+            && note.source.editable
+            && note.saved.profile.supports_mutation()
+            && !(note.saved.profile.kind == turbodbn_services::DatabaseKind::MySql
+                && turbodbn_services::mysql::uses_legacy(&note.saved.profile));
+        cx.notify();
+    }
     pub(crate) fn from_note(
         source: WeakEntity<DatabaseView>,
         binding: (SavedConnection, String),
@@ -43,12 +61,6 @@ impl TableView {
             comment: String::new(),
             parent: String::new(),
         });
-        let writable = meta.editable
-            && saved.profile.supports_mutation()
-            && !(saved.profile.kind == turbodbn_services::DatabaseKind::Sqlite
-                && saved.profile.sqlite_read_only)
-            && !(saved.profile.kind == turbodbn_services::DatabaseKind::MySql
-                && turbodbn_services::mysql::uses_legacy(&saved.profile));
         let target = OpenTable {
             connection: saved.profile.id,
             database,
@@ -56,7 +68,7 @@ impl TableView {
             mode: Mode::Grid,
             generation: saved.generation,
             kind: saved.profile.kind,
-            writable,
+            writable: false,
         };
         let mut this = Self::create(
             format!("note-result-{}", Uuid::new_v4()),
@@ -69,6 +81,7 @@ impl TableView {
         this.options.page_size = 20;
         this.notebook = Some(NotebookContext {
             saved,
+            access_mode: Default::default(),
             plan: plan.clone(),
             confirmed,
             source: meta.clone(),
@@ -181,21 +194,64 @@ impl TableView {
             self.receive(Err(t(cx, "notes.results_stale").to_string()), cx);
             return;
         }
+        let mut commands = vec![];
+        if let Some(key) = turbodbn_services::database::notebook_query::command_required(
+            note.saved.profile.kind,
+            &note.plan.sql,
+        ) {
+            commands.push(key);
+        }
+        match &action {
+            Action::Commit { changes, .. } => {
+                for change in changes {
+                    commands.push(if change.original.is_none() {
+                        "insert"
+                    } else if change.values.is_none() {
+                        "delete"
+                    } else {
+                        "update"
+                    });
+                }
+            }
+            Action::Count { .. } => commands.push("select"),
+            _ => {}
+        }
+        if let Some(advice) = commands.into_iter().find_map(|key| {
+            crate::note_permissions::Advice::for_command(
+                note.access_mode,
+                &note.saved.profile,
+                key,
+                cx,
+            )
+        }) {
+            self.receive(Err(advice.message(cx).to_string()), cx);
+            cx.emit(advice);
+            return;
+        }
         let policy = &cx.global::<crate::preferences::Preferences>().database;
         let query_allowed = turbodbn_services::database::notebook_query::command_required(
             note.saved.profile.kind,
             &note.plan.sql,
         )
-        .is_some_and(|key| policy.command_enabled(key));
+        .is_some_and(|key| {
+            note.access_mode
+                .allows_note_effective(key, policy.command_enabled(key))
+        });
+        if matches!(&action, Action::Count { .. }) && !policy.command_enabled("select") {
+            self.receive(Err(t(cx, "settings.sql_policy_blocked").to_string()), cx);
+            return;
+        }
         let writes_allowed = match &action {
             Action::Commit { changes, .. } => changes.iter().all(|change| {
-                policy.command_enabled(if change.original.is_none() {
+                let key = if change.original.is_none() {
                     "insert"
                 } else if change.values.is_none() {
                     "delete"
                 } else {
                     "update"
-                })
+                };
+                note.access_mode
+                    .allows_note_effective(key, policy.command_enabled(key))
             }),
             _ => true,
         };

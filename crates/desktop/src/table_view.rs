@@ -2,12 +2,16 @@
 mod filter_ui;
 #[path = "data_grid.rs"]
 mod grid_ui;
+#[path = "mongo_workbench.rs"]
+mod mongo_ui;
 #[path = "note_results.rs"]
 mod note_results;
 #[path = "redis_editor.rs"]
 mod redis_editor;
 #[path = "grid_value.rs"]
 mod value_ui;
+#[path = "grid_width.rs"]
+mod width_ui;
 use crate::{
     database::{DatabaseView, OpenTable},
     locale::t,
@@ -37,6 +41,17 @@ pub enum Mode {
     Export,
 }
 pub struct TableView {
+    mongo_dirty: bool,
+    mongo_preview: Option<turbodbn_core::mongo::Mutation>,
+    mongo: Option<std::sync::Arc<turbodbn_core::mongo::Projection>>,
+    mongo_tree: Option<Entity<crate::mongo_tree::MongoTree>>,
+    mongo_subscription: Option<Subscription>,
+    mongo_inspect: bool,
+    mongo_epoch: u64,
+    widths: width_ui::Layout,
+    widths_writable: bool,
+    width_revision: u64,
+    width_sender: Option<async_channel::Sender<width_ui::Layout>>,
     notebook: Option<note_results::NotebookContext>,
     redis_cursor: String,
     redis_kind: String,
@@ -84,8 +99,25 @@ pub struct TableView {
     baseline: Option<Rows>,
 }
 impl TableView {
+    pub(crate) fn mongo_unsaved(&self) -> bool {
+        self.mongo_dirty || (self.mongo.is_some() && self.committing)
+    }
+    pub(crate) fn discard_mongo(&mut self, cx: &mut Context<Self>) {
+        if self.committing {
+            return;
+        }
+        self.mongo_dirty = false;
+        self.mongo_preview = None;
+        if let Some(tree) = &self.mongo_tree {
+            tree.update(cx, |tree, cx| tree.finish(true, cx));
+        }
+    }
     pub(crate) fn update_blocked(&self) -> bool {
-        !self.changes.is_empty() || self.committing || self.busy || self.counting
+        !self.changes.is_empty()
+            || self.committing
+            || self.busy
+            || self.counting
+            || self.mongo_pending()
     }
     pub fn new(
         key: String,
@@ -104,6 +136,7 @@ impl TableView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        cx.defer_in(window, |this, _, cx| this.init_widths(cx));
         let note = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -146,6 +179,7 @@ impl TableView {
                 .row_selectable(false)
                 .col_selectable(false)
                 .col_movable(false)
+                .col_resizable(false)
         });
         let highlight_color = default_highlight_color(cx);
         let color_picker =
@@ -158,6 +192,17 @@ impl TableView {
                 this.sync_selection(cx);
             });
         Self {
+            mongo_dirty: false,
+            mongo_preview: None,
+            mongo: None,
+            mongo_tree: None,
+            mongo_subscription: None,
+            mongo_inspect: false,
+            mongo_epoch: 0,
+            widths: Default::default(),
+            widths_writable: true,
+            width_revision: 0,
+            width_sender: None,
             notebook: None,
             redis_cursor: "0".into(),
             redis_kind: String::new(),
@@ -255,6 +300,10 @@ impl TableView {
         cx.notify();
     }
     fn load(&mut self, cx: &mut Context<Self>) {
+        if self.mongo_pending() {
+            crate::feedback::error(t(cx, "mongo.document.pending"), cx);
+            return;
+        }
         if self.target.kind == turbodbn_services::DatabaseKind::Redis {
             self.request(
                 Action::RedisValue {
@@ -300,6 +349,34 @@ impl TableView {
         self.busy = false;
         self.counting = false;
         match result {
+            Ok(Reply::MongoPage(page)) => {
+                self.receive_mongo(page, cx);
+                return;
+            }
+            Ok(Reply::MongoWritten { inserted }) => {
+                self.mongo_dirty = false;
+                self.total = None;
+                if let Some(tree) = &self.mongo_tree {
+                    tree.update(cx, |tree, cx| tree.finish(true, cx));
+                }
+                self.committing = false;
+                crate::feedback::success(
+                    t(
+                        cx,
+                        if inserted {
+                            "mongo.document.inserted"
+                        } else {
+                            "mongo.document.updated"
+                        },
+                    ),
+                    cx,
+                );
+                let view = cx.entity().downgrade();
+                cx.defer(move |cx| {
+                    let _ = view.update(cx, |this, cx| this.load(cx));
+                });
+                return;
+            }
             Ok(Reply::RedisValue(page)) => {
                 self.redis_kind = page.kind.clone();
                 self.redis_ttl = page.ttl;
@@ -383,6 +460,11 @@ impl TableView {
                 self.notice.clear();
             }
             Err(e) => {
+                if let Some(tree) = &self.mongo_tree {
+                    tree.update(cx, |tree, cx| tree.finish(false, cx));
+                }
+                self.committing = false;
+                self.mongo_epoch += 1;
                 self.sync_pager_inputs = true;
                 self.options = self.last_options.clone();
                 self.offset = self.options.offset;
@@ -484,7 +566,21 @@ impl TableView {
         }
     }
     fn export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        match workbench::export_csv(&self.rows) {
+        let mongo_rows = self.mongo.as_ref().map(|data| Rows {
+            columns: self.rows.columns.clone(),
+            values: data
+                .documents
+                .iter()
+                .map(|doc| {
+                    self.rows
+                        .columns
+                        .iter()
+                        .map(|key| doc.get(key).map(ToString::to_string))
+                        .collect()
+                })
+                .collect(),
+        });
+        match workbench::export_csv(mongo_rows.as_ref().unwrap_or(&self.rows)) {
             Ok(text) => save_text(text, "data-page.csv", window, cx),
             Err(e) => {
                 self.notice = crate::locale::message(cx, &e).to_string();
@@ -592,6 +688,7 @@ impl TableView {
         div()
             .relative()
             .size_full()
+            .on_drop(width_ui::drop_width)
             .child(Table::new(&self.grid_state).scrollbar_visible(false, false))
             .when(
                 !self.rows.values.is_empty() || self.insert_count > 0,
@@ -648,6 +745,14 @@ impl TableView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.mongo.is_some() {
+            if let Some((row, col)) = cell {
+                self.open_mongo_node(row, col, cx);
+            }
+            self.json_mode = true;
+            cx.notify();
+            return;
+        }
         let mut rows = self.display_rows();
         if let Some((r, c)) = cell {
             let Some(value) = rows.values.get(r).and_then(|row| row.get(c)).cloned() else {
@@ -678,6 +783,40 @@ impl TableView {
         })
     }
     fn result_content(&self, cx: &Context<Self>) -> AnyElement {
+        if let Some(tree) = &self.mongo_tree {
+            if self.json_mode {
+                return tree.clone().into_any_element();
+            }
+            if self.mongo_inspect {
+                return div()
+                    .v_flex()
+                    .size_full()
+                    .min_h_0()
+                    .child(div().flex_1().min_h_0().child(self.grid(cx)))
+                    .child(
+                        div()
+                            .h(px(300.))
+                            .min_h(px(120.))
+                            .border_t_1()
+                            .border_color(cx.theme().border)
+                            .v_flex()
+                            .min_h_0()
+                            .child(
+                                Button::new("mongo-inspector-close")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Close)
+                                    .tooltip(t(cx, "mongo.node.hide"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.mongo_inspect = false;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(div().flex_1().min_h_0().child(tree.clone())),
+                    )
+                    .into_any_element();
+            }
+        }
         if self.json_mode
             && let Some(document) = &self.document
         {
@@ -715,6 +854,9 @@ impl TableView {
         cx.notify();
     }
     fn select_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mongo.is_some() && !self.select_mongo_node(row, col, cx) {
+            return;
+        }
         self.selected = Some((row, col));
         self.focus.focus(window);
         self.sync_selection(cx);
@@ -800,6 +942,10 @@ impl TableView {
         });
     }
     fn edit_cell(&mut self, row: usize, col: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.mongo.is_some() {
+            self.open_mongo_node(row, col, cx);
+            return;
+        }
         if self.busy || !self.can_edit_row(row) {
             crate::feedback::error(t(cx, "grid.readonly"), cx);
             return;
@@ -1027,6 +1173,11 @@ impl TableView {
     fn can_delete_row(&self, row: usize) -> bool {
         self.can_edit_row(row)
             && (row >= self.rows.values.len()
+                || self
+                    .notebook
+                    .as_ref()
+                    .is_none_or(|n| n.access_mode.allows_note("delete")))
+            && (row >= self.rows.values.len()
                 || self.notebook.as_ref().is_none_or(|n| n.source.complete_row))
     }
     fn delete_row(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1138,6 +1289,22 @@ impl TableView {
         );
     }
     fn copy(&self, row: usize, col: usize, format: &str, cx: &mut App) {
+        if let Some(data) = &self.mongo {
+            if let Some(doc) = data.documents.get(row) {
+                let value = if format == "cell" {
+                    self.rows.columns.get(col).and_then(|k| doc.get(k))
+                } else {
+                    Some(doc)
+                };
+                if let Some(value) = value {
+                    cx.write_to_clipboard(ClipboardItem::new_string(
+                        serde_json::to_string_pretty(value).unwrap_or_default(),
+                    ));
+                    crate::feedback::success(t(cx, "feedback.copied"), cx);
+                }
+            }
+            return;
+        }
         if matches!(format, "sql" | "insert" | "update")
             && self
                 .notebook
@@ -1241,6 +1408,31 @@ impl TableView {
         self.load(cx);
     }
     fn show_details(&self, row: Option<usize>, refresh: bool, cx: &mut App) {
+        if let (Some(row), Some(data)) = (row, self.mongo.as_ref()) {
+            if let Some(doc) = data.documents.get(row) {
+                crate::feedback::details(
+                    crate::feedback::DetailRequest {
+                        inspector: true,
+                        refresh,
+                        title: format!(
+                            "{}.{} · #{}",
+                            self.target.database,
+                            self.target.object.name,
+                            self.offset + row + 1
+                        ),
+                        entries: doc
+                            .as_object()
+                            .into_iter()
+                            .flatten()
+                            .map(|(key, v)| (key.clone(), turbodbn_core::mongo::summary(v)))
+                            .collect(),
+                        text: serde_json::to_string_pretty(doc).unwrap_or_default(),
+                    },
+                    cx,
+                );
+            }
+            return;
+        }
         if let Some(row) = row {
             if !refresh {
                 cx.global_mut::<crate::feedback::InspectorSource>().0 = Some(self.key.clone());
@@ -1400,6 +1592,11 @@ impl Panel for TableView {
 }
 impl Render for TableView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(change) = self.mongo_preview.take() {
+            cx.defer_in(window, move |this, window, cx| {
+                this.preview_mongo(change, window, cx)
+            });
+        }
         let default_color = default_highlight_color(cx);
         if self.highlight_color.is_none()
             && self.color_picker.read(cx).value() != Some(default_color)
@@ -1719,7 +1916,7 @@ impl TableView {
 
 impl TableView {
     fn jump_page(&mut self, page: usize, cx: &mut Context<Self>) {
-        if self.busy || !self.changes.is_empty() {
+        if self.busy || !self.changes.is_empty() || self.mongo_pending() {
             return;
         }
         let Some(offset) = page
@@ -1742,7 +1939,7 @@ impl TableView {
         self.load(cx);
     }
     fn apply_pager_input(&mut self, size: bool, cx: &mut Context<Self>) {
-        if self.busy || !self.changes.is_empty() {
+        if self.busy || !self.changes.is_empty() || self.mongo_pending() {
             return;
         }
         let input = if size {
@@ -1801,9 +1998,10 @@ impl TableView {
             .into_any_element()
     }
     fn toolbar_actions(&self, cx: &Context<Self>) -> AnyElement {
-        let editable = self.target.mode == Mode::Grid
+        let editable = self.mongo.is_none()
+            && self.target.mode == Mode::Grid
             && self.notebook.as_ref().is_none_or(|n| n.source.editable);
-        let locked = self.busy || !self.changes.is_empty();
+        let locked = self.busy || !self.changes.is_empty() || self.mongo_pending();
         div()
             .h_flex()
             .gap_1()
@@ -1915,7 +2113,7 @@ impl TableView {
             .into_any_element()
     }
     fn toolbar_pager(&self, cx: &Context<Self>) -> AnyElement {
-        let locked = self.busy || !self.changes.is_empty();
+        let locked = self.busy || !self.changes.is_empty() || self.mongo_pending();
         div()
             .h_flex()
             .gap_1()
@@ -2106,7 +2304,7 @@ impl TableView {
                 "grid.status",
                 &[
                     ("rows", &self.rows.values.len().to_string()),
-                    ("ms", &self.elapsed_ms.to_string()),
+                    ("ms", &crate::duration::elapsed(self.elapsed_ms)),
                     (
                         "cell",
                         &self
@@ -2198,7 +2396,7 @@ impl TableView {
                     .id("grid-toolbar-details")
                     .flex_shrink_0()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("{} ms", self.elapsed_ms))
+                    .child(crate::duration::elapsed(self.elapsed_ms))
                     .tooltip(move |window, cx| {
                         gpui_component::tooltip::Tooltip::new(details.clone()).build(window, cx)
                     }),

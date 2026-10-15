@@ -47,6 +47,9 @@ pub struct Profile {
     pub port: u16,
     pub user: String,
     pub database: String,
+    pub mongo_auth_source: String,
+    pub mongo_read_only: bool,
+    pub odbc: turbodbn_core::odbc::Options,
     pub driver: Driver,
     pub target_version: String,
     pub charset: String,
@@ -54,7 +57,9 @@ pub struct Profile {
     pub ca: String,
     pub client_cert: String,
     pub client_key: String,
+    pub inherit_timeouts: bool,
     pub timeout_seconds: u64,
+    pub execution_timeout_seconds: u64,
     pub remember_password: bool,
     pub legacy_library: String,
     pub allow_old_auth: bool,
@@ -76,6 +81,9 @@ impl Default for Profile {
             port: 3306,
             user: "root".into(),
             database: String::new(),
+            mongo_auth_source: "admin".into(),
+            mongo_read_only: true,
+            odbc: Default::default(),
             driver: Driver::Auto,
             target_version: "自动检测".into(),
             charset: "utf8mb4".into(),
@@ -83,7 +91,9 @@ impl Default for Profile {
             ca: String::new(),
             client_cert: String::new(),
             client_key: String::new(),
+            inherit_timeouts: false,
             timeout_seconds: 5,
+            execution_timeout_seconds: turbodbn_core::timeouts::DEFAULT_EXECUTION_SECONDS,
             remember_password: false,
             legacy_library: String::new(),
             allow_old_auth: false,
@@ -98,7 +108,20 @@ pub fn valid_charset(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 impl Profile {
+    pub fn execution_timeout(&self) -> Duration {
+        Duration::from_secs(turbodbn_core::timeouts::execution_seconds(Some(
+            self.execution_timeout_seconds,
+        )))
+    }
     pub fn validate(&self) -> Result<(), String> {
+        if !(1..=turbodbn_core::timeouts::MAX_EXECUTION_SECONDS)
+            .contains(&self.execution_timeout_seconds)
+        {
+            return Err("database.timeout.execution_invalid".into());
+        }
+        if self.driver_id == "odbc" {
+            self.odbc.attributes().map_err(str::to_owned)?;
+        }
         if !self.driver_id.is_empty() && self.driver_spec().is_none_or(|d| d.kind != self.kind) {
             return Err("drivers.invalid_identity".into());
         }
@@ -129,6 +152,7 @@ impl Profile {
             &self.host,
             &self.user,
             &self.database,
+            &self.mongo_auth_source,
             &self.target_version,
             &self.ca,
             &self.client_cert,
@@ -316,6 +340,10 @@ pub(crate) fn statement_error(number: u32) -> Option<&'static str> {
     match number {
         1064 => Some(SQL_SYNTAX_ERROR),
         1146 => Some(TABLE_MISSING),
+        1142 | 1143 => Some("mysql.error.command_denied"),
+        1227 => Some("mysql.error.privilege_1227"),
+        1360 => Some("mysql.error.trigger_missing_1360"),
+        1419 => Some("mysql.error.trigger_privilege_1419"),
         _ => None,
     }
 }
@@ -492,6 +520,17 @@ impl Drop for Session {
 }
 impl Session {
     pub fn start(profile: Profile, password: String, test_only: bool) -> (Self, Receiver<Event>) {
+        let profile = profile.resolve_timeouts();
+        if profile
+            .driver_spec()
+            .is_some_and(|d| !crate::driver_packages::enabled(d.id))
+        {
+            let (stop, _) = async_channel::bounded(1);
+            let (commands, _) = async_channel::bounded(1);
+            let (send, output) = async_channel::bounded(1);
+            let _ = send.try_send(Event::Failed("components.disabled".into()));
+            return (Self { stop, commands }, output);
+        }
         // Workspace builds may enable another provider through isolated drivers.
         // Keep existing connection TLS deterministic instead of relying on feature inference.
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -520,6 +559,7 @@ impl Session {
                 match runtime {
                 Ok(runtime)=>runtime.block_on(async{
                     let duration=Duration::from_secs(profile.timeout_seconds.clamp(1,60));
+                    let execution_timeout=profile.execution_timeout();
                     let result=tokio::select!{
                         _=rx.recv()=>return,
                         result=tokio::time::timeout(duration,open(&profile,&password))=>result.unwrap_or_else(|_|Err("连接测试超时，已取消".into())),
@@ -540,7 +580,7 @@ impl Session {
                                     script_session|=matches!(&request.kind,crate::database::OperationKind::Workbench(r) if matches!(r.action,crate::database::workbench::Action::ScriptPrepare{..}|crate::database::workbench::Action::ScriptExecute{..}));
                                     let result=tokio::select!{
                                         _=rx.recv()=>break,
-                                        result=tokio::time::timeout(duration,crate::database::mysql_operation(&mut connection,&profile,&request))=>result,
+                                        result=tokio::time::timeout(execution_timeout,crate::database::mysql_operation(&mut connection,&profile,&request))=>result,
                                     };
                                     match result {Ok(result)=>{let _=events.send(Event::Operation{id,result}).await;},Err(_)=>{
                                         let message=if script_session{"script.error.timeout"}else{"操作超时；建库结果可能已生效，请重连后确认，勿重复提交"};
@@ -591,6 +631,52 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn old_profiles_keep_connect_timeout_and_receive_separate_execution_default() {
+        let p: Profile = serde_json::from_str(r#"{"timeout_seconds":7}"#).unwrap();
+        assert_eq!(p.timeout_seconds, 7);
+        assert_eq!(p.execution_timeout_seconds, 300);
+        let mut p = p;
+        p.execution_timeout_seconds = 3600;
+        p.validate().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Profile>(&serde_json::to_string(&p).unwrap())
+                .unwrap()
+                .execution_timeout_seconds,
+            3600
+        );
+        p.execution_timeout_seconds = 0;
+        assert!(p.validate().is_err());
+    }
+    #[test]
+    fn trigger_server_codes_are_safe_actionable_categories() {
+        assert_eq!(statement_error(1142), Some("mysql.error.command_denied"));
+        assert_eq!(statement_error(1227), Some("mysql.error.privilege_1227"));
+        assert_eq!(
+            statement_error(1360),
+            Some("mysql.error.trigger_missing_1360")
+        );
+        assert_eq!(
+            statement_error(1419),
+            Some("mysql.error.trigger_privilege_1419")
+        );
+    }
+    #[test]
+    fn mongodb_auth_source_retains_legacy_default_and_round_trips() {
+        let old: Profile = serde_json::from_str(
+            r#"{"driver_id":"mongodb","kind":"External","database":"business"}"#,
+        )
+        .unwrap();
+        assert_eq!(old.mongo_auth_source, "admin");
+        let profile = Profile {
+            mongo_auth_source: "account_auth".into(),
+            ..old
+        };
+        let restored: Profile =
+            serde_json::from_str(&serde_json::to_string(&profile).unwrap()).unwrap();
+        assert_eq!(restored.mongo_auth_source, "account_auth");
+        assert_eq!(restored.database, "business");
+    }
     #[test]
     fn metadata_text_decodes_binary_flagged_utf8_without_lossy_fallback() {
         fn packet(socket: &mut std::net::TcpStream, seq: u8, bytes: &[u8]) {

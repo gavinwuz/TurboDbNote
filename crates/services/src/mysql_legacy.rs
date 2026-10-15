@@ -34,6 +34,7 @@ pub fn validate(profile: &Profile) -> Result<(), String> {
     Ok(())
 }
 pub fn start(profile: Profile, password: String, test_only: bool) -> (Session, Receiver<Event>) {
+    let profile = profile.resolve_timeouts();
     let (stop, rx) = async_channel::bounded(1);
     let (commands, requests) = async_channel::bounded::<Operation>(8);
     let (events, out) = async_channel::bounded(8);
@@ -110,6 +111,7 @@ async fn run_process(
     events: Sender<Event>,
 ) -> Result<(), String> {
     let timeout = Duration::from_secs(profile.timeout_seconds.clamp(1, 60));
+    let execution_timeout = profile.execution_timeout();
     let startup_timeout = timeout
         + if profile.kind == crate::DatabaseKind::External {
             Duration::from_secs(30)
@@ -181,7 +183,12 @@ async fn run_process(
                     if bytes.len()>65536 {let _=events.send(Event::Operation{id,result:Err("操作参数过大".into())}).await;continue;}
                     bytes.push(b'\n');input.write_all(&bytes).await.map_err(|_|"兼容进程已断开")?;
                     line.clear();
-                    let reply=tokio::time::timeout(timeout,(&mut output).take(1048577).read_line(&mut line)).await;
+                    let reply=tokio::time::timeout(execution_timeout,(&mut output).take(1048577).read_line(&mut line)).await;
+                    if reply.is_err() {
+                        let script=matches!(&request.kind,OperationKind::Workbench(r) if matches!(r.action,crate::database::workbench::Action::ScriptPrepare{..}|crate::database::workbench::Action::ScriptExecute{..}));
+                        let _=events.send(Event::Operation{id,result:Err(if script{"script.error.timeout"}else{"database.timeout.execution"}.into())}).await;
+                        return Err("兼容操作连接已关闭".into());
+                    }
                     if !matches!(reply,Ok(Ok(n)) if n>0) || line.len()>1048576 {
                         let _=events.send(Event::Operation{id,result:Err("操作超时或响应异常；建库结果可能已生效，请重连确认".into())}).await;
                         return Err("兼容操作连接已关闭".into());
@@ -325,12 +332,13 @@ pub fn worker_main() -> Result<(), String> {
         }
         let handle = Handle { raw, close };
         let timeout = request.profile.timeout_seconds as c_uint;
+        let execution_timeout = request.profile.execution_timeout_seconds as c_uint;
         let tcp: c_uint = 1;
         let disabled: c_uint = 0;
         for (option, value) in [
             (0, &timeout),
-            (11, &timeout),
-            (12, &timeout),
+            (11, &execution_timeout),
+            (12, &execution_timeout),
             (9, &tcp),
             (8, &disabled),
         ] {
@@ -936,7 +944,11 @@ mod tests {
     fn sql_syntax_and_missing_table_have_shared_sanitized_categories() {
         assert_eq!(database_error(1064), crate::mysql::SQL_SYNTAX_ERROR);
         assert_eq!(database_error(1146), crate::mysql::TABLE_MISSING);
-        assert_eq!(crate::mysql::statement_error(1142), None);
+        assert_eq!(
+            crate::mysql::statement_error(1142),
+            Some("mysql.error.command_denied")
+        );
+        assert_eq!(database_error(1142), "mysql.error.command_denied");
     }
     #[test]
     fn chinese_database_names_decode_without_loss() {

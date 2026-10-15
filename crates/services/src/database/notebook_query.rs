@@ -14,6 +14,97 @@ use std::{collections::BTreeSet, ops::ControlFlow, time::Instant};
 mod result_grid;
 pub use result_grid::{GridAction, GridSource, grid_request};
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScriptDiagnostics {
+    pub version: String,
+    pub account: String,
+    pub database: String,
+    pub binary_log: String,
+    pub trust_creators: String,
+    pub grants_available: bool,
+    pub direct_privileges: Vec<String>,
+}
+pub async fn script_diagnostics(
+    c: &mut impl Access,
+    kind: DatabaseKind,
+) -> Result<ScriptDiagnostics, String> {
+    if kind != DatabaseKind::MySql {
+        return Err("script.diagnostics.unsupported".into());
+    }
+    let rows = c
+        .query("SELECT VERSION(), CURRENT_USER(), DATABASE()")
+        .await?;
+    let row = rows
+        .values
+        .first()
+        .filter(|r| r.len() == 3)
+        .ok_or("script.error.execution")?;
+    let value = |i: usize| {
+        row[i]
+            .clone()
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(512)
+            .collect::<String>()
+    };
+    let variables = c
+        .query("SELECT @@GLOBAL.log_bin, @@GLOBAL.log_bin_trust_function_creators")
+        .await
+        .ok();
+    let variable = |i: usize| {
+        variables
+            .as_ref()
+            .and_then(|r| r.values.first())
+            .and_then(|r| r.get(i))
+            .and_then(Option::as_ref)
+            .filter(|v| v.len() <= 8 && v.bytes().all(|b| b.is_ascii_alphanumeric()))
+            .cloned()
+            .unwrap_or_default()
+    };
+    let grants = c.query("SHOW GRANTS").await;
+    let mut direct_privileges = Vec::new();
+    if let Ok(grants) = &grants {
+        for row in &grants.values {
+            if let Some(text) = row.first().and_then(Option::as_deref) {
+                // Never return grant text: older servers can include authentication material.
+                if let Some((privileges, _)) = text.split_once(" ON ")
+                    && let Some(privileges) = privileges.strip_prefix("GRANT ")
+                {
+                    for privilege in privileges.split(',').map(str::trim) {
+                        if [
+                            "ALL PRIVILEGES",
+                            "TRIGGER",
+                            "SUPER",
+                            "SYSTEM_USER",
+                            "SET_USER_ID",
+                            "SYSTEM_VARIABLES_ADMIN",
+                        ]
+                        .contains(&privilege)
+                            && !direct_privileges.iter().any(|v| v == privilege)
+                        {
+                            direct_privileges.push(privilege.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(ScriptDiagnostics {
+        version: value(0),
+        account: value(1),
+        database: value(2),
+        binary_log: variable(0),
+        trust_creators: variable(1),
+        grants_available: grants.is_ok(),
+        direct_privileges,
+    })
+}
+/// In-memory identity only; never persisted or used to authorize different SQL.
+pub fn script_source_fingerprint(sql: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(sql.trim().as_bytes()).into()
+}
 pub const DEFAULT_PAGE_SIZE: usize = 20;
 pub const SCRIPT_MAX_BYTES: usize = workbench::script_context::MAX_BYTES;
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,13 +355,25 @@ pub fn validate_script_statement(kind: DatabaseKind, sql: &str) -> Result<bool, 
     } else {
         sql
     };
-    if kind == DatabaseKind::MySql && workbench::script_context::keys_target(sql)?.is_some() {
+    if kind == DatabaseKind::MySql
+        && (workbench::script_context::keys_target(sql)?.is_some()
+            || workbench::script_context::drop_trigger_target(sql)?.is_some())
+    {
         return Ok(false);
     }
     if kind == DatabaseKind::MySql
         && let Some(control) = workbench::script_context::control(sql)?
     {
         return Ok(!control.confirm());
+    }
+    if kind == DatabaseKind::MySql
+        && let Some((inspection, _)) = workbench::script_context::variable_select(sql)?
+    {
+        let info = inspect(&parse_for(kind, &inspection, true)?, kind)?;
+        if info.functions || info.writes {
+            return Err("script.error.control".into());
+        }
+        return Ok(false);
     }
     if mysql_metadata(kind, sql) {
         return Ok(true);
@@ -299,8 +402,20 @@ pub fn validate_script_target(kind: DatabaseKind, sql: &str, database: &str) -> 
     workbench::script_context::validate_target(kind, sql, database)?;
     if kind == DatabaseKind::MySql {
         let expanded = workbench::script_context::expand(sql, None)?;
-        if let Some(parts) = workbench::script_context::keys_target(&expanded)? {
+        if let Some(parts) = workbench::script_context::drop_trigger_target(&expanded)?
+            .or(workbench::script_context::keys_target(&expanded)?)
+        {
             object(kind, database, &parts).map_err(|_| "script.error.database_mismatch")?;
+            return Ok(());
+        }
+        if let Some((inspection, _)) = workbench::script_context::variable_select(&expanded)? {
+            let info = inspect(&parse_for(kind, &inspection, true)?, kind)?;
+            if info.functions || info.writes {
+                return Err("script.error.control".into());
+            }
+            for parts in info.tables {
+                object(kind, database, &parts).map_err(|_| "script.error.database_mismatch")?;
+            }
             return Ok(());
         }
         if workbench::script_context::control(&expanded)?.is_none() {
@@ -432,13 +547,79 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
 ];
 pub const SCRIPT_COMMANDS: &[(&str, &str, bool)] = &[
     ("script_session", "USE / SET SESSION", true),
-    ("script_transaction", "BEGIN / COMMIT / ROLLBACK", true),
-    ("script_lock", "LOCK / UNLOCK TABLES", false),
+    (
+        "script_transaction",
+        "BEGIN / COMMIT / ROLLBACK / SET TRANSACTION",
+        true,
+    ),
+    (
+        "script_lock",
+        "LOCK / UNLOCK TABLES / SELECT INTO FOR UPDATE",
+        false,
+    ),
+    ("script_drop_trigger", "DROP TRIGGER", false),
+    ("script_variables", "SELECT INTO @variable", false),
 ];
 
+/// Stable, non-sensitive operation label, ignoring leading SQL comments.
+pub fn script_operation_label(sql: &str) -> &'static str {
+    // UI labels must not tokenize an entire multi-megabyte INSERT payload.
+    let sql = sql.get(..sql.len().min(8192)).unwrap_or("");
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let Some(Token::Word(word)) = Tokenizer::new(&MySqlDialect {}, sql)
+        .tokenize()
+        .ok()
+        .and_then(|ts| ts.into_iter().find(|t| !matches!(t, Token::Whitespace(_))))
+    else {
+        return "COMMAND";
+    };
+    if word.quote_style.is_some() {
+        return "COMMAND";
+    }
+    match word.value.to_ascii_uppercase().as_str() {
+        "DROP"
+            if workbench::script_context::drop_trigger_target(sql)
+                .ok()
+                .flatten()
+                .is_some() =>
+        {
+            "DROP TRIGGER"
+        }
+        "INSERT" => "INSERT",
+        "UPDATE" => "UPDATE",
+        "DELETE" => "DELETE",
+        "CREATE" => "CREATE",
+        "ALTER" => "ALTER",
+        "DROP" => "DROP",
+        "TRUNCATE" => "TRUNCATE",
+        "SELECT" => "SELECT",
+        "EXPLAIN" => "EXPLAIN",
+        "SET" => "SET",
+        "USE" => "USE",
+        "BEGIN" => "BEGIN",
+        "COMMIT" => "COMMIT",
+        "ROLLBACK" => "ROLLBACK",
+        _ => "COMMAND",
+    }
+}
 pub fn script_command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
     if kind == DatabaseKind::MySql {
         let expanded = workbench::script_context::expand(sql, None).ok()?;
+        if let Some((_, locked)) = workbench::script_context::variable_select(&expanded).ok()? {
+            return validate_script_statement(kind, sql).ok().map(|_| {
+                if locked {
+                    "script_lock"
+                } else {
+                    "script_variables"
+                }
+            });
+        }
+        if workbench::script_context::drop_trigger_target(&expanded)
+            .ok()?
+            .is_some()
+        {
+            return Some("script_drop_trigger");
+        }
         if workbench::script_context::keys_target(&expanded)
             .ok()?
             .is_some()
@@ -462,6 +643,37 @@ fn script_sql_command(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
     }
 }
 
+/// REPLACE can remove existing rows; Note read/write must not use it to bypass DELETE restrictions.
+pub fn note_mode_allows(
+    mode: crate::access_mode::AccessMode,
+    kind: DatabaseKind,
+    sql: &str,
+    script: bool,
+) -> bool {
+    let command = if script {
+        script_command_required(kind, sql)
+    } else {
+        command_required(kind, sql)
+    };
+    let Some(command) = command else {
+        return false;
+    };
+    if !mode.allows_note(command) {
+        return false;
+    }
+    if command == "insert" && mode != crate::access_mode::AccessMode::Admin {
+        let expanded = if script && kind == DatabaseKind::MySql {
+            match workbench::script_context::expand(sql, None) {
+                Ok(s) => s,
+                Err(_) => return false,
+            }
+        } else {
+            sql.into()
+        };
+        return matches!(parse_for(kind,&expanded,script),Ok(Statement::Insert(insert)) if !insert.replace_into && insert.or!=Some(ast::SqliteOnConflict::Replace));
+    }
+    true
+}
 pub fn command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
     if let Some(key) = extension_required(kind, sql) {
         return Some(key);
@@ -739,6 +951,40 @@ pub async fn prepare_script(
             guards: vec![Guard { object, stamp }],
         });
     }
+    if kind == DatabaseKind::MySql
+        && let Some(parts) = workbench::script_context::drop_trigger_target(&expanded)?
+    {
+        if !crate::mysql::modern_version(version) {
+            return Err("script.error.legacy".into());
+        }
+        let mut target = object(kind, database, &parts)?;
+        target.kind = "trigger".into();
+        let rows = c.query(&format!("SELECT ACTION_STATEMENT,EVENT_MANIPULATION,EVENT_OBJECT_TABLE,ACTION_TIMING,DEFINER,SQL_MODE,CHARACTER_SET_CLIENT,COLLATION_CONNECTION,DATABASE_COLLATION FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA={} AND TRIGGER_NAME={}", workbench::literal_for(kind,database), workbench::literal_for(kind,&target.name))).await?;
+        let stamp = if rows.values.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&rows.values).map_err(|_| "script.error.syntax")?)
+        };
+        return Ok(Plan {
+            sql: sql.trim().into(),
+            read_only: false,
+            confirm: true,
+            guards: vec![Guard {
+                object: target,
+                stamp,
+            }],
+        });
+    }
+    if kind == DatabaseKind::MySql
+        && let Some((inspection, _)) = workbench::script_context::variable_select(&expanded)?
+    {
+        validate_script_statement(kind, &expanded)?;
+        let mut plan = prepare_inner(c, kind, database, version, &inspection, true).await?;
+        plan.sql = sql.trim().into();
+        plan.read_only = false;
+        plan.confirm = true;
+        return Ok(plan);
+    }
     let mut plan = prepare_inner(c, kind, database, version, &expanded, true).await?;
     plan.sql = sql.trim().into();
     Ok(plan)
@@ -961,9 +1207,7 @@ pub async fn execute_script(
             return Err("notes.preview_changed".into());
         }
         if !empty {
-            c.query(&expanded)
-                .await
-                .map_err(|_| "script.error.execution")?;
+            c.query(&expanded).await?;
         }
         return Ok(ResultPage {
             execution: Some(Box::new(ExecutionSummary {
@@ -981,15 +1225,42 @@ pub async fn execute_script(
             read_only: plan.read_only,
         });
     }
+    if kind == DatabaseKind::MySql
+        && (workbench::script_context::drop_trigger_target(&expanded)?.is_some()
+            || workbench::script_context::variable_select(&expanded)?.is_some())
+    {
+        let start = Instant::now();
+        c.query(&expanded).await?;
+        return Ok(ResultPage {
+            execution: Some(Box::new(ExecutionSummary {
+                operation:
+                    if workbench::script_context::drop_trigger_target(&expanded)?.is_some() {
+                        "DROP TRIGGER"
+                    } else {
+                        "SELECT INTO"
+                    }
+                    .into(),
+                status: "succeeded".into(),
+                objects: plan.guards.iter().map(|g| g.object.clone()).collect(),
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                ..Default::default()
+            })),
+            affected_rows: None,
+            grid: None,
+            rows: Rows::default(),
+            more: false,
+            offset: 0,
+            elapsed_ms: start.elapsed().as_millis() as u64,
+            read_only: false,
+        });
+    }
     let mut expanded_plan = plan.clone();
     expanded_plan.sql = expanded;
     if kind == DatabaseKind::MySql
         && workbench::script_context::keys_target(&expanded_plan.sql)?.is_some()
     {
         let start = Instant::now();
-        c.query(&expanded_plan.sql)
-            .await
-            .map_err(|_| "script.error.execution")?;
+        c.query(&expanded_plan.sql).await?;
         return Ok(ResultPage {
             execution: Some(Box::new(ExecutionSummary {
                 operation: "ALTER".into(),
@@ -1997,6 +2268,268 @@ mod tests {
 #[cfg(test)]
 mod command_policy_tests {
     use super::*;
+    #[test]
+    fn read_only_diagnostics_never_return_grant_authentication_material() {
+        struct Fake {
+            requests: Vec<String>,
+        }
+        impl Access for Fake {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                self.requests.push(sql.into());
+                let rows = if sql == "SHOW GRANTS" {
+                    Rows{columns:vec!["grants".into()],values:vec![vec![Some("GRANT SELECT, TRIGGER ON app.* TO user IDENTIFIED BY 'fixture-only'".into())],vec![Some("GRANT `some_role` TO user".into())]]}
+                } else if sql.starts_with("SELECT @@GLOBAL") {
+                    Rows {
+                        columns: vec!["binlog".into(), "trust".into()],
+                        values: vec![vec![Some("1".into()), Some("0".into())]],
+                    }
+                } else {
+                    Rows {
+                        columns: vec!["v".into(); 3],
+                        values: vec![vec![
+                            Some("8.4.5".into()),
+                            Some("fixture@localhost".into()),
+                            Some("app".into()),
+                        ]],
+                    }
+                };
+                Box::pin(async move { Ok(rows) })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut c = Fake { requests: vec![] };
+                let report = script_diagnostics(&mut c, DatabaseKind::MySql)
+                    .await
+                    .unwrap();
+                assert_eq!(report.direct_privileges, vec!["TRIGGER"]);
+                assert!(report.grants_available);
+                let json = serde_json::to_string(&report).unwrap();
+                assert!(!json.contains("fixture-only"));
+                assert!(!json.contains("IDENTIFIED"));
+                assert_eq!(c.requests.len(), 3);
+                assert!(c.requests[0].starts_with("SELECT VERSION()"));
+                assert!(c.requests[1].starts_with("SELECT @@GLOBAL"));
+                assert_eq!(c.requests[2], "SHOW GRANTS");
+                let before = c.requests.len();
+                assert!(
+                    script_diagnostics(&mut c, DatabaseKind::Sqlite)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(c.requests.len(), before);
+                assert_ne!(
+                    script_source_fingerprint("DROP TRIGGER a"),
+                    script_source_fingerprint("DROP TRIGGER b")
+                );
+            });
+    }
+    #[test]
+    fn script_errors_and_labels_preserve_safe_server_categories() {
+        assert_eq!(
+            script_operation_label("-- comment\n/* DDL */ DROP TRIGGER IF EXISTS t;"),
+            "DROP TRIGGER"
+        );
+        struct Denied;
+        impl Access for Denied {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                let result = if sql == "SELECT @@SESSION.sql_mode" {
+                    Ok(Rows {
+                        columns: vec!["mode".into()],
+                        values: vec![vec![Some(String::new())]],
+                    })
+                } else if sql.starts_with("SELECT ACTION_STATEMENT") {
+                    Ok(Rows::default())
+                } else {
+                    Err("mysql.error.privilege_1227".into())
+                };
+                Box::pin(async move { result })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut c = Denied;
+                let plan = prepare_script(
+                    &mut c,
+                    DatabaseKind::MySql,
+                    "app",
+                    "8.4.5",
+                    "DROP TRIGGER IF EXISTS t",
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    execute_script(&mut c, DatabaseKind::MySql, "app", "8.4.5", &plan, true)
+                        .await
+                        .unwrap_err(),
+                    "mysql.error.privilege_1227"
+                );
+            });
+    }
+    #[test]
+    fn script_variables_and_isolation_are_narrow_and_script_only() {
+        for (sql, key) in [
+            (
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;",
+                "script_transaction",
+            ),
+            ("SET @active_generation = 0;", "script_variables"),
+            (
+                "SET @new_generation = @active_generation + 1;",
+                "script_variables",
+            ),
+            (
+                "SELECT COALESCE(MAX(`id`), 0) INTO @delta_watermark FROM `recruit_post_count_delta`;",
+                "script_variables",
+            ),
+            (
+                "SELECT `active_generation` INTO @active_generation FROM `recruit_post_count_meta` WHERE `id` = 1 FOR UPDATE;",
+                "script_lock",
+            ),
+        ] {
+            assert_eq!(
+                script_command_required(DatabaseKind::MySql, sql),
+                Some(key),
+                "{sql}"
+            );
+            assert_eq!(
+                validate_script_statement(DatabaseKind::MySql, sql),
+                Ok(false),
+                "{sql}"
+            );
+            assert!(
+                parse(DatabaseKind::MySql, sql)
+                    .and_then(|s| inspect(&s, DatabaseKind::MySql))
+                    .is_err()
+            );
+        }
+        for sql in [
+            "SET GLOBAL TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            "SET @a = dangerous_udf()",
+            "SELECT id INTO OUTFILE '/tmp/out' FROM t",
+            "SELECT dangerous_udf() INTO @a FROM t",
+            "SELECT id INTO @a FROM other.t",
+            "SELECT id INTO @a FROM t; DELETE FROM t",
+        ] {
+            assert!(
+                validate_script_statement(DatabaseKind::MySql, sql).is_err()
+                    || validate_script_target(DatabaseKind::MySql, sql, "app").is_err(),
+                "{sql}"
+            );
+        }
+    }
+    #[test]
+    fn trigger_deletion_is_script_only_and_requires_unchanged_metadata() {
+        let sql = "-- dump\nDROP TRIGGER IF EXISTS `app`.`sample_trigger`;";
+        assert_eq!(
+            script_command_required(DatabaseKind::MySql, sql),
+            Some("script_drop_trigger")
+        );
+        assert!(command_required(DatabaseKind::MySql, sql).is_none());
+        assert_eq!(
+            validate_script_statement(DatabaseKind::MySql, sql),
+            Ok(false)
+        );
+        assert!(validate_script_target(DatabaseKind::MySql, sql, "other").is_err());
+        for bad in [
+            "DROP TRIGGER",
+            "DROP TRIGGER IF t",
+            "DROP TRIGGER a,b",
+            "DROP TRIGGER a CASCADE",
+            "DROP TRIGGER a; DELETE FROM t",
+        ] {
+            assert!(validate_script_statement(DatabaseKind::MySql, bad).is_err());
+        }
+        struct Fake {
+            stamp: String,
+            writes: usize,
+        }
+        impl Access for Fake {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                let rows = if sql == "SELECT @@SESSION.sql_mode" {
+                    Rows {
+                        columns: vec!["mode".into()],
+                        values: vec![vec![Some(String::new())]],
+                    }
+                } else if sql.starts_with("SELECT ACTION_STATEMENT") {
+                    Rows {
+                        columns: vec!["definition".into()],
+                        values: vec![vec![Some(self.stamp.clone())]],
+                    }
+                } else if sql.starts_with("SHOW CREATE TABLE") {
+                    Rows {
+                        columns: vec!["Table".into(), "Create Table".into()],
+                        values: vec![vec![
+                            Some("t".into()),
+                            Some("CREATE TABLE t(id INT)".into()),
+                        ]],
+                    }
+                } else {
+                    self.writes += 1;
+                    Rows::default()
+                };
+                Box::pin(async move { Ok(rows) })
+            }
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut c = Fake {
+                    stamp: "original".into(),
+                    writes: 0,
+                };
+                let plan = prepare_script(&mut c, DatabaseKind::MySql, "app", "8.4.5", sql)
+                    .await
+                    .unwrap();
+                assert!(plan.confirm && !plan.read_only);
+                assert_eq!(plan.guards[0].object.kind, "trigger");
+                assert!(
+                    execute_script(&mut c, DatabaseKind::MySql, "app", "8.4.5", &plan, false)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(c.writes, 0);
+                c.stamp = "changed".into();
+                assert!(
+                    execute_script(&mut c, DatabaseKind::MySql, "app", "8.4.5", &plan, true)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(c.writes, 0);
+                c.stamp = "original".into();
+                let result =
+                    execute_script(&mut c, DatabaseKind::MySql, "app", "8.4.5", &plan, true)
+                        .await
+                        .unwrap();
+                assert_eq!(c.writes, 1);
+                assert_eq!(result.execution.unwrap().operation, "DROP TRIGGER");
+                let sql = "SELECT COALESCE(MAX(id),0) INTO @watermark FROM t FOR UPDATE";
+                let plan = prepare_script(&mut c, DatabaseKind::MySql, "app", "8.4.5", sql)
+                    .await
+                    .unwrap();
+                assert_eq!(plan.sql, sql);
+                assert!(plan.confirm && !plan.read_only);
+                assert!(
+                    execute_script(&mut c, DatabaseKind::MySql, "app", "8.4.5", &plan, false)
+                        .await
+                        .is_err()
+                );
+                let result =
+                    execute_script(&mut c, DatabaseKind::MySql, "app", "8.4.5", &plan, true)
+                        .await
+                        .unwrap();
+                assert_eq!(result.execution.unwrap().operation, "SELECT INTO");
+                assert_eq!(c.writes, 2);
+            });
+    }
     #[test]
     fn mysql_dump_keys_require_alter_confirmation_and_recheck_schema() {
         let sql = "/*!40000 ALTER TABLE `account` ENABLE KEYS */;";

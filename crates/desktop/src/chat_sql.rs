@@ -177,7 +177,7 @@ impl ChatView {
                 let owner = owner.clone();
                 let p = p.clone();
                 menu = menu.item(
-                    PopupMenuItem::new(p.name.clone()).on_click(move |_, _, cx| {
+                    crate::connection_choice::item(&p).on_click(move |_, _, cx| {
                         let _ = owner.update(cx, |this, cx| {
                             if this.busy {
                                 return;
@@ -206,7 +206,7 @@ impl ChatView {
                     }),
                 );
             }
-            menu.scrollable(true).max_h(px(320.))
+            menu.scrollable(true).min_w(px(360.)).max_h(px(320.))
         }
     }
     pub(super) fn sql_database_menu(

@@ -27,7 +27,7 @@ impl Adapter {
         validate_profile(&p)?;
         let driver = string(&p, "driver_id").to_owned();
         let backend = match driver.as_str() {
-            "access" | "sqlserver" | "oracle" | "db2" => {
+            "access" | "sqlserver" | "oracle" | "db2" | "odbc" => {
                 Backend::Relational(Relational::connect(&p, password).await?)
             }
             "elasticsearch" | "tdengine" => Backend::Http(Http::new(&p, password)?),
@@ -35,7 +35,23 @@ impl Adapter {
             "cassandra" => Backend::Cassandra(Box::new(Cassandra::connect(&p, password).await?)),
             _ => return Err("drivers.invalid_identity"),
         };
-        let db = if driver == "access" {
+        let db = if driver == "odbc" {
+            if let Backend::Relational(Relational::Odbc(c)) = &backend {
+                c.current_catalog()
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        let dsn = string(&p["odbc"], "dsn");
+                        if dsn.is_empty() {
+                            "ODBC".into()
+                        } else {
+                            dsn.into()
+                        }
+                    })
+            } else {
+                return Err(FAILED);
+            }
+        } else if driver == "access" {
             std::path::Path::new(string(&p, "sqlite_path"))
                 .file_name()
                 .ok_or(FAILED)?
@@ -57,15 +73,8 @@ impl Adapter {
     async fn query(&mut self, sql: &str, maximum: usize) -> Result<Rows> {
         match &mut self.backend {
             Backend::Relational(c) => {
-                c.query(
-                    sql,
-                    maximum,
-                    self.p["timeout_seconds"]
-                        .as_u64()
-                        .unwrap_or(10)
-                        .clamp(1, 60) as usize,
-                )
-                .await
+                c.query(sql, maximum, execution_seconds(&self.p) as usize)
+                    .await
             }
             Backend::Http(c) if self.driver == "tdengine" => c.sql(&self.db, sql, maximum).await,
             Backend::Cassandra(c) => c.query_bounded(sql, maximum).await,
@@ -75,10 +84,10 @@ impl Adapter {
     pub async fn ping(&mut self) -> Result<()> {
         match &self.backend {
             Backend::Mongo(c) => {
-                c.database("admin")
+                c.database(crate::document::mongo_ping_database(&self.p))
                     .run_command(doc! {"ping":1})
                     .await
-                    .map_err(|_| FAILED)?;
+                    .map_err(crate::document::mongo_error)?;
             }
             Backend::Http(c) if self.driver == "elasticsearch" => {
                 let v = c.request(&[], None, "").await?;
@@ -89,7 +98,7 @@ impl Adapter {
             }
             _ => {
                 let sql = match self.driver.as_str() {
-                    "access" => return Ok(()),
+                    "access" | "odbc" => return Ok(()),
                     "oracle" => "SELECT 1 FROM DUAL",
                     "db2" => "SELECT 1 FROM SYSIBM.SYSDUMMY1",
                     "cassandra" => "SELECT release_version FROM system.local",
@@ -108,8 +117,9 @@ impl Adapter {
         match &self.backend {
             Backend::Mongo(c) => Ok(c
                 .list_database_names()
+                .authorized_databases(true)
                 .await
-                .map_err(|_| FAILED)?
+                .map_err(crate::document::mongo_error)?
                 .into_iter()
                 .take(512)
                 .collect()),
@@ -197,8 +207,8 @@ impl Adapter {
                     .map(|n| object("", n, "table"))
                     .collect());
             }
-            Backend::Relational(c) if self.driver == "access" => {
-                for r in c.access_catalog()?.values {
+            Backend::Relational(c) if ["access", "odbc"].contains(&self.driver.as_str()) => {
+                for r in c.odbc_catalog(self.driver == "odbc")?.values {
                     if !at(&r, 2).starts_with("MSys") {
                         objects.push(object(
                             at(&r, 1),
@@ -237,11 +247,16 @@ impl Adapter {
         let name = qualified(obj, &self.driver)?;
         let table = literal(string(obj, "name"));
         let owner = literal(string(obj, "schema"));
-        let columns = if self.driver == "access" {
+        let columns = if ["access", "odbc"].contains(&self.driver.as_str()) {
             if let Backend::Relational(c) = &self.backend {
-                c.access_columns(string(obj, "name"))?
+                c.odbc_columns(string(obj, "schema"), string(obj, "name"))?
                     .values
                     .iter()
+                    .filter(|r| {
+                        at(r, 2) == string(obj, "name")
+                            && (string(obj, "schema").is_empty()
+                                || at(r, 1) == string(obj, "schema"))
+                    })
                     .map(|r| column(at(r, 3), at(r, 5), at(r, 11)))
                     .collect()
             } else {
@@ -314,11 +329,25 @@ impl Adapter {
     async fn page(&mut self, obj: &Value, options: &Value) -> Result<Value> {
         let started = std::time::Instant::now();
         let (size, offset) = page_options(options)?;
+        if let Backend::Mongo(c) = &self.backend {
+            let page =
+                crate::document::mongo_page(c, &self.db, string(obj, "name"), size, offset).await?;
+            return Ok(json!({"MongoPage":page}));
+        }
+        if self.driver == "odbc"
+            && let Backend::Relational(c) = &mut self.backend
+        {
+            let rows = c.odbc_page(obj, size + 1, offset, execution_seconds(&self.p) as usize)?;
+            let more = rows.values.len() > size;
+            let mut rows = rows;
+            rows.values.truncate(size);
+            let metadata = self.schema(obj, false).await?;
+            return Ok(
+                json!({"GridPage":{"rows":rows.json(),"schema":metadata,"offset":offset,"more":more,"sql":"","next":null,"elapsed_ms":started.elapsed().as_millis() as u64,"keyset":false}}),
+            );
+        }
         let mut cursor_more = None;
         let mut rows = match &mut self.backend {
-            Backend::Mongo(c) => {
-                crate::document::mongo_page(c, &self.db, string(obj, "name"), size, offset).await?
-            }
             Backend::Http(c) if self.driver == "elasticsearch" => {
                 if offset + size as u64 + 1 > 10000 {
                     return Err(TOO_LARGE);
@@ -403,7 +432,18 @@ impl Adapter {
             return Ok(json!({"Workbench":{"Catalog":{"objects":objects,"notice":notice}}}));
         }
         self.switch(string(request, "database")).await?;
-        let result = if let Some(v) = action.get("GridPage") {
+        let result = if let Some(v) = action.get("MongoWrite") {
+            if self.p["mongo_read_only"].as_bool() != Some(false) {
+                return Err("mongo.document.denied");
+            }
+            let Backend::Mongo(c) = &self.backend else {
+                return Err(UNSUPPORTED);
+            };
+            let change: turbodbn_core::mongo::Mutation =
+                serde_json::from_value(v.clone()).map_err(|_| "mongo.document.invalid")?;
+            let inserted = crate::document::mongo_write(c, &self.db, &change).await?;
+            json!({"MongoWritten":{"inserted":inserted}})
+        } else if let Some(v) = action.get("GridPage") {
             self.page(&v["object"], &v["options"]).await?
         } else if let Some(v) = action.get("Count") {
             let obj = &v["object"];

@@ -5,7 +5,6 @@ use gpui_component::{
     ActiveTheme, Disableable, IconName, Selectable, StyledExt, WindowExt,
     button::Button,
     dock::{Panel, PanelEvent},
-    menu::{DropdownMenu, PopupMenuItem},
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -22,7 +21,6 @@ pub enum SettingsRequest {
     Open(Option<Category>),
     Close,
     CancelClose,
-    ReturnToChat,
 }
 impl EventEmitter<SettingsRequest> for ChatView {}
 pub struct SettingsView {
@@ -239,62 +237,7 @@ impl Render for SettingsView {
                     }),
             );
             let content = if self.database_tab == 2 {
-                let group = self.drivers.read(cx).selected_group;
-                let label = turbodbn_services::driver_catalog::GROUPS
-                    .iter()
-                    .find(|(id, _)| *id == group)
-                    .map(|(_, label)| *label)
-                    .unwrap_or("drivers.group.all");
-                let drivers = self.drivers.clone();
-                let mut list = div().v_flex().gap_2().child(
-                    Button::new("settings-driver-group")
-                        .label(t(cx, label))
-                        .dropdown_caret(true)
-                        .dropdown_menu(move |mut menu, _, cx| {
-                            for &(id, label) in turbodbn_services::driver_catalog::GROUPS {
-                                let drivers = drivers.clone();
-                                menu = menu.item(PopupMenuItem::new(t(cx, label)).on_click(
-                                    move |_, _, cx| {
-                                        drivers.update(cx, |this, cx| {
-                                            this.selected_group = id;
-                                            cx.notify();
-                                        })
-                                    },
-                                ));
-                            }
-                            menu
-                        }),
-                );
-                for driver in turbodbn_services::driver_catalog::DRIVERS
-                    .iter()
-                    .filter(|d| d.in_group(group))
-                {
-                    let kind = driver.kind;
-                    list = list.child(
-                        div()
-                            .h_flex()
-                            .gap_3()
-                            .p_3()
-                            .border_b_1()
-                            .border_color(cx.theme().border)
-                            .child(driver.name)
-                            .child(div().flex_1())
-                            .child(if kind == turbodbn_services::DatabaseKind::MySql {
-                                crate::locale::tr(
-                                    cx,
-                                    "drivers.mysql_status",
-                                    &[(
-                                        "compat",
-                                        t(cx, self.drivers.read(cx).status_key()).as_ref(),
-                                    )],
-                                )
-                            } else if kind == turbodbn_services::DatabaseKind::External {
-                                t(cx, turbodbn_services::external_driver::status_key())
-                            } else {
-                                t(cx, "settings2.builtin")
-                            }),
-                    );
-                }
+                let list = div().child(self.drivers.read(cx).components.clone());
                 list.child(
                     Button::new("legacy-driver-settings")
                         .icon(IconName::Settings2)
@@ -584,17 +527,6 @@ impl Render for SettingsView {
                             ))
                         },
                     ),
-            )
-            .child(
-                Button::new("return-chat")
-                    .icon(IconName::ArrowRight)
-                    .label(t(cx, "chat.action.return"))
-                    .on_click({
-                        let chat = self.chat.clone();
-                        move |_, _, cx| {
-                            chat.update(cx, |_, cx| cx.emit(SettingsRequest::ReturnToChat))
-                        }
-                    }),
             )
     }
 }

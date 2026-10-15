@@ -2,29 +2,7 @@ use super::*;
 use crate::{feedback::SqlScope, locale::t};
 use turbodbn_services::database::notebook_query::COMMANDS;
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
-pub(super) enum AccessMode {
-    #[default]
-    ReadOnly,
-    ReadWrite,
-    Admin,
-}
-impl AccessMode {
-    fn label(self) -> &'static str {
-        match self {
-            Self::ReadOnly => "mcp.mode.read",
-            Self::ReadWrite => "mcp.mode.write",
-            Self::Admin => "mcp.mode.admin",
-        }
-    }
-    pub fn allows(self, command: &str) -> bool {
-        match command {
-            "select" | "explain" | "show_create" | "show_columns" => true,
-            "insert" | "update" | "delete" => self != Self::ReadOnly,
-            _ => self == Self::Admin && COMMANDS.iter().any(|(key, _, _)| *key == command),
-        }
-    }
-}
+pub(super) use turbodbn_services::access_mode::AccessMode;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReviewState {
     Waiting,
@@ -373,7 +351,7 @@ impl ChatView {
                             "mcp.card.summary",
                             &[
                                 ("rows", &card.rows.to_string()),
-                                ("ms", &card.elapsed_ms.to_string()),
+                                ("ms", &crate::duration::elapsed(card.elapsed_ms)),
                             ],
                         ));
                     }

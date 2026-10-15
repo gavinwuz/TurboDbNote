@@ -27,7 +27,7 @@ A native SQL Notebook and database workbench built with Rust and GPUI. Write SQL
 | Analytics / time series | ClickHouse, Apache Doris, TDengine |
 | NoSQL / search | Redis, MongoDB, Cassandra, Elasticsearch |
 
-Capabilities vary. Note SQL execution supports MySQL/PostgreSQL/SQLite. External adapters offer connection, object browsing and bounded read-only previews; Doris is read-only. Access/DB2 require the corresponding ODBC provider; Oracle requires OCI. See [driver capabilities and prerequisites](docs/database-drivers.md).
+Capabilities vary. Note SQL execution supports MySQL/PostgreSQL/SQLite. External adapters offer connection, object browsing and bounded previews; MongoDB additionally supports explicitly enabled, confirmed document writes. Doris is read-only. Access/DB2 require the corresponding ODBC provider; Oracle requires OCI. See [driver capabilities and prerequisites](docs/database-drivers.md).
 
 MySQL database detection reads binary-flagged UTF-8 metadata without treating encoding failures as permission failures. Notes support bounded `SHOW DATABASES`/`SHOW SCHEMAS`, plus literal `LIKE` filters for `SHOW TABLES`/`SHOW STATUS`/`SHOW VARIABLES`; STATUS/VARIABLES also accept SESSION/GLOBAL scope. These commands honor Settings → Database → SQL permissions and do not change server grants.
 
@@ -86,3 +86,23 @@ Note MySQL script execution supports a single database, bounded UTF-8 session se
 SQL file exports create ordinary tables only if missing (`IF NOT EXISTS`); existing structures are not compared or changed, and data statements retain their original behavior.
 
 Script cells show cumulative execution statistics and the latest 500 statement details, retain the latest genuine query result, and read up to 512 fields for a selected table on demand. Unknown counts are explicit; affected rows are not committed totals. MySQL conditional creation uses server diagnostics to distinguish new and skipped tables.
+
+Driver settings support version-matched downloads, trusted offline ZIP imports, dependency probes and persisted enable switches. Releases provide full/minimal distributions and reusable offline component packages; external drivers use Rust worker processes, with OCI/ODBC prerequisites where applicable.
+
+Connection URLs can be pasted one per line (up to 100 / 64 KiB), previewed and opened as independent editable drafts without connecting. Supported schemes: MySQL/MariaDB, PostgreSQL, Redis/rediss, ClickHouse and single-host MongoDB. Passwords are masked and remain in memory until an explicit save; unsupported parameters prevent that row from being imported. New MongoDB forms use the default database for authentication unless overridden under Advanced; imported URLs and existing records retain their explicit authentication source.
+
+MongoDB collections now support typed top-level field columns and a linked virtual document tree. Objects/arrays use bounded summaries; copying and CSV export retain complete canonical EJSON values. Node menus provide copying, lazy expansion, staged edits and clone drafts. MongoDB connections remain read-only by default; explicitly disable read-only under Advanced, save and reconnect to enable confirmed single-document updates/clones. Updates compare the original document and never automatically retry. Shared data grids use a drag guide and apply column width once on drop; numeric/fit/reset actions are in column menus and widths are stored locally.
+
+Connection URL help provides masked examples and supports MySQL `@tcp(host:port)` DSN-style URLs. Go-specific `interpolateParams`, `parseTime` and `loc` options are explained before importing; such rows are unselected until the user explicitly accepts TurboDBNote behavior. Settings uses normal tab navigation; driver readiness details and missing prerequisites are collapsible, and enablement uses switches.
+
+Generic ODBC now supports existing x64 DSNs or installed driver names with validated non-secret parameters, read-only catalogs/columns and bounded data previews. Windows full/component packages include the official offline Db2 CLI archive and manual registration instructions; no driver is registered automatically. See [database drivers](docs/database-drivers.md).
+
+Imported MySQL scripts can execute `DROP TRIGGER [IF EXISTS]` after enabling the script-only permission and explicitly authorizing the batch. Trigger metadata is rechecked before execution; ordinary SQL cells remain unchanged.
+
+MySQL scripts additionally support transaction isolation and bounded SET user-variable / SELECT INTO forms; locking SELECT uses the script lock permission. These remain unavailable to ordinary SQL cells.
+
+Note connection selectors show environment, driver and address. Each open Note has independent Read only / Read-write / DBA restrictions beneath global SQL settings. Script previews separate leading comments and actual SQL; failures offer explicit, read-only MySQL diagnostics without changing server policy.
+
+Connection timeout and per-operation timeout are independent (existing connection value retained; execution defaults to 300 seconds). Note Read/write permits INSERT/UPDATE; DELETE requires DBA. Elapsed UI values adapt between ms, seconds and minutes; journals retain milliseconds. External components now require protocol 5.
+
+Global default timeouts are available under Settings → Database → Query. New connections inherit them; existing custom values are retained. Note permission messages provide scoped actions to switch mode, open global SQL settings or choose a writable connection, without running SQL automatically.

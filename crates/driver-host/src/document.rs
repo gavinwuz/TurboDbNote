@@ -6,7 +6,10 @@ use mongodb::{
     options::{ClientOptions, Credential, ServerAddress, Tls, TlsOptions},
 };
 use scylla::{
-    client::{PoolSize, session::Session, session_builder::SessionBuilder},
+    client::{
+        PoolSize, execution_profile::ExecutionProfile, session::Session,
+        session_builder::SessionBuilder,
+    },
     response::{PagingState, PagingStateResponse},
     statement::unprepared::Statement,
 };
@@ -40,9 +43,10 @@ impl Http {
         let mut builder = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(
+            .connect_timeout(Duration::from_secs(
                 p["timeout_seconds"].as_u64().unwrap_or(10).clamp(1, 60),
-            ));
+            ))
+            .timeout(Duration::from_secs(execution_seconds(p)));
         if string(p, "tls") == "Required" {
             builder = builder.danger_accept_invalid_certs(true);
         }
@@ -141,6 +145,28 @@ impl Http {
         Ok(rows)
     }
 }
+pub fn mongo_auth_source(p: &Value) -> &str {
+    let source = string(p, "mongo_auth_source").trim();
+    if source.is_empty() { "admin" } else { source }
+}
+pub fn mongo_ping_database(p: &Value) -> &str {
+    let database = string(p, "database");
+    if database.is_empty() {
+        mongo_auth_source(p)
+    } else {
+        database
+    }
+}
+pub fn mongo_error(error: mongodb::error::Error) -> &'static str {
+    use mongodb::error::ErrorKind;
+    match error.kind.as_ref() {
+        ErrorKind::Authentication { .. } => "mongo.error.authentication",
+        ErrorKind::Command(command) if command.code == 18 => "mongo.error.authentication",
+        ErrorKind::Command(command) if command.code == 13 => "mongo.error.permission",
+        ErrorKind::Io(_) | ErrorKind::ServerSelection { .. } => "mongo.error.network",
+        _ => FAILED,
+    }
+}
 pub async fn mongo(p: &Value, password: &str) -> Result<Client> {
     if !string(p, "client_cert").is_empty() {
         return Err("drivers.tls_options_unsupported");
@@ -162,7 +188,7 @@ pub async fn mongo(p: &Value, password: &str) -> Result<Client> {
             Credential::builder()
                 .username(string(p, "user").to_owned())
                 .password(password.to_owned())
-                .source("admin".to_owned())
+                .source(mongo_auth_source(p).to_owned())
                 .build(),
         );
     }
@@ -178,12 +204,12 @@ pub async fn mongo(p: &Value, password: &str) -> Result<Client> {
                 .build(),
         ));
     }
-    let client = Client::with_options(options).map_err(|_| FAILED)?;
+    let client = Client::with_options(options).map_err(mongo_error)?;
     client
-        .database("admin")
+        .database(mongo_ping_database(p))
         .run_command(doc! {"ping":1})
         .await
-        .map_err(|_| FAILED)?;
+        .map_err(mongo_error)?;
     Ok(client)
 }
 pub async fn mongo_page(
@@ -192,7 +218,8 @@ pub async fn mongo_page(
     name: &str,
     size: usize,
     offset: u64,
-) -> Result<Rows> {
+) -> Result<turbodbn_core::mongo::Page> {
+    let started = std::time::Instant::now();
     let mut cursor = c
         .database(db)
         .collection::<Document>(name)
@@ -201,16 +228,88 @@ pub async fn mongo_page(
         .limit((size + 1) as i64)
         .batch_size(1)
         .await
-        .map_err(|_| FAILED)?;
-    let mut rows = Rows::new(vec!["document".into()])?;
-    while let Some(doc) = cursor.try_next().await.map_err(|_| FAILED)? {
-        rows.push(vec![Some(
-            mongodb::bson::Bson::Document(doc)
-                .into_relaxed_extjson()
-                .to_string(),
-        )])?;
+        .map_err(mongo_error)?;
+    let mut documents = Vec::new();
+    let mut bytes = 0;
+    let mut more = false;
+    while let Some(doc) = cursor.try_next().await.map_err(mongo_error)? {
+        if documents.len() == size {
+            more = true;
+            break;
+        }
+        let source = mongodb::bson::Bson::Document(doc)
+            .into_canonical_extjson()
+            .to_string();
+        if source.len() > turbodbn_core::mongo::DOCUMENT_BYTES {
+            return Err(TOO_LARGE);
+        }
+        bytes += source.len();
+        if bytes > turbodbn_core::mongo::PAGE_BYTES {
+            return Err(TOO_LARGE);
+        }
+        documents.push(source);
     }
-    Ok(rows)
+    Ok(turbodbn_core::mongo::Page {
+        documents,
+        offset: offset as usize,
+        more,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+pub async fn mongo_write(
+    c: &Client,
+    db: &str,
+    change: &turbodbn_core::mongo::Mutation,
+) -> Result<bool> {
+    let (old, new) = turbodbn_core::mongo::validate_mutation(change)?;
+    let mut collections = c
+        .database(db)
+        .list_collections()
+        .filter(doc! {"name":&change.collection})
+        .await
+        .map_err(mongo_error)?;
+    let collection = collections
+        .try_next()
+        .await
+        .map_err(mongo_error)?
+        .ok_or("mongo.document.denied")?;
+    if collection.collection_type != mongodb::results::CollectionType::Collection
+        || collection.info.read_only
+    {
+        return Err("mongo.document.denied");
+    }
+    let old = mongodb::bson::Bson::try_from(old).map_err(|_| "mongo.document.invalid")?;
+    let new = mongodb::bson::Bson::try_from(new).map_err(|_| "mongo.document.invalid")?;
+    let (Some(old), Some(new)) = (old.as_document(), new.as_document()) else {
+        return Err("mongo.document.invalid");
+    };
+    // A round-trip validates canonical BSON wrappers and immutable identity after decoding.
+    if !change.clone_document && (old.get("_id").is_none() || old.get("_id") != new.get("_id")) {
+        return Err("mongo.document.id_immutable");
+    }
+    let target = c.database(db).collection::<Document>(&change.collection);
+    if change.clone_document {
+        if new.contains_key("_id") {
+            return Err("mongo.document.id_immutable");
+        }
+        target.insert_one(new.clone()).await.map_err(mongo_error)?;
+        Ok(true)
+    } else {
+        let filter = doc! {"_id":old.get("_id").unwrap().clone(),"$expr":{"$eq":["$$ROOT",{"$literal":old.clone()}]}};
+        let result = target
+            .replace_one(filter, new.clone())
+            .collation(
+                mongodb::options::Collation::builder()
+                    .locale("simple")
+                    .build(),
+            )
+            .await
+            .map_err(mongo_error)?;
+        if result.matched_count != 1 {
+            return Err("mongo.document.conflict");
+        }
+        Ok(false)
+    }
 }
 pub struct Cassandra {
     session: Session,
@@ -249,7 +348,12 @@ impl Cassandra {
         } else {
             format!("{host}:{}", p["port"])
         };
+        let profile = ExecutionProfile::builder()
+            .request_timeout(Some(Duration::from_secs(execution_seconds(p))))
+            .build()
+            .into_handle();
         let mut b = SessionBuilder::new()
+            .default_execution_profile_handle(profile)
             .known_node(address)
             .pool_size(PoolSize::PerHost(std::num::NonZeroUsize::new(1).unwrap()))
             .connection_timeout(Duration::from_secs(
@@ -405,5 +509,92 @@ impl rustls::client::danger::ServerCertVerifier for EncryptedOnly {
     }
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod mongo_configuration_tests {
+    use super::{mongo_auth_source, mongo_ping_database};
+    #[tokio::test]
+    async fn wire_fixture_preserves_bson_and_guards_document_writes() {
+        use crate::{adapter::Adapter, mongo_fixture::Fixture};
+        use serde_json::{Value, json};
+        use turbodbn_core::mongo::{Mutation, Page, project};
+        let fixture = Fixture::start();
+        let profile = json!({"driver_id":"mongodb","host":"127.0.0.1","port":fixture.port,"timeout_seconds":3,"tls":"Disabled","database":"fixture","user":"","mongo_auth_source":"fixture","mongo_read_only":false});
+        let mut adapter = Adapter::connect(profile.clone(), "").await.unwrap();
+        let page=adapter.operation(&json!({"Workbench":{"database":"fixture","action":{"GridPage":{"object":{"name":"sample"},"options":{"page_size":2,"offset":0}}}}})).await.unwrap();
+        let page: Page = serde_json::from_value(page["Workbench"]["MongoPage"].clone()).unwrap();
+        assert_eq!(page.documents.len(), 2);
+        assert!(page.more);
+        let projection = project(&page, &[]).unwrap();
+        assert_eq!(
+            projection.documents[0]["long"]["$numberLong"],
+            i64::MAX.to_string()
+        );
+        assert!(projection.types.contains(&"Int32".into()));
+        assert!(projection.types.contains(&"Array".into()));
+        let original = page.documents[0].clone();
+        let mut next: Value = serde_json::from_str(&original).unwrap();
+        next["r"] = json!({"$numberInt":"99"});
+        let mut mutation = Mutation {
+            collection: "sample".into(),
+            original,
+            replacement: next.to_string(),
+            clone_document: false,
+            confirmed: false,
+        };
+        let operation =
+            |m: &Mutation| json!({"Workbench":{"database":"fixture","action":{"MongoWrite":m}}});
+        assert_eq!(
+            adapter.operation(&operation(&mutation)).await.unwrap_err(),
+            "mongo.document.denied"
+        );
+        assert_eq!(fixture.state.lock().unwrap().writes, 0);
+        mutation.confirmed = true;
+        adapter.operation(&operation(&mutation)).await.unwrap();
+        assert_eq!(fixture.state.lock().unwrap().writes, 1);
+        assert_eq!(
+            adapter.operation(&operation(&mutation)).await.unwrap_err(),
+            "mongo.document.conflict"
+        );
+        assert_eq!(fixture.state.lock().unwrap().writes, 1);
+        next.as_object_mut().unwrap().remove("_id");
+        mutation.clone_document = true;
+        mutation.replacement = next.to_string();
+        adapter.operation(&operation(&mutation)).await.unwrap();
+        assert_eq!(fixture.state.lock().unwrap().writes, 2);
+        fixture.state.lock().unwrap().deny = true;
+        assert_eq!(
+            adapter.operation(&operation(&mutation)).await.unwrap_err(),
+            "mongo.error.permission"
+        );
+        assert_eq!(fixture.state.lock().unwrap().writes, 2);
+        fixture.state.lock().unwrap().view = true;
+        assert_eq!(
+            adapter.operation(&operation(&mutation)).await.unwrap_err(),
+            "mongo.document.denied"
+        );
+        let mut profile = profile;
+        profile["mongo_read_only"] = json!(true);
+        let mut readonly = Adapter::connect(profile, "").await.unwrap();
+        assert_eq!(
+            readonly.operation(&operation(&mutation)).await.unwrap_err(),
+            "mongo.document.denied"
+        );
+        assert!(adapter.operation(&json!({"Workbench":{"database":"fixture","action":{"Execute":{"sql":"DELETE"}}}})).await.is_err());
+    }
+    use serde_json::json;
+    #[test]
+    fn authentication_source_and_target_database_are_independent() {
+        let profile = json!({"mongo_auth_source":"account_auth","database":"business"});
+        assert_eq!(mongo_auth_source(&profile), "account_auth");
+        assert_eq!(mongo_ping_database(&profile), "business");
+        assert_eq!(
+            mongo_ping_database(&json!({"mongo_auth_source":"account_auth"})),
+            "account_auth"
+        );
+        assert_eq!(mongo_auth_source(&json!({"database":"business"})), "admin");
+        assert_eq!(mongo_auth_source(&json!({"mongo_auth_source":""})), "admin");
     }
 }

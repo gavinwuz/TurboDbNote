@@ -39,6 +39,7 @@ pub struct NoteView {
     pub path: PathBuf,
     pub draft: bool,
     note: Note,
+    access_mode: turbodbn_services::access_mode::AccessMode,
     default_database: Entity<InputState>,
     default_picker: Entity<
         gpui_component::select::SelectState<
@@ -78,6 +79,105 @@ impl Focusable for NoteView {
     }
 }
 impl NoteView {
+    fn permission_help(
+        &self,
+        advice: crate::note_permissions::Advice,
+        origin: EntityId,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::note_permissions::Advice;
+        let reason = advice.message(cx);
+        let text = crate::locale::tr(
+            cx,
+            "permissions.note_context",
+            &[("note", &self.note.title), ("reason", &reason)],
+        );
+        let owner = cx.entity().downgrade();
+        let revision = self.revision;
+        let mode = self.access_mode;
+        match advice {
+            Advice::Mode {
+                required,
+                key,
+                command,
+                ..
+            } => {
+                let label = crate::locale::tr(
+                    cx,
+                    "permissions.switch",
+                    &[("mode", &t(cx, required.label()))],
+                );
+                feedback::action_error(
+                    text,
+                    label,
+                    move |_, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            if this.revision != revision || this.access_mode != mode {
+                                feedback::error(t(cx, "permissions.expired"), cx);
+                                return;
+                            }
+                            if !cx.global::<Preferences>().database.command_enabled(&key) {
+                                this.permission_help(
+                                    Advice::Global {
+                                        command: command.clone(),
+                                    },
+                                    origin,
+                                    cx,
+                                );
+                                return;
+                            }
+                            if this.defaults_locked(cx) {
+                                feedback::error(t(cx, "permissions.busy"), cx);
+                                return;
+                            }
+                            this.access_mode = required;
+                            for cell in &this.cells {
+                                cell.update(cx, |cell, cx| cell.set_access_mode(required, cx));
+                            }
+                            feedback::success(
+                                crate::locale::tr(
+                                    cx,
+                                    "permissions.switched",
+                                    &[("mode", &t(cx, required.label()))],
+                                ),
+                                cx,
+                            );
+                            cx.notify();
+                        });
+                    },
+                    cx,
+                );
+            }
+            Advice::Global { .. } => feedback::action_error(
+                text,
+                t(cx, "settings.sql_policy_open"),
+                move |_, cx| {
+                    let hub = cx.global::<feedback::Hub>().0.clone();
+                    cx.defer(move |cx| hub.update(cx, |_, cx| cx.emit(feedback::OpenSqlSettings)));
+                },
+                cx,
+            ),
+            Advice::Connection => {
+                let cell = self
+                    .cells
+                    .iter()
+                    .find(|cell| cell.entity_id() == origin)
+                    .map(|cell| cell.downgrade());
+                feedback::action_error(
+                    text,
+                    t(cx, "permissions.choose_connection"),
+                    move |window, cx| {
+                        if let Some(cell) = &cell {
+                            let _ =
+                                cell.update(cx, |cell, cx| cell.permission_connection(window, cx));
+                        }
+                    },
+                    cx,
+                );
+            }
+            Advice::Unsupported => feedback::error(text, cx),
+        }
+    }
     pub(super) fn import_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.active_queries(cx) || self.picking || self.saving {
             return;
@@ -223,6 +323,7 @@ impl NoteView {
             path,
             draft,
             note: loaded.note,
+            access_mode: Default::default(),
             default_database,
             default_picker,
             default_context: None,
@@ -272,6 +373,7 @@ impl NoteView {
         });
         let database = self.default_database.read(cx).value().trim().to_owned();
         entity.update(cx, |cell, cx| {
+            cell.set_access_mode(self.access_mode, cx);
             cell.set_defaults(self.note.default_connection_id, database, cx)
         });
         let id = entity.entity_id();
@@ -281,6 +383,9 @@ impl NoteView {
                 &entity,
                 window,
                 move |this, _, event, window, cx| match event {
+                    CellEvent::PermissionBlocked(advice) => {
+                        this.permission_help(advice.clone(), id, cx)
+                    }
                     CellEvent::Changed => this.changed(cx),
                     CellEvent::SelectTarget => cx.defer_in(window, |this, window, cx| {
                         this.select_script_target(window, cx)

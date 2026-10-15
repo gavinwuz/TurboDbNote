@@ -36,7 +36,7 @@ impl Connection {
         } else {
             String::new()
         };
-        let mut profile = self.profile.clone();
+        let mut profile = self.profile.resolve_timeouts();
         profile.database = database;
         Ok(Endpoint { profile, password })
     }
@@ -675,7 +675,7 @@ impl TransferView {
             .choices
             .iter()
             .enumerate()
-            .map(|(i, p)| (i, p.profile.name.clone()))
+            .map(|(i, p)| (i, p.profile.clone()))
             .collect::<Vec<_>>();
         let view = cx.entity();
         Button::new(if source {
@@ -683,14 +683,15 @@ impl TransferView {
         } else {
             "transfer-target"
         })
-        .label(self.choices[selected].profile.name.clone())
-        .icon(IconName::GalleryVerticalEnd)
+        .child(crate::connection_choice::identity(
+            &self.choices[selected].profile,
+        ))
         .disabled(self.running || self.previewing || (source && self.mode == Mode::Copy))
         .dropdown_menu(move |mut menu, _, _| {
-            for (index, name) in &values {
+            for (index, profile) in &values {
                 let index = *index;
                 let view = view.clone();
-                menu = menu.item(PopupMenuItem::new(name.clone()).on_click(
+                menu = menu.item(crate::connection_choice::item(profile).on_click(
                     move |_, window, cx| {
                         view.update(cx, |this, cx| {
                             if source {
@@ -723,7 +724,7 @@ impl TransferView {
                     },
                 ));
             }
-            menu.scrollable(true).max_h(px(320.))
+            menu.scrollable(true).min_w(px(360.)).max_h(px(320.))
         })
         .into_any_element()
     }
@@ -1550,7 +1551,7 @@ impl Render for TransferView {
                                                     ),
                                                 );
                                             }
-                                            menu.scrollable(true).max_h(px(320.))
+                                            menu.scrollable(true).min_w(px(360.)).max_h(px(320.))
                                         }),
                                 )
                                 .child(
@@ -1640,7 +1641,9 @@ impl Render for TransferView {
                                                         ),
                                                     );
                                                 }
-                                                menu.scrollable(true).max_h(px(320.))
+                                                menu.scrollable(true)
+                                                    .min_w(px(360.))
+                                                    .max_h(px(320.))
                                             }
                                         }),
                                 )

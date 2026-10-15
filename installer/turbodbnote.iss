@@ -11,6 +11,10 @@
   #error IconFile is required
 #endif
 
+#ifndef AppFlavor
+  #define AppFlavor "full"
+#endif
+
 [Setup]
 AppId={{48E57826-489A-4C7B-A181-FBA086AB71D6}
 AppName=TurboDBNote
@@ -25,7 +29,11 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
 OutputDir={#OutputDir}
+#if AppFlavor == "minimal"
+OutputBaseFilename=TurboDBNote-v{#AppVersion}-windows-x64-minimal-setup
+#else
 OutputBaseFilename=TurboDBNote-v{#AppVersion}-windows-x64-setup
+#endif
 SetupIconFile={#IconFile}
 UninstallDisplayIcon={app}\turbodbnote.exe
 LicenseFile={#SourceDir}\LICENSE

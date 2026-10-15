@@ -6,6 +6,7 @@ use gpui_component::{
 };
 pub(super) const ROW_NUMBER_WIDTH: f32 = 58.;
 pub(super) struct GridDelegate {
+    mongo: bool,
     owner: Option<WeakEntity<TableView>>,
     columns: Vec<GridColumn>,
     rows: Rc<Rows>,
@@ -28,8 +29,19 @@ impl GridDelegate {
     pub fn column_names(&self) -> Vec<&str> {
         self.columns.iter().map(|c| c.key.as_ref()).collect()
     }
+    pub fn set_width(&mut self, field: &str, width: f32) {
+        if let Some(column) = self
+            .columns
+            .iter_mut()
+            .skip(1)
+            .find(|c| c.name.as_ref() == field)
+        {
+            *column = column.clone().width(px(width));
+        }
+    }
     pub fn new() -> Self {
         Self {
+            mongo: false,
             owner: None,
             columns: vec![],
             rows: Rc::new(Rows::default()),
@@ -60,7 +72,7 @@ impl GridDelegate {
         columns.extend(view.rows.columns.iter().enumerate().map(|(i, name)| {
             GridColumn::new(format!("data-{i}"), name.clone())
                 .p_0()
-                .width(px(
+                .width(px(view.widths.widths.get(name).copied().unwrap_or(
                     if view.target.kind == turbodbn_services::DatabaseKind::Redis {
                         if view.rows.columns.len() == 1 {
                             720.
@@ -70,9 +82,10 @@ impl GridDelegate {
                     } else {
                         220.
                     },
-                ))
+                )))
         }));
         Self {
+            mongo: view.mongo.is_some(),
             owner: Some(owner),
             columns,
             rows: Rc::new(view.display_rows()),
@@ -130,6 +143,20 @@ pub(crate) fn column_icon(c: Option<&workbench::Column>, cx: &App) -> AnyElement
             .into_any_element();
     }
     let ty = c.map(|c| c.data_type.to_lowercase()).unwrap_or_default();
+    if ["objectid", "array", "object", "mixed", "null", "boolean"].contains(&ty.as_str()) {
+        return div()
+            .text_xs()
+            .text_color(color(0x2dd4bf, 0x0f766e))
+            .child(match ty.as_str() {
+                "array" => "[]",
+                "object" => "{}",
+                "objectid" => "OID",
+                "boolean" => "T/F",
+                "null" => "∅",
+                _ => "±",
+            })
+            .into_any_element();
+    }
     if ["date", "time"].iter().any(|t| ty.contains(t)) {
         return gpui_component::Icon::new(IconName::Calendar)
             .text_color(color(0xc084fc, 0x7e22ce))
@@ -186,6 +213,9 @@ impl TableDelegate for GridDelegate {
         let copy = name.clone();
         let owner = self.owner.clone();
         let query_locked = self.busy || !self.pending.is_empty() || !self.query_controls;
+        let resize_owner = owner.clone();
+        let resize_field = name.clone();
+        let resize_width = f32::from(self.columns[index].width);
         let sort_owner = owner.clone();
         let sort_name = name.clone();
         let direction = self
@@ -241,6 +271,14 @@ impl TableDelegate for GridDelegate {
                         Tooltip::new(tip).build(window, cx)
                     }),
             )
+            .when(self.mongo, |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(meta.map(|m| m.data_type.clone()).unwrap_or_default()),
+                )
+            })
             .child(
                 Button::new(("sort-column", index))
                     .ghost()
@@ -299,6 +337,22 @@ impl TableDelegate for GridDelegate {
                                     crate::feedback::success(t(cx, "feedback.copied"), cx);
                                 }),
                         );
+                        for (key, action) in [
+                            ("grid.width.set", "set"),
+                            ("grid.width.fit", "fit"),
+                            ("grid.width.reset", "reset"),
+                        ] {
+                            let owner = owner.clone();
+                            menu = menu.item(PopupMenuItem::new(t(cx, key)).on_click(
+                                move |_, window, cx| {
+                                    if let Some(owner) = &owner {
+                                        let _ = owner.update(cx, |this, cx| {
+                                            this.width_action(col, action, window, cx)
+                                        });
+                                    }
+                                },
+                            ));
+                        }
                         for (key, filter) in [("grid.filter", true), ("grid.structure", false)] {
                             let owner = owner.clone();
                             menu = menu.item(
@@ -327,6 +381,9 @@ impl TableDelegate for GridDelegate {
                         menu
                     }),
             )
+            .when_some(resize_owner, |el, owner| {
+                el.child(width_ui::handle(owner, resize_field, resize_width, cx))
+            })
             .into_any_element()
     }
     fn render_td(
@@ -382,6 +439,8 @@ impl TableDelegate for GridDelegate {
             let text: SharedString = v
                 .unwrap_or(if self.defaults.contains(&key) {
                     "DEFAULT"
+                } else if self.mongo {
+                    "∅"
                 } else {
                     "NULL"
                 })
@@ -395,6 +454,7 @@ impl TableDelegate for GridDelegate {
         let text = self.previews[&key].clone();
         let owner = self.owner.clone();
         let menu_owner = owner.clone();
+        let mongo = self.mongo;
         let active = self.selection == Some((row, col));
         let related = self.highlight && self.selection.is_some_and(|(r, c)| r == row || c == col);
         let cell = div()
@@ -441,6 +501,28 @@ impl TableDelegate for GridDelegate {
             SharedString::from(format!("cell-menu-{row}-{col}")),
             cell,
             move |mut menu, window, cx| {
+                if mongo {
+                    for (key, action) in [
+                        ("mongo.copy.value", "cell"),
+                        ("mongo.copy.document", "json"),
+                        ("mongo.node.inspect", "inspect"),
+                    ] {
+                        let owner = menu_owner.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(t(cx, key)).on_click(move |_, _, cx| {
+                                if let Some(owner) = &owner {
+                                    let _ = owner.update(cx, |this, cx| {
+                                        if action == "inspect" {
+                                            this.open_mongo_node(row, col, cx);
+                                        } else {
+                                            this.copy(row, col, action, cx);
+                                        }
+                                    });
+                                }
+                            }));
+                    }
+                    return menu;
+                }
                 if menu_owner
                     .as_ref()
                     .and_then(|owner| owner.upgrade())

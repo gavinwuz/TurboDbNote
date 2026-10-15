@@ -15,7 +15,7 @@ pub const MAX_SQL_BYTES: usize = notebook_query::SCRIPT_MAX_BYTES;
 pub const PAGE_SIZE: u64 = 6;
 const HEADER: u64 = 80;
 const RECORD: u64 = 32;
-const MAGIC: &[u8; 8] = b"TDBSQL03";
+const MAGIC: &[u8; 8] = b"TDBSQL04";
 pub fn kind(dialect: SqlDialect) -> DatabaseKind {
     match dialect {
         SqlDialect::MySql => DatabaseKind::MySql,
@@ -101,7 +101,71 @@ pub struct Entry {
     pub supported: bool,
     pub write: bool,
     pub preview: String,
+    pub has_comments: bool,
     pub reason: String,
+}
+/// Display-only segmentation; execution retains the immutable original source.
+pub struct StatementPreview {
+    pub source: String,
+    pub sql: String,
+    pub comments: String,
+    pub source_line: u64,
+    pub sql_line: u64,
+    pub end_line: u64,
+}
+pub fn leading_code_offset(sql: &str, dialect: SqlDialect) -> usize {
+    let b = sql.as_bytes();
+    let mut i = 0;
+    loop {
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if b.get(i..i + 2) == Some(b"--")
+            && (dialect != SqlDialect::MySql
+                || b.get(i + 2)
+                    .is_none_or(|b| b.is_ascii_whitespace() || b.is_ascii_control()))
+            || dialect == SqlDialect::MySql && b.get(i) == Some(&b'#')
+        {
+            while b.get(i).is_some_and(|b| *b != b'\n') {
+                i += 1;
+            }
+        } else if b.get(i..i + 2) == Some(b"/*")
+            && b.get(i + 2) != Some(&b'!')
+            && b.get(i..i + 4) != Some(b"/*M!")
+        {
+            i += 2;
+            let mut depth = 1;
+            while i < b.len() && depth > 0 {
+                if dialect == SqlDialect::PostgreSql && b.get(i..i + 2) == Some(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if b.get(i..i + 2) == Some(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+        } else {
+            return i;
+        }
+    }
+}
+pub fn statement_preview(source: String, sql_line: u64, dialect: SqlDialect) -> StatementPreview {
+    let start = leading_code_offset(&source, dialect);
+    let prefix = &source[..start];
+    let source_line = sql_line
+        .saturating_sub(prefix.bytes().filter(|b| *b == b'\n').count() as u64)
+        .max(1);
+    let end_line = source_line + source.bytes().filter(|b| *b == b'\n').count() as u64;
+    StatementPreview {
+        sql: source[start..].to_owned(),
+        comments: prefix.trim().to_owned(),
+        source_line,
+        sql_line,
+        end_line,
+        source,
+    }
 }
 #[derive(Clone, Debug)]
 pub struct PermissionBlock {
@@ -140,14 +204,14 @@ impl Reader {
             let key = notebook_query::script_command_required(kind, &sql)
                 .ok_or("script.error.unsupported")?;
             match key {
-                "script_session" => result.session += 1,
+                "script_session" | "script_variables" => result.session += 1,
                 "script_lock" => result.locks += 1,
                 "script_transaction" => result.transactions += 1,
-                "create" | "alter" | "drop" | "truncate" => result.ddl += 1,
+                "create" | "alter" | "drop" | "truncate" | "script_drop_trigger" => result.ddl += 1,
                 "insert" | "update" | "delete" => result.writes += 1,
                 _ => result.reads += 1,
             }
-            if matches!(key, "drop" | "truncate" | "delete") {
+            if matches!(key, "drop" | "truncate" | "delete" | "script_drop_trigger") {
                 result.destructive += 1;
             }
             if key == "script_session" {
@@ -771,7 +835,10 @@ impl Reader {
         }
         let mut header = [0; HEADER as usize];
         index.read_exact(&mut header).map_err(disk)?;
-        if (&header[..8] != MAGIC && &header[..8] != b"TDBSQL01" && &header[..8] != b"TDBSQL02")
+        if (&header[..8] != MAGIC
+            && &header[..8] != b"TDBSQL01"
+            && &header[..8] != b"TDBSQL02"
+            && &header[..8] != b"TDBSQL03")
             || header[8..40] != script.source_hash.as_bytes()[..32]
             || header[40] != code(script.dialect)
             || u64::from_le_bytes(header[48..56].try_into().unwrap()) != script.statements
@@ -839,11 +906,18 @@ impl Reader {
         self.source.read_exact(&mut bytes).map_err(disk)?;
         let valid =
             std::str::from_utf8(&bytes).map_or_else(|error| error.valid_up_to(), |_| bytes.len());
-        let preview = std::str::from_utf8(&bytes[..valid])
-            .map_err(|_| "script.error.encoding")?
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let source = if len <= MAX_SQL_BYTES as u64 {
+            self.read_statement(offset, len)?
+        } else {
+            std::str::from_utf8(&bytes[..valid])
+                .map_err(|_| "script.error.encoding")?
+                .to_owned()
+        };
+        let start = leading_code_offset(&source, self.script.dialect);
+        let has_comments = !source[..start].trim().is_empty();
+        let prefix = source[start..].chars().take(512).collect::<String>();
+        let preview = prefix.split_whitespace().collect::<Vec<_>>().join(" ");
+        let preview = preview.chars().take(128).collect::<String>();
         let reason = if supported == 0 {
             self.read_statement(offset, len)
                 .and_then(|sql| {
@@ -861,6 +935,7 @@ impl Reader {
             supported: supported > 0,
             write: supported == 2,
             preview,
+            has_comments,
             reason,
         })
     }
@@ -914,7 +989,7 @@ pub fn refresh(note: &Path, script: &SqlScript, cancel: &AtomicBool) -> Result<S
     if &magic == MAGIC {
         return Ok(script.clone());
     }
-    if &magic != b"TDBSQL01" && &magic != b"TDBSQL02" {
+    if &magic != b"TDBSQL01" && &magic != b"TDBSQL02" && &magic != b"TDBSQL03" {
         return Err("script.error.resource".into());
     }
     drop(index);
@@ -946,6 +1021,70 @@ pub fn freeze(note: &Path, script: &SqlScript, cancel: &AtomicBool) -> Result<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn leading_comments_do_not_hide_sql_or_change_the_frozen_source() {
+        let source = "-- 说明; not a statement\r\n# more comment\r\n/* ordinary */\r\nDROP TRIGGER IF EXISTS `t`;";
+        let (dir, imported) = prepared(source, SqlDialect::MySql);
+        assert_eq!(imported.script.statements, 1);
+        let entry = imported.page().unwrap().remove(0);
+        assert_eq!(entry.line, 4);
+        assert!(entry.has_comments);
+        assert_eq!(entry.preview, "DROP TRIGGER IF EXISTS `t`;");
+        let view = statement_preview(source.into(), entry.line, SqlDialect::MySql);
+        assert_eq!((view.source_line, view.sql_line, view.end_line), (1, 4, 4));
+        assert!(view.comments.contains("# more comment"));
+        assert_eq!(view.source, source);
+        assert_eq!(view.sql, "DROP TRIGGER IF EXISTS `t`;");
+        let note = dir.path().join("comments.note");
+        let cancel = AtomicBool::new(false);
+        imported.publish(&note, &cancel).unwrap();
+        let mut reader = freeze(&note, &imported.script, &cancel).unwrap();
+        assert_eq!(reader.statement(0).unwrap(), source);
+        for sql in [
+            "SELECT '-- not a comment', '# value';",
+            "--not_a_mysql_comment",
+            "/*!40000 SET NAMES utf8mb4 */;",
+            "/*M! SET NAMES utf8mb4 */;",
+        ] {
+            assert_eq!(leading_code_offset(sql, SqlDialect::MySql), 0);
+        }
+        assert_eq!(
+            leading_code_offset("--comment\nSELECT 1", SqlDialect::Sqlite),
+            10
+        );
+        assert_eq!(
+            leading_code_offset("/* a /* b */ c */SELECT 1", SqlDialect::PostgreSql),
+            17
+        );
+    }
+    #[test]
+    fn trigger_deletions_are_indexed_as_destructive_ddl_with_permission_location() {
+        let (dir, imported) = prepared(
+            "-- dump\nDROP TRIGGER IF EXISTS `one`;\nDROP TRIGGER IF EXISTS `two`;",
+            SqlDialect::MySql,
+        );
+        assert_eq!(imported.script.unsupported, 0);
+        let note = dir.path().join("triggers.note");
+        let cancel = AtomicBool::new(false);
+        imported.publish(&note, &cancel).unwrap();
+        let mut reader = freeze(&note, &imported.script, &cancel).unwrap();
+        let summary = reader.authorization_summary(0, 2, false, &cancel).unwrap();
+        assert_eq!((summary.ddl, summary.destructive, summary.risky), (2, 2, 2));
+        let blocked = permission_block(&mut reader, DatabaseKind::MySql, 0, &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked.command, "DROP TRIGGER");
+        assert!(
+            permission_block(
+                &mut reader,
+                DatabaseKind::MySql,
+                0,
+                &["script_drop_trigger".into()]
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
     #[test]
     fn batch_authorization_counts_real_risks_and_pages_only_current_source() {
         let (dir, imported) = prepared(
@@ -1145,7 +1284,7 @@ mod tests {
     #[test]
     fn unsupported_statements_and_ambiguous_escaping_are_not_silently_split_for_execution() {
         for text in [
-            "SET @x=1; SELECT 1;",
+            "SET @x=dangerous_udf(); SELECT 1;",
             "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; END$$",
             "SELECT `x\\`; DROP TABLE users; -- `;",
             "SELECT 1; /*!50000 DELETE FROM users */ SELECT 2;",

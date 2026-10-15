@@ -18,6 +18,7 @@ macro_rules! driver {
     }
 }
 pub const DRIVERS: &[DriverSpec] = &[
+    driver!("odbc", "ODBC", External, 1, ["sql"], false, false, "odbc"),
     driver!("mysql", "MySQL", MySql, 3306, ["sql"], true, false, ""),
     driver!(
         "postgresql",
@@ -181,7 +182,7 @@ impl DriverSpec {
         p.driver_id = self.id.into();
         p.port = self.port;
         p.user = match self.id {
-            "oracle" | "sqlserver" | "db2" | "mongodb" | "elasticsearch" | "access" => "",
+            "oracle" | "sqlserver" | "db2" | "mongodb" | "elasticsearch" | "access" | "odbc" => "",
             "cassandra" => "cassandra",
             "tdengine" => "root",
             _ => &p.user,

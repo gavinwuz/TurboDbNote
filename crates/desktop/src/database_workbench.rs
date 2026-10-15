@@ -14,6 +14,26 @@ pub struct OpenTable {
 }
 impl EventEmitter<OpenTable> for DatabaseView {}
 impl DatabaseView {
+    pub(crate) fn mongo_context_current(&self, id: Uuid, generation: u64) -> bool {
+        self.generation.get(&id).copied() == Some(generation)
+            && self.states.get(&id).is_some_and(|s| s == "已连接")
+    }
+    pub(crate) fn mongo_write_allowed(&self, id: Uuid, generation: u64) -> bool {
+        self.generation.get(&id).copied() == Some(generation)
+            && self.states.get(&id).is_some_and(|s| s == "已连接")
+            && self
+                .profiles
+                .iter()
+                .any(|p| p.id == id && p.driver_id == "mongodb" && !p.mongo_read_only)
+    }
+    pub(crate) fn mongo_context_label(&self, id: Uuid) -> String {
+        self.profiles
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| format!("{} · {}", p.name, p.environment))
+            .unwrap_or_default()
+    }
+
     pub(super) fn cancel_table_request(&mut self, cx: &mut Context<Self>) {
         self.mcp_target = None;
         self.ddl.pending = false;
@@ -44,6 +64,11 @@ impl DatabaseView {
     ) -> Result<(), String> {
         if self.generation.get(&id).copied().unwrap_or_default() != generation {
             return Err("连接已重新建立，请关闭并重新打开此数据页".into());
+        }
+        if matches!(request.action, Action::MongoWrite(_))
+            && !self.mongo_write_allowed(id, generation)
+        {
+            return Err("mongo.document.denied".into());
         }
         if matches!(request.action, Action::Commit { .. })
             && self

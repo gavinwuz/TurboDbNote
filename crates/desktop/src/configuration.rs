@@ -26,6 +26,7 @@ pub struct Configuration {
     pub category: Category,
     general: GeneralPreferences,
     database: DatabasePreferences,
+    timeout_fields: [Entity<InputState>; 2],
     pub database_tab: usize,
     providers: Vec<ProviderPreferences>,
     extensions: Vec<AgentExtension>,
@@ -84,6 +85,20 @@ impl Configuration {
         .into_iter()
         .map(|v| input(v, false, window, cx))
         .collect();
+        let timeout_fields = [
+            input(
+                &prefs.database.connect_timeout_seconds.to_string(),
+                false,
+                window,
+                cx,
+            ),
+            input(
+                &prefs.database.execution_timeout_seconds.to_string(),
+                false,
+                window,
+                cx,
+            ),
+        ];
         let font = input(&prefs.general.font_family, false, window, cx);
         let mut fonts = cx.text_system().all_font_names();
         fonts.push(".SystemUIFont".into());
@@ -95,6 +110,7 @@ impl Configuration {
         let mut subscriptions: Vec<Subscription> = fields
             .iter()
             .chain(agent_fields.iter())
+            .chain(timeout_fields.iter())
             .chain(std::iter::once(&font))
             .map(|field| cx.observe(field, |_, _, cx| cx.notify()))
             .collect();
@@ -121,6 +137,7 @@ impl Configuration {
                 prefs.database.clone(),
             ),
             database: prefs.database,
+            timeout_fields,
             database_tab: 0,
             providers,
             extensions,
@@ -180,17 +197,51 @@ impl Configuration {
         if let Some(a) = extensions.get_mut(self.agent) {
             *a = self.agent_value(cx);
         }
-        (general, providers, extensions, self.database.clone())
+        let mut database = self.database.clone();
+        database.connect_timeout_seconds = self.timeout_fields[0]
+            .read(cx)
+            .value()
+            .trim()
+            .parse()
+            .unwrap_or(database.connect_timeout_seconds);
+        database.execution_timeout_seconds = self.timeout_fields[1]
+            .read(cx)
+            .value()
+            .trim()
+            .parse()
+            .unwrap_or(database.execution_timeout_seconds);
+        (general, providers, extensions, database)
     }
     pub fn reset_theme(&mut self, cx: &mut Context<Self>) {
         self.general.theme = None;
         cx.notify();
     }
     pub fn signature(&self, cx: &App) -> String {
-        serde_json::to_string(&self.snapshot(cx)).unwrap_or_default()
+        serde_json::to_string(&(
+            self.snapshot(cx),
+            self.timeout_fields
+                .iter()
+                .map(|v| v.read(cx).value().to_string())
+                .collect::<Vec<_>>(),
+        ))
+        .unwrap_or_default()
     }
     pub fn dirty(&self, cx: &App) -> bool {
         self.snapshot(cx) != self.baseline
+            || self.timeout_fields[0]
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u64>()
+                .ok()
+                != Some(self.baseline.3.connect_timeout_seconds)
+            || self.timeout_fields[1]
+                .read(cx)
+                .value()
+                .trim()
+                .parse::<u64>()
+                .ok()
+                != Some(self.baseline.3.execution_timeout_seconds)
     }
     fn sync_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let p = self
@@ -236,6 +287,20 @@ impl Configuration {
         self.font.update(cx, |input, cx| {
             input.set_value(self.general.font_family.clone(), window, cx)
         });
+        self.timeout_fields[0].update(cx, |field, cx| {
+            field.set_value(
+                self.database.connect_timeout_seconds.to_string(),
+                window,
+                cx,
+            )
+        });
+        self.timeout_fields[1].update(cx, |field, cx| {
+            field.set_value(
+                self.database.execution_timeout_seconds.to_string(),
+                window,
+                cx,
+            )
+        });
         self.sync_fields(window, cx);
         cx.notify();
     }
@@ -248,6 +313,28 @@ impl Configuration {
     }
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
         if self.locked {
+            return false;
+        }
+        let valid = self.timeout_fields[0]
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u64>()
+            .ok()
+            .zip(
+                self.timeout_fields[1]
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .parse::<u64>()
+                    .ok(),
+            )
+            .is_some_and(|(connect, execution)| {
+                turbodbn_services::timeout_policy::Defaults { connect, execution }.valid()
+            });
+        if !valid {
+            self.status = "database.timeout.defaults_invalid".into();
+            cx.notify();
             return false;
         }
         self.capture(cx);
@@ -408,6 +495,57 @@ impl Configuration {
                         }),
                 )
                 .child(t(cx, "settings2.page_hint"));
+            body = body.child(
+                div()
+                    .v_flex()
+                    .gap_2()
+                    .pt_3()
+                    .child(t(cx, "database.timeout.global_title"))
+                    .children(self.timeout_fields.iter().enumerate().map(|(i, field)| {
+                        div()
+                            .v_flex()
+                            .gap_1()
+                            .child(t(
+                                cx,
+                                if i == 0 {
+                                    "database.timeout.connect"
+                                } else {
+                                    "database.timeout.execute"
+                                },
+                            ))
+                            .child(Input::new(field).cleanable(true).disabled(self.locked))
+                            .when(
+                                !field.read(cx).value().trim().parse::<u64>().is_ok_and(|v| {
+                                    if i == 0 {
+                                        (1..=60).contains(&v)
+                                    } else {
+                                        (1..=turbodbn_core::timeouts::MAX_EXECUTION_SECONDS)
+                                            .contains(&v)
+                                    }
+                                }),
+                                |row| {
+                                    row.child(
+                                        div()
+                                            .h_flex()
+                                            .gap_2()
+                                            .text_sm()
+                                            .child(gpui_component::Icon::new(
+                                                IconName::TriangleAlert,
+                                            ))
+                                            .child(t(
+                                                cx,
+                                                if i == 0 {
+                                                    "database.timeout.connect_invalid"
+                                                } else {
+                                                    "database.timeout.execution_invalid"
+                                                },
+                                            )),
+                                    )
+                                },
+                            )
+                    }))
+                    .child(t(cx, "database.timeout.global_hint")),
+            );
         } else {
             body = body
                 .child(
@@ -467,7 +605,13 @@ impl Configuration {
                 }
                 body = body.child(
                     gpui_component::checkbox::Checkbox::new(key)
-                        .label(label)
+                        .label(if key == "script_drop_trigger" {
+                            t(cx, "script.drop_trigger.permission")
+                        } else if key == "script_variables" {
+                            t(cx, "script.variables.permission")
+                        } else {
+                            label.into()
+                        })
                         .checked(self.database.command_enabled(key))
                         .disabled(self.locked)
                         .on_click(cx.listener(move |this, checked: &bool, _, cx| {

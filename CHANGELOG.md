@@ -4,6 +4,10 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Support independent MongoDB authSource and target-scoped connection tests without requiring admin database listing; classify authentication, permissions and connection failures.
+
+- Add Rust driver component download/offline import, dependency probes and persisted per-driver enable switches; generate full/minimal distributions and reusable offline component archives with a pinned Oracle client.
+
 - Replace empty script write-result grids with bounded execution details, cumulative affected-row statistics, preserved query results and on-demand table structure previews.
 
 - Add IF NOT EXISTS to ordinary table DDL in SQL file exports while preserving quoted data, comments and routine bodies.
@@ -29,6 +33,27 @@ Release notes are generated from the version sections below.
 
 - Add startup/manual stable-release checks, persistent upgrade prompts, version skipping and cancellable in-app downloads with SHA256 verification.
 - Windows installer builds save pending Notes/settings before exiting and launching a separately verified installer; staged edits, connection drafts and active database/Note operations block installation. Portable Windows/Linux updates remain manual.
+
+- Add local, bounded connection URL preview and editable batch drafts with masked credentials; move MongoDB authentication-source overrides to Advanced and show concrete component compatibility differences.
+
+- Add typed MongoDB field grids, a virtual linked EJSON tree, node copy/fold menus and confirmed optimistic document edits/clones. Preserve read-only defaults and advance native driver protocol to 3.
+- Defer shared grid column resizing until drop, add numeric/fit/reset width actions, and persist widths separately from document data.
+
+- Simplify driver settings with enable switches, per-driver prerequisite details and a collapsed unavailable section; remove the chat-specific settings footer. Add connection URL help and MySQL TCP DSN compatibility with explicit client-option notices.
+
+- Add read-only generic ODBC connections, stable driver status columns, consistent Access/Db2 detection, and official offline Windows Db2 CLI materials. Generate network connection names as database@host-suffix; require worker protocol 4.
+
+- Support script-only MySQL DROP TRIGGER with opt-in permission, batch authorization, target/metadata rechecks and index refresh.
+
+- Support script-only isolation levels, bounded user-variable assignment and SELECT INTO (including explicitly authorized FOR UPDATE).
+
+- Preserve sanitized server errors for script session/trigger/variable statements; show the actual DROP TRIGGER command despite leading comments.
+
+- Unify connection picker identities; add Note-local access ceilings, script comment/source previews, frozen-request checks and explicit sanitized MySQL diagnostics.
+
+- Separate connection and execution timeouts with a backward-compatible 300-second operation default; format elapsed UI values adaptively and restrict Note DELETE to DBA. External component protocol 5 propagates operation deadlines.
+
+- Add global timeout defaults with connection inheritance and preserved overrides; add scoped, actionable Note permission guidance without automatic SQL replay.
 
 ## [0.1.1] - 2026-10-13
 

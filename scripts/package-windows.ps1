@@ -3,6 +3,8 @@ param(
     [string]$FxcPath,
     [string]$LegacyDriverArchive,
     [string]$LegacySourceArchive,
+    [string]$OracleClientArchive,
+    [string]$Db2ClientArchive,
     [string]$CrashSightSdkDirectory,
     [Parameter(Mandatory)][string]$IsccPath
 )
@@ -54,7 +56,7 @@ try {
     $setup = Join-Path $output "$name-setup.exe"
     $sourcesZip = Join-Path $output "$name-sources.zip"
     $checksum = Join-Path $output 'SHA256SUMS.txt'
-    foreach ($path in @($stage, $zip, $setup, $sourcesZip, $checksum)) {
+    foreach ($path in @($stage, $zip, $setup, $sourcesZip, $checksum, (Join-Path $output "$name-drivers.zip"), (Join-Path $output "$name-minimal"), (Join-Path $output "$name-minimal-portable.zip"), (Join-Path $output "$name-minimal-setup.exe"), (Join-Path $output "$name-minimal-sources.zip"))) {
         if (Test-Path -LiteralPath $path) { throw "Output already exists: $path" }
     }
     $notes = Get-VersionReleaseNotes -ChangelogPath (Join-Path $root 'CHANGELOG.md') -Version $version
@@ -86,8 +88,19 @@ try {
     if (-not (Test-Path -LiteralPath $legacyHelper)) {throw 'Legacy helper was not built'}
     Copy-Item -LiteralPath $legacyHelper -Destination $stage
     # Curated x64 client supports legacy 4.x servers; win32 4.x DLLs cannot load in this app.
+    Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'LICENSE')
     Stage-DatabaseDrivers -Destination (Join-Path $stage 'drivers/native') -HostPath (Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote-driver-host.exe')
     Stage-MySqlDriver -Destination (Join-Path $stage 'drivers') -LegacyDriverArchive $LegacyDriverArchive -LegacySourceArchive $LegacySourceArchive
+    Copy-Item -LiteralPath (Join-Path $root 'LICENSE') -Destination (Join-Path $stage 'drivers/native/LICENSE.TurboDBNote')
+    $oracleArgs = @('prepare-oracle', (Join-Path $root 'target/tools/oracle-bundle'), (Join-Path $stage 'drivers/native'), 'windows-x64')
+    if ($OracleClientArchive) { $oracleArgs += (Resolve-Path -LiteralPath $OracleClientArchive).Path }
+    Invoke-Checked $devTools $oracleArgs
+    $db2Args = @('prepare-db2', (Join-Path $root 'target/tools/db2-client'), (Join-Path $stage 'drivers/native'))
+    if ($Db2ClientArchive) { $db2Args += (Resolve-Path -LiteralPath $Db2ClientArchive).Path }
+    Invoke-Checked $devTools $db2Args
+    $driverArchive = Join-Path $output "$name-drivers.zip"
+    Invoke-Checked $devTools @('driver-components', (Join-Path $stage 'drivers/native'), $driverArchive, $version, 'windows-x64')
+    'full' | Set-Content -LiteralPath (Join-Path $stage 'package-flavor.txt') -Encoding ascii
     # Include the exact application source used for this build alongside the third-party source.
     $sourceStage = Join-Path $stage 'sources/TurboDBNote'
     $sourceFiles = & git ls-files --cached --others --exclude-standard
@@ -136,7 +149,25 @@ This build is unsigned. Read RELEASE-NOTES.md before use.
     Invoke-Checked $IsccPath @("/DAppVersion=$version", "/DSourceDir=$stage", "/DOutputDir=$output",
         "/DIconFile=$(Join-Path $root 'crates/desktop/assets/turbodbnote.ico')", (Join-Path $root 'installer/turbodbnote.iss'))
     if (-not (Test-Path -LiteralPath $setup)) { throw 'Installer was not generated' }
-    Write-ReleaseChecksums -Paths @($zip, $setup, $sourcesZip) -OutputFile $checksum
+    $minimalStage = Join-Path $output "$name-minimal"
+    $minimalZip = Join-Path $output "$name-minimal-portable.zip"
+    $minimalSetup = Join-Path $output "$name-minimal-setup.exe"
+    foreach ($path in @($minimalStage, $minimalZip, $minimalSetup)) { if (Test-Path -LiteralPath $path) { throw "Output already exists: $path" } }
+    New-Item -ItemType Directory -Path $minimalStage | Out-Null
+    foreach ($item in Get-ChildItem -LiteralPath $stage) {
+        if ($item.Name -eq 'drivers') {
+            New-Item -ItemType Directory -Path (Join-Path $minimalStage 'drivers') | Out-Null
+            foreach ($driverItem in Get-ChildItem -LiteralPath $item.FullName | Where-Object Name -ne 'native') {
+                Copy-Item -LiteralPath $driverItem.FullName -Destination (Join-Path $minimalStage 'drivers') -Recurse
+            }
+        } else { Copy-Item -LiteralPath $item.FullName -Destination $minimalStage -Recurse }
+    }
+    'minimal' | Set-Content -LiteralPath (Join-Path $minimalStage 'package-flavor.txt') -Encoding ascii
+    $minimalSources = Join-Path $output "$name-minimal-sources.zip"
+    Write-WindowsReleaseArchives -Stage $minimalStage -PortableZip $minimalZip -SourcesZip $minimalSources
+    Invoke-Checked $IsccPath @("/DAppVersion=$version", '/DAppFlavor=minimal', "/DSourceDir=$minimalStage", "/DOutputDir=$output", "/DIconFile=$(Join-Path $root 'crates/desktop/assets/turbodbnote.ico')", (Join-Path $root 'installer/turbodbnote.iss'))
+    if (-not (Test-Path -LiteralPath $minimalSetup)) { throw 'Minimal installer was not generated' }
+    Write-ReleaseChecksums -Paths @($zip, $setup, $sourcesZip, $minimalZip, $minimalSetup, $minimalSources, $driverArchive) -OutputFile $checksum
     Write-Output "Package: $zip"
     Write-Output "Installer: $setup"
     Write-Output "Sources: $sourcesZip"

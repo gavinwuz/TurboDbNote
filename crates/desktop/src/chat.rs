@@ -96,7 +96,7 @@ impl AiLog {
                     ("task", &task),
                     ("kind", kind.as_ref()),
                     ("phase", phase.as_ref()),
-                    ("elapsed", &event.elapsed_ms.to_string()),
+                    ("elapsed", &crate::duration::elapsed(event.elapsed_ms)),
                     (
                         "count",
                         &event
@@ -117,7 +117,7 @@ impl AiLog {
                 &[
                     ("task", &task),
                     ("phase", phase.as_ref()),
-                    ("elapsed", &event.elapsed_ms.to_string()),
+                    ("elapsed", &crate::duration::elapsed(event.elapsed_ms)),
                     ("rows", &event.rows.to_string()),
                 ],
             )
@@ -133,7 +133,7 @@ impl AiLog {
                     ("task", &task),
                     ("kind", kind.as_ref()),
                     ("phase", phase.as_ref()),
-                    ("elapsed", &event.elapsed_ms.to_string()),
+                    ("elapsed", &crate::duration::elapsed(event.elapsed_ms)),
                     ("class", &class),
                 ],
             )
@@ -145,7 +145,7 @@ impl AiLog {
                     ("task", &task),
                     ("kind", kind.as_ref()),
                     ("phase", phase.as_ref()),
-                    ("elapsed", &event.elapsed_ms.to_string()),
+                    ("elapsed", &crate::duration::elapsed(event.elapsed_ms)),
                     ("rows", &event.rows.to_string()),
                     ("bytes", &event.bytes.to_string()),
                     ("class", &class),
@@ -1776,20 +1776,30 @@ impl ChatView {
                             .disabled(self.busy)
                             .dropdown_caret(true)
                             .ghost()
-                            .icon(IconName::Globe)
                             .flex_1()
                             .min_w_0()
                             .px_1()
                             .child(
-                                div().max_w(px(220.)).truncate().child(
-                                    self.sql_scope
-                                        .as_ref()
-                                        .filter(|s| !s.name.is_empty())
-                                        .map(|s| s.name.clone().into())
-                                        .unwrap_or_else(|| {
-                                            crate::locale::t(cx, "chat.context.connection")
-                                        }),
-                                ),
+                                self.sql_scope
+                                    .as_ref()
+                                    .and_then(|s| s.connection)
+                                    .and_then(|id| {
+                                        self.databases.as_ref().and_then(|d| d.upgrade()).and_then(
+                                            |db| {
+                                                db.read(cx)
+                                                    .note_profiles()
+                                                    .into_iter()
+                                                    .find(|p| p.id == id)
+                                            },
+                                        )
+                                    })
+                                    .as_ref()
+                                    .map(crate::connection_choice::identity)
+                                    .unwrap_or_else(|| {
+                                        div()
+                                            .truncate()
+                                            .child(crate::locale::t(cx, "chat.context.connection"))
+                                    }),
                             )
                             .tooltip(
                                 self.sql_scope

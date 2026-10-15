@@ -1,5 +1,4 @@
-use sha2::{Digest, Sha256};
-use std::{fs, io::Read, path::Path, process::Command};
+use std::{fs, path::Path, process::Command};
 fn run(root: &Path, program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
@@ -22,7 +21,13 @@ pub fn linux(root: &Path) -> Result<(), String> {
     let stage = output.join(&name);
     let archive = output.join(format!("{name}.tar.gz"));
     let checksum = output.join("SHA256SUMS-linux.txt");
-    if stage.exists() || archive.exists() || checksum.exists() {
+    if stage.exists()
+        || archive.exists()
+        || checksum.exists()
+        || output.join(format!("{name}-drivers.zip")).exists()
+        || output.join(format!("{name}-minimal")).exists()
+        || output.join(format!("{name}-minimal.tar.gz")).exists()
+    {
         return Err("Refusing to overwrite an existing Linux package".into());
     }
     let args = [
@@ -67,6 +72,27 @@ pub fn linux(root: &Path) -> Result<(), String> {
         )
         .map_err(|_| "Cannot write dependency inventory")?;
     }
+    fs::copy(
+        root.join("LICENSE"),
+        stage.join("drivers/native/LICENSE.TurboDBNote"),
+    )
+    .map_err(|_| "Cannot copy license")?;
+    turbodbn_services::oracle_bundle::prepare(
+        &root.join("target/tools/oracle-bundle"),
+        &stage.join("drivers/native"),
+        "linux-x64",
+        None,
+        &std::sync::atomic::AtomicBool::new(false),
+    )?;
+    let driver_archive = output.join(format!("{name}-drivers.zip"));
+    turbodbn_services::driver_packages::build(
+        &stage.join("drivers/native"),
+        &driver_archive,
+        &version,
+        "linux-x64",
+    )?;
+    fs::write(stage.join("package-flavor.txt"), "full\n")
+        .map_err(|_| "Cannot write package flavor")?;
     for file in ["LICENSE", "README.md", "README.zh-CN.md"] {
         fs::copy(root.join(file), stage.join(file)).map_err(|_| "Cannot copy documentation")?;
     }
@@ -80,7 +106,7 @@ pub fn linux(root: &Path) -> Result<(), String> {
         )
         .map_err(|_| "Cannot write release notes")?;
     }
-    fs::write(stage.join("README.txt"),"Run ./turbodbnote after extraction. Linux x64, Ubuntu 22.04/glibc 2.35 baseline.\nRequires X11/Wayland, Vulkan graphics, libxkbcommon, fontconfig and unixODBC.\nPasswords are session-only on Linux. Windows tray and legacy MySQL DLL are Windows-only.\nApplication data uses the per-user config directory. AI requires a separately installed CLI.\nSee RELEASE-NOTES.md and dependency inventories.\n").map_err(|_|"Cannot write package instructions")?;
+    fs::write(stage.join("README.txt"),"Run ./turbodbnote after extraction. Linux x64, Ubuntu 22.04/glibc 2.35 baseline.\nRequires X11/Wayland, Vulkan graphics, libxkbcommon, fontconfig. Extension workers additionally require unixODBC; Oracle requires libaio.\nPasswords are session-only on Linux. Windows tray and legacy MySQL DLL are Windows-only.\nApplication data uses the per-user config directory. AI requires a separately installed CLI.\nSee RELEASE-NOTES.md and dependency inventories.\n").map_err(|_|"Cannot write package instructions")?;
     let commit = run(root, "git", &["rev-parse", "HEAD"])?;
     fs::write(stage.join("BUILD-INFO.json"),serde_json::to_vec_pretty(&serde_json::json!({"version":version,"commit":commit.trim(),"target":"x86_64-unknown-linux-gnu"})).map_err(|_|"Cannot encode build info")?).map_err(|_|"Cannot write build info")?;
     let sources = format!("--output={}", stage.join("sources.tar.gz").display());
@@ -114,20 +140,49 @@ pub fn linux(root: &Path) -> Result<(), String> {
             &name,
         ],
     )?;
-    let mut source = fs::File::open(&archive).map_err(|_| "Cannot open archive")?;
-    let mut hash = Sha256::new();
-    let mut buffer = [0; 65536];
-    loop {
-        let n = source
-            .read(&mut buffer)
-            .map_err(|_| "Cannot read archive")?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
+    let minimal_name = format!("{name}-minimal");
+    let minimal_stage = output.join(&minimal_name);
+    if minimal_stage.exists() {
+        return Err("Refusing to overwrite minimal package".into());
     }
-    fs::write(checksum, format!("{:x}  {name}.tar.gz\n", hash.finalize()))
-        .map_err(|_| "Cannot write checksum")?;
+    fs::create_dir(&minimal_stage).map_err(|_| "Cannot create minimal package")?;
+    for entry in fs::read_dir(&stage).map_err(|_| "Cannot read package")? {
+        let entry = entry.map_err(|_| "Cannot read package")?;
+        if entry
+            .file_type()
+            .map_err(|_| "Cannot read package")?
+            .is_file()
+        {
+            fs::copy(entry.path(), minimal_stage.join(entry.file_name()))
+                .map_err(|_| "Cannot copy minimal package")?;
+        }
+    }
+    fs::write(minimal_stage.join("package-flavor.txt"), "minimal\n")
+        .map_err(|_| "Cannot write package flavor")?;
+    let minimal_archive = output.join(format!("{minimal_name}.tar.gz"));
+    run(
+        root,
+        "tar",
+        &[
+            "-czf",
+            minimal_archive.to_str().ok_or("Invalid path")?,
+            "-C",
+            output.to_str().ok_or("Invalid path")?,
+            &minimal_name,
+        ],
+    )?;
+    let mut sums = String::new();
+    for file in [&archive, &minimal_archive, &driver_archive] {
+        let digest = turbodbn_services::driver_packages::hash(
+            file,
+            &std::sync::atomic::AtomicBool::new(false),
+        )?;
+        sums.push_str(&format!(
+            "{digest}  {}\n",
+            file.file_name().ok_or("Invalid path")?.to_string_lossy()
+        ));
+    }
+    fs::write(checksum, sums).map_err(|_| "Cannot write checksums")?;
     println!("{name}.tar.gz");
     Ok(())
 }

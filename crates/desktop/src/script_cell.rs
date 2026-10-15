@@ -33,10 +33,12 @@ pub enum ScriptEvent {
     Run(bool),
     Reindexed(SqlScript),
     SelectTarget,
+    PermissionBlocked(crate::note_permissions::Advice),
     Finished { run: u64, success: bool },
 }
 enum PreflightError {
     Other(String),
+    NoteAccess(crate::note_permissions::Advice),
     Permissions(Vec<sql_script::PermissionBlock>),
 }
 impl From<String> for PreflightError {
@@ -61,6 +63,10 @@ pub struct ScriptView {
     selected: u64,
     preview: SharedString,
     preview_markdown: SharedString,
+    preview_comments: SharedString,
+    preview_sql: SharedString,
+    preview_range: SharedString,
+    show_comments: bool,
     status: SharedString,
     page_epoch: u64,
     page_task: Option<Task<()>>,
@@ -68,6 +74,7 @@ pub struct ScriptView {
     preview_task: Option<Task<()>>,
     pub active: bool,
     locked: bool,
+    access_mode: turbodbn_services::access_mode::AccessMode,
     run_id: u64,
     next: u64,
     end: u64,
@@ -79,6 +86,10 @@ pub struct ScriptView {
     risk_task: Option<Task<()>>,
     cancel: Arc<AtomicBool>,
     operation: u64,
+    pending_request: Option<(bool, [u8; 32])>,
+    diagnostic_task: Option<Task<()>>,
+    diagnostic_running: bool,
+    diagnostic_job: Option<(uuid::Uuid, Instant)>,
     executing: bool,
     current_sql: String,
     current_location: Option<(u64, u64)>,
@@ -101,7 +112,16 @@ pub struct ScriptView {
 }
 impl EventEmitter<ScriptEvent> for ScriptView {}
 impl ScriptView {
+    pub fn set_access_mode(
+        &mut self,
+        mode: turbodbn_services::access_mode::AccessMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.access_mode = mode;
+        cx.notify();
+    }
     pub fn scope_changed(&mut self, cx: &mut Context<Self>) {
+        self.stop_diagnostics(cx);
         if self.active {
             self.stop(cx);
         }
@@ -141,6 +161,13 @@ impl ScriptView {
         let results =
             cx.new(|cx| crate::script_results::ScriptResults::new(connections.clone(), window, cx));
         let observed = cx.observe(&connections, |this, _, cx| {
+            if this.diagnostic_running
+                && this.binding.as_ref().is_none_or(|(saved, _)| {
+                    !this.connections.read(cx).connection_snapshot_current(saved)
+                })
+            {
+                this.stop_diagnostics(cx);
+            }
             if this.active && !this.current(this.run_id, cx) {
                 this.fail("notes.preview_changed".into(), cx);
             }
@@ -158,6 +185,10 @@ impl ScriptView {
             selected: 0,
             preview: "".into(),
             preview_markdown: "".into(),
+            preview_comments: "".into(),
+            preview_sql: "".into(),
+            preview_range: "".into(),
+            show_comments: false,
             status: "".into(),
             page_epoch: 0,
             page_task: None,
@@ -165,6 +196,7 @@ impl ScriptView {
             preview_task: None,
             active: false,
             locked: false,
+            access_mode: Default::default(),
             run_id: 0,
             next: 0,
             end: 0,
@@ -176,6 +208,10 @@ impl ScriptView {
             risk_task: None,
             cancel: Arc::new(AtomicBool::new(false)),
             operation: 0,
+            pending_request: None,
+            diagnostic_task: None,
+            diagnostic_running: false,
+            diagnostic_job: None,
             executing: false,
             current_sql: String::new(),
             current_location: None,
@@ -323,6 +359,10 @@ impl ScriptView {
         let script = self.script.clone();
         self.preview = "".into();
         self.preview_markdown = "".into();
+        self.preview_sql = "".into();
+        self.preview_comments = "".into();
+        self.preview_range = "".into();
+        self.show_comments = false;
         let work = cx
             .background_executor()
             .spawn(async move { sql_script::preview(&path, &script, number) });
@@ -334,12 +374,235 @@ impl ScriptView {
                 }
                 match result {
                     Ok(sql) => {
-                        this.preview_markdown =
-                            crate::cell::sql_reading(&sql, sql_script::kind(this.script.dialect))
-                                .into();
-                        this.preview = sql.into();
+                        this.set_preview(sql, cx);
                     }
                     Err(error) => this.status = crate::locale::message(cx, &error),
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
+    fn set_preview(&mut self, source: String, cx: &App) {
+        let line = self
+            .rows
+            .iter()
+            .find(|r| r.number == self.selected)
+            .map(|r| r.line)
+            .or_else(|| self.current_location.map(|(_, line)| line))
+            .unwrap_or(1);
+        let parts = sql_script::statement_preview(source, line, self.script.dialect);
+        self.preview_markdown =
+            crate::cell::sql_reading(&parts.sql, sql_script::kind(self.script.dialect)).into();
+        self.preview_range = tr(
+            cx,
+            "script.source_range",
+            &[
+                ("sql_line", &parts.sql_line.to_string()),
+                ("start", &parts.source_line.to_string()),
+                ("end", &parts.end_line.to_string()),
+            ],
+        );
+        self.preview_comments = parts.comments.into();
+        self.preview_sql = parts.sql.into();
+        self.preview = parts.source.into();
+    }
+    fn diagnostic_log(
+        &self,
+        job: uuid::Uuid,
+        phase: crate::operation_log::Phase,
+        elapsed: u64,
+        error: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(output) = self.connections.read(cx).output.clone() {
+            let mut record =
+                crate::operation_log::Record::new(job, crate::operation_log::Kind::Query, phase);
+            record.source = self.binding.as_ref().map(|(saved, _)| saved.profile.id);
+            record.elapsed_ms = elapsed;
+            if let Some(error) = error {
+                record.failure = crate::operation_log::failure_class(error);
+            }
+            output.update(cx, |output, cx| output.operation(record, cx));
+        }
+    }
+    fn stop_diagnostics(&mut self, cx: &mut Context<Self>) {
+        if let Some((job, start)) = self.diagnostic_job.take() {
+            self.diagnostic_log(
+                job,
+                crate::operation_log::Phase::Cancelled,
+                start.elapsed().as_millis() as u64,
+                None,
+                cx,
+            );
+        }
+        self.diagnostic_task = None;
+        self.diagnostic_running = false;
+    }
+    fn diagnose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active || self.diagnostic_running {
+            return;
+        }
+        let Some((saved, database)) = self.binding.clone() else {
+            return;
+        };
+        if !self
+            .connections
+            .read(cx)
+            .connection_snapshot_current(&saved)
+        {
+            feedback::error(t(cx, "notes.preview_changed"), cx);
+            return;
+        }
+        let original = saved.clone();
+        let target = format!("{} / {}", saved.profile.name, database);
+        let expected_database = database.clone();
+        let run = self.run_id;
+        let job = uuid::Uuid::new_v4();
+        let start = Instant::now();
+        self.diagnostic_job = Some((job, start));
+        self.diagnostic_running = true;
+        self.diagnostic_log(job, crate::operation_log::Phase::Started, 0, None, cx);
+        self.diagnostic_task = Some(cx.spawn_in(window, async move |owner, cx| {
+            let endpoint = cx
+                .background_executor()
+                .spawn(async move { saved.endpoint(database) })
+                .await;
+            let result = async {
+                let endpoint = endpoint?;
+                let (session, events) = Session::start(endpoint.profile, endpoint.password, false);
+                while let Ok(event) = events.recv().await {
+                    match event {
+                        Event::Connected(info) => {
+                            if info.database.as_deref() != Some(expected_database.as_str()) {
+                                return Err("script.error.request_mismatch".into());
+                            }
+                            session
+                                .request(Operation {
+                                    id: 1,
+                                    kind: OperationKind::Workbench(Box::new(Request {
+                                        database: expected_database.clone(),
+                                        action: Action::ScriptDiagnostics,
+                                    })),
+                                })
+                                .map_err(|_| "script.error.execution")?;
+                        }
+                        Event::Operation { id: 1, result } => {
+                            return match result {
+                                Ok(OperationResult::Workbench(reply)) => match *reply {
+                                    Reply::ScriptDiagnostics(report) => Ok(report),
+                                    _ => Err("script.error.request_mismatch".into()),
+                                },
+                                Err(error) => Err(error),
+                                _ => Err("script.error.request_mismatch".into()),
+                            };
+                        }
+                        Event::Failed(error) => return Err(error),
+                        Event::Disconnected => return Err("script.error.execution".into()),
+                        _ => {}
+                    }
+                }
+                Err("script.error.execution".into())
+            }
+            .await;
+            let _ = owner.update_in(cx, |this, window, cx| {
+                this.diagnostic_job = None;
+                this.diagnostic_running = false;
+                this.diagnostic_log(
+                    job,
+                    if result.is_ok() {
+                        crate::operation_log::Phase::Succeeded
+                    } else {
+                        crate::operation_log::Phase::Failed
+                    },
+                    start.elapsed().as_millis() as u64,
+                    result.as_ref().err().map(String::as_str),
+                    cx,
+                );
+                if this.run_id != run
+                    || !this
+                        .connections
+                        .read(cx)
+                        .connection_snapshot_current(&original)
+                {
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Err(error) => feedback::error(crate::locale::message(cx, &error), cx),
+                    Ok(report) => {
+                        let grants = if report.grants_available {
+                            if report.direct_privileges.is_empty() {
+                                t(cx, "script.diagnostics.not_seen").to_string()
+                            } else {
+                                report.direct_privileges.join(", ")
+                            }
+                        } else {
+                            t(cx, "script.diagnostics.grants_unavailable").to_string()
+                        };
+                        let text = tr(
+                            cx,
+                            "script.diagnostics.report",
+                            &[
+                                ("version", &report.version),
+                                ("account", &report.account),
+                                ("database", &report.database),
+                                (
+                                    "binlog",
+                                    if report.binary_log.is_empty() {
+                                        "?"
+                                    } else {
+                                        &report.binary_log
+                                    },
+                                ),
+                                (
+                                    "trust",
+                                    if report.trust_creators.is_empty() {
+                                        "?"
+                                    } else {
+                                        &report.trust_creators
+                                    },
+                                ),
+                                ("grants", &grants),
+                            ],
+                        );
+                        window.open_dialog(cx, move |dialog, _, cx| {
+                            dialog
+                                .title(t(cx, "script.diagnostics.title"))
+                                .w(px(700.))
+                                .child(
+                                    div()
+                                        .v_flex()
+                                        .gap_3()
+                                        .child(target.clone())
+                                        .child(div().whitespace_normal().child(text.clone()))
+                                        .child(t(cx, "script.diagnostics.hint"))
+                                        .child(
+                                            feedback::actions()
+                                                .child(feedback::close_button(cx))
+                                                .child(
+                                                    Button::new("copy-script-diagnostics")
+                                                        .icon(IconName::Copy)
+                                                        .label(t(cx, "script.diagnostics.copy"))
+                                                        .on_click({
+                                                            let text = text.clone();
+                                                            move |_, _, cx| {
+                                                                cx.write_to_clipboard(
+                                                                    ClipboardItem::new_string(
+                                                                        text.to_string(),
+                                                                    ),
+                                                                );
+                                                                feedback::success(
+                                                                    t(cx, "feedback.copied"),
+                                                                    cx,
+                                                                );
+                                                            }
+                                                        }),
+                                                ),
+                                        ),
+                                )
+                        });
+                    }
                 }
                 cx.notify();
             });
@@ -377,7 +640,7 @@ impl ScriptView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.active || self.indexing {
+        if self.active || self.indexing || self.diagnostic_running {
             return false;
         }
         if saved.profile.kind != sql_script::kind(self.script.dialect) {
@@ -409,6 +672,7 @@ impl ScriptView {
         };
         self.authorize_next = self.next;
         self.operation = 0;
+        self.pending_request = None;
         self.executing = false;
         self.job = uuid::Uuid::new_v4();
         self.started = Instant::now();
@@ -434,9 +698,11 @@ impl ScriptView {
             })
             .map(|(key, _, _)| key.to_string())
             .collect::<Vec<_>>();
+        let mode = self.access_mode;
         let work = cx.background_executor().spawn(async move {
             let mut reader = sql_script::freeze(&path, &script, &cancel)?;
             let mut blocked = Vec::new();
+            let mut mode_blocked = None;
             if selected && saved.profile.kind == turbodbn_services::DatabaseKind::MySql {
                 let mut context = false;
                 for number in 0..script.statements {
@@ -471,6 +737,33 @@ impl ScriptView {
                     return Err(PreflightError::Other("script.cancelled".into()));
                 }
                 let sql = reader.statement(number)?;
+                if mode_blocked.is_none()
+                    && !turbodbn_services::database::notebook_query::note_mode_allows(
+                        mode,
+                        saved.profile.kind,
+                        &sql,
+                        true,
+                    )
+                {
+                    let key = turbodbn_services::database::notebook_query::script_command_required(
+                        saved.profile.kind,
+                        &sql,
+                    )
+                    .ok_or("script.error.unsupported")?;
+                    let required = if turbodbn_services::database::notebook_query::note_mode_allows(
+                        turbodbn_services::access_mode::AccessMode::ReadWrite,
+                        saved.profile.kind,
+                        &sql,
+                        true,
+                    ) {
+                        turbodbn_services::access_mode::AccessMode::ReadWrite
+                    } else {
+                        turbodbn_services::access_mode::AccessMode::Admin
+                    };
+                    mode_blocked = Some(crate::note_permissions::Advice::blocked_mode(
+                        mode, required, key,
+                    ));
+                }
                 turbodbn_services::database::notebook_query::validate_script_target(
                     saved.profile.kind,
                     &sql,
@@ -508,6 +801,9 @@ impl ScriptView {
             if !blocked.is_empty() {
                 return Err(PreflightError::Permissions(blocked));
             }
+            if let Some(advice) = mode_blocked {
+                return Err(PreflightError::NoteAccess(advice));
+            }
             sequence.finish()?;
             let mut endpoint = saved.endpoint(database)?;
             if endpoint.profile.kind == turbodbn_services::DatabaseKind::MySql {
@@ -525,6 +821,7 @@ impl ScriptView {
                                 PreflightError::Permissions(blocks) => {
                                     this.permission_dialog(blocks, window, cx)
                                 }
+                                PreflightError::NoteAccess(advice)=>{this.fail("notes.access.blocked".into(),cx);this.status=advice.message(cx);cx.emit(ScriptEvent::PermissionBlocked(advice));}
                                 PreflightError::Other(error) => {
                                     let mismatch = error == "script.error.database_mismatch";
                                     this.fail(error, cx);
@@ -571,11 +868,17 @@ impl ScriptView {
                                     && !turbodbn_services::mysql::modern_version(&info.version);
                                 this.authorize_next(window, cx);
                             }
+                            Event::Operation { id, .. } if id == this.operation && this.pending_request.is_none_or(|(_,hash)|hash!=turbodbn_services::database::notebook_query::script_source_fingerprint(&this.current_sql)) => this.fail("script.error.request_mismatch".into(),cx),
                             Event::Operation { id, result } if id == this.operation => match result
                             {
                                 Ok(OperationResult::Workbench(reply)) => match *reply {
-                                    Reply::NotePrepared(plan) => this.prepared(plan, window, cx),
+                                    Reply::NotePrepared(plan) => {
+                                        if this.pending_request.take()!=Some((true,turbodbn_services::database::notebook_query::script_source_fingerprint(&plan.sql))) { this.fail("script.error.request_mismatch".into(),cx); }
+                                        else { this.prepared(plan,window,cx); }
+                                    },
                                     Reply::NoteResult(result) => {
+                                        if this.pending_request.take()!=Some((false,turbodbn_services::database::notebook_query::script_source_fingerprint(&this.current_sql))) { this.fail("script.error.request_mismatch".into(),cx);return this.active; }
+
                                         this.completed += 1;
                                         let line =
                                             this.current_location.map_or(0, |(_, line)| line);
@@ -916,6 +1219,7 @@ impl ScriptView {
                 cx.global::<crate::preferences::Preferences>()
                     .database
                     .command_enabled(key)
+                    && self.access_mode.allows_note(key)
             })
         })
     }
@@ -929,6 +1233,20 @@ impl ScriptView {
                 );
             }
             self.advance(window, cx);
+            return;
+        }
+        if let Some(advice) = self.binding.as_ref().and_then(|(saved, _)| {
+            crate::note_permissions::Advice::for_sql(
+                self.access_mode,
+                &saved.profile,
+                &plan.sql,
+                true,
+                cx,
+            )
+        }) {
+            self.fail("notes.access.blocked".into(), cx);
+            self.status = advice.message(cx);
+            cx.emit(ScriptEvent::PermissionBlocked(advice));
             return;
         }
         if !self.permitted(&plan, cx) {
@@ -988,6 +1306,29 @@ impl ScriptView {
         let Some((_, database)) = &self.binding else {
             return;
         };
+        self.pending_request = match &action {
+            Action::ScriptPrepare { sql } => Some((
+                true,
+                turbodbn_services::database::notebook_query::script_source_fingerprint(sql),
+            )),
+            Action::ScriptExecute { plan, .. } => {
+                if turbodbn_services::database::notebook_query::script_source_fingerprint(&plan.sql)
+                    != turbodbn_services::database::notebook_query::script_source_fingerprint(
+                        &self.current_sql,
+                    )
+                {
+                    self.fail("script.error.request_mismatch".into(), cx);
+                    return;
+                }
+                Some((
+                    false,
+                    turbodbn_services::database::notebook_query::script_source_fingerprint(
+                        &plan.sql,
+                    ),
+                ))
+            }
+            _ => None,
+        };
         self.operation += 1;
         if self.session.as_ref().is_none_or(|session| {
             session
@@ -1043,7 +1384,33 @@ impl ScriptView {
             reason
         };
         self.log(crate::operation_log::Phase::Failed, Some(&error), cx);
-        feedback::error(self.status.clone(), cx);
+        if error != "notes.access.blocked" {
+            if matches!(
+                error.as_str(),
+                "mysql.error.command_denied"
+                    | "mysql.error.privilege_1227"
+                    | "mysql.error.trigger_privilege_1419"
+            ) {
+                let owner = cx.entity().downgrade();
+                let run = self.run_id;
+                feedback::action_error(
+                    self.status.clone(),
+                    t(cx, "script.diagnostics.run"),
+                    move |window, cx| {
+                        let _ = owner.update(cx, |this, cx| {
+                            if this.run_id != run {
+                                feedback::error(t(cx, "permissions.expired"), cx);
+                                return;
+                            }
+                            this.diagnose(window, cx);
+                        });
+                    },
+                    cx,
+                );
+            } else {
+                feedback::error(self.status.clone(), cx);
+            }
+        }
         self.finish(false, cx);
     }
     fn finish(&mut self, success: bool, cx: &mut Context<Self>) {
@@ -1293,6 +1660,22 @@ impl Render for ScriptView {
                                                 .truncate()
                                                 .child(row.preview.clone()),
                                         )
+                                        .when(row.has_comments, |el| {
+                                            el.child(
+                                                Button::new(SharedString::from(format!(
+                                                    "script-comments-{number}"
+                                                )))
+                                                .ghost()
+                                                .small()
+                                                .icon(IconName::Info)
+                                                .tooltip(t(cx, "script.comments_hint"))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.select(number, cx);
+                                                    this.show_comments = true;
+                                                })),
+                                            )
+                                        })
                                         .when(!row.supported, |el| {
                                             let reason = crate::locale::message(cx, &row.reason);
                                             el.child(
@@ -1386,6 +1769,60 @@ impl Render for ScriptView {
         if !self.preview_markdown.is_empty() {
             body = body.child(
                 div()
+                    .h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(self.preview_range.clone()),
+                    )
+                    .when(!self.preview_comments.is_empty(), |el| {
+                        el.child(
+                            Button::new("script-show-comments")
+                                .ghost()
+                                .small()
+                                .icon(IconName::Info)
+                                .label(t(cx, "script.comments"))
+                                .selected(self.show_comments)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_comments = !this.show_comments;
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("script-copy-sql")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Copy)
+                            .label(t(cx, "script.copy_sql"))
+                            .tooltip(t(cx, "script.copy_sql_hint"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    this.preview_sql.to_string(),
+                                ));
+                                feedback::success(t(cx, "feedback.copied"), cx);
+                            })),
+                    ),
+            );
+            if self.show_comments {
+                body = body.child(
+                    div()
+                        .id("script-leading-comments")
+                        .max_h(px(140.))
+                        .overflow_y_scroll()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .whitespace_normal()
+                        .child(self.preview_comments.clone()),
+                );
+            }
+
+            body = body.child(
+                div()
                     .id("script-preview")
                     .relative()
                     .max_h(px(220.))
@@ -1404,7 +1841,7 @@ impl Render for ScriptView {
                             Button::new("script-copy-preview")
                                 .ghost()
                                 .icon(IconName::Copy)
-                                .tooltip(t(cx, "script.copy"))
+                                .tooltip(t(cx, "script.copy_source"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
                                         this.preview.to_string(),
@@ -1416,6 +1853,45 @@ impl Render for ScriptView {
             );
         }
         body = body.child(self.results.clone());
+        if self.failed_location.is_some()
+            && self.binding.as_ref().is_some_and(|(saved, _)| {
+                saved.profile.kind == turbodbn_services::DatabaseKind::MySql
+            })
+        {
+            body = body.child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("script-diagnostics")
+                            .ghost()
+                            .icon(IconName::Search)
+                            .label(t(
+                                cx,
+                                if self.diagnostic_running {
+                                    "script.diagnostics.running"
+                                } else {
+                                    "script.diagnostics.run"
+                                },
+                            ))
+                            .tooltip(t(cx, "script.diagnostics.tip"))
+                            .disabled(self.active || self.diagnostic_running)
+                            .on_click(cx.listener(|this, _, window, cx| this.diagnose(window, cx))),
+                    )
+                    .when(self.diagnostic_running, |el| {
+                        el.child(
+                            Button::new("cancel-script-diagnostics")
+                                .ghost()
+                                .icon(IconName::Close)
+                                .tooltip(t(cx, "script.diagnostics.cancel"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.stop_diagnostics(cx);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
+        }
         if let Some((number, line)) = self.failed_location {
             body = body.child(
                 Button::new("script-locate-failure")
@@ -1435,12 +1911,7 @@ impl Render for ScriptView {
                         this.preview_epoch += 1;
                         this.preview_task = None;
                         this.load_page(number / sql_script::PAGE_SIZE * sql_script::PAGE_SIZE, cx);
-                        this.preview = this.current_sql.clone().into();
-                        this.preview_markdown = crate::cell::sql_reading(
-                            &this.current_sql,
-                            sql_script::kind(this.script.dialect),
-                        )
-                        .into();
+                        this.set_preview(this.current_sql.clone(), cx);
                         cx.notify();
                     })),
             );

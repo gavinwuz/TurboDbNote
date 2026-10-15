@@ -27,7 +27,7 @@
 | 分析／时序 | ClickHouse、Apache Doris、TDengine |
 | NoSQL／搜索 | Redis、MongoDB、Cassandra、Elasticsearch |
 
-能力依驱动而异。Note SQL 执行支持 MySQL/PostgreSQL/SQLite；外部适配器提供连接、对象浏览与有界只读预览，Doris 为只读。Access/DB2 需对应 ODBC 提供程序，Oracle 需 OCI 客户端。详见[驱动能力与前置条件](docs/database-drivers.md)。
+能力依驱动而异。Note SQL 执行支持 MySQL/PostgreSQL/SQLite；外部适配器提供连接、对象浏览与有界预览；MongoDB 额外支持明确启用后确认提交文档写入，Doris 为只读。Access/DB2 需对应 ODBC 提供程序，Oracle 需 OCI 客户端。详见[驱动能力与前置条件](docs/database-drivers.md)。
 
 MySQL 数据库检测兼容带 BINARY 标记的 UTF-8 元数据，编码失败与权限拒绝分别提示。Note 支持有界 `SHOW DATABASES`/`SHOW SCHEMAS`，以及 `SHOW TABLES`/`SHOW STATUS`/`SHOW VARIABLES` 的 LIKE 字符串筛选；STATUS/VARIABLES 可带 SESSION/GLOBAL 范围。上述指令遵循设置 → 数据库 → SQL 命令许可，不修改服务端授权。
 
@@ -86,3 +86,23 @@ Note MySQL 脚本支持单库、受控 UTF-8 会话设置、常见导出变量�
 SQL 文件导出的普通建表语句默认包含 `IF NOT EXISTS`：已有表跳过创建，不校验或修改其结构；数据语句保留原有行为。
 
 SQL 脚本单元展示累计执行统计与最近 500 条明细，保留最近一次真实查询结果，并按需读取所选表的最多 512 个字段。无法确认的计数明确显示未知；影响行数不等同已提交数量。MySQL 条件建表通过服务端诊断区分新增与跳过。
+
+驱动设置支持匹配版本下载、可信离线 ZIP 导入、依赖检测与持久化启用开关；发行提供完整／最小版本及离线组件包。扩展驱动使用 Rust 独立进程，Oracle／Access／DB2 按实际 OCI／ODBC 依赖判定就绪。
+
+支持逐行粘贴连接 URL（最多 100 条／64 KiB），预览后创建独立可编辑草稿，不自动连接。支持 MySQL/MariaDB、PostgreSQL、Redis/rediss、ClickHouse 和单主机 MongoDB；密码默认遮罩，明确保存前仅保留在内存，不支持的参数阻止该条导入。新建 MongoDB 表单默认复用默认数据库认证，可在“高级”中覆盖；URL 和已有连接保留明确的认证库。
+
+MongoDB 集合支持带 BSON 类型的顶层字段列与联动虚拟文档树。对象／数组显示有界摘要，复制和 CSV 导出保留完整 Canonical EJSON 值。节点菜单提供复制、渐进展开、本地暂存编辑和克隆草稿。MongoDB 默认只读；需在“高级”中明确关闭只读，保存并重新连接后，才能确认提交单文档修改／克隆。更新校验原始文档，不自动重试。共享数据表格拖动列宽时显示参考线、松手后一次应用；表头菜单提供数字列宽／适应内容／恢复默认，列宽在本机保存。
+
+连接 URL 帮助提供脱敏示例，并兼容 MySQL `@tcp(主机:端口)` DSN 风格。Go 专属 `interpolateParams`、`parseTime`、`loc` 会在预览中说明差异，此类连接默认不勾选，由用户明确选择接受本应用行为。设置页使用正常页签导航；驱动状态详情与未就绪项按需展开，启用操作采用左右开关。
+
+通用 ODBC 支持已有 x64 DSN 或已安装驱动名称及经过校验的非敏感参数，提供只读目录、字段与有界数据预览。Windows 完整包/组件包附带官方 DB2 CLI 离线归档及手动注册说明，不自动注册系统驱动。详见[驱动说明](docs/database-drivers.md)。
+
+导入的 MySQL 脚本支持 `DROP TRIGGER [IF EXISTS]`，需开启默认关闭的脚本专属权限并明确批量授权。执行前重新核对触发器元数据；普通 SQL 单元权限不变。
+
+MySQL 脚本另支持事务隔离级别、受限的 SET 用户变量和 SELECT INTO；带锁 SELECT 使用脚本锁定权限，普通 SQL 单元仍不开放。
+
+Note 连接选择显示环境、驱动与地址；每个打开的 Note 提供独立的只读/读写/DBA 限制，不能突破全局 SQL 权限。脚本预览区分前置注释与实际 SQL，失败后可手动运行 MySQL 只读诊断，不修改服务器策略。
+
+连接超时与单次执行超时已分开：保留已有连接值，执行默认 300 秒。Note 读写允许 INSERT/UPDATE，DELETE 需 DBA。界面耗时按毫秒、秒、分自适应显示，日志仍保留毫秒。外部组件协议升级至 5。
+
+设置 → 数据库 → 查询提供全局默认超时；新连接默认继承，已有自定义值保留。Note 权限提示提供切换模式、打开全局 SQL 设置或选择可写连接的引导，均不自动执行 SQL。

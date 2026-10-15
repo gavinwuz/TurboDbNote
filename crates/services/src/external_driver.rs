@@ -20,6 +20,9 @@ pub(crate) fn acquire() -> Result<Permit, String> {
 }
 
 pub fn directory() -> Option<PathBuf> {
+    crate::driver_packages::runtime_directory().ok().flatten()
+}
+pub fn bundled_directory() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let mut base = exe.parent()?.to_path_buf();
     if base
@@ -55,7 +58,10 @@ pub(crate) fn command(p: &Profile) -> Result<tokio::process::Command, String> {
     if spec.component == "removed" {
         return Err("drivers.removed".into());
     }
-    let dir = directory().ok_or("drivers.runtime_missing")?;
+    if !crate::driver_packages::enabled(spec.id) {
+        return Err("components.disabled".into());
+    }
+    let dir = crate::driver_packages::runtime_directory()?.ok_or("drivers.runtime_missing")?;
     let executable = dir.join(executable_name());
     if !executable.is_file() {
         return Err("drivers.runtime_missing".into());

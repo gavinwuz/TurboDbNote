@@ -8,12 +8,15 @@ mod navigation;
 mod objects_ui;
 #[path = "database_transfer.rs"]
 mod transfer_ui;
+#[path = "database_url.rs"]
+mod url_ui;
 pub(crate) use transfer_ui::Connection as SavedConnection;
 #[path = "database_workbench.rs"]
 mod workbench_ui;
 use crate::{connection_secret, connection_store, feedback};
 use gpui_component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
 use navigation::Navigation;
+pub(crate) use navigation::environment_color;
 use turbodbn_services::database::workbench::{self, Action, Object, Reply, Schema};
 use turbodbn_services::{
     DatabaseKind,
@@ -81,6 +84,7 @@ pub struct DatabaseView {
     choosing_type: bool,
     type_grid: bool,
     typed_drafts: HashMap<String, (Profile, String)>,
+    url_drafts: Vec<(Profile, String)>,
     navigation: Navigation,
     navigation_error: bool,
     nav_writer: async_channel::Sender<Navigation>,
@@ -132,7 +136,7 @@ pub struct DatabaseView {
     _search: Subscription,
     _inputs: Vec<Subscription>,
 }
-const FIELDS: [(&str, &str); 16] = [
+const FIELDS: [(&str, &str); 21] = [
     ("sqlite_path", "选择数据库文件"),
     ("charset", "utf8mb4 / gbk / 自定义字符集"),
     ("legacy", "兼容驱动库绝对路径"),
@@ -145,7 +149,12 @@ const FIELDS: [(&str, &str); 16] = [
     ("user", "用户名"),
     ("password", "密码（可留空）"),
     ("database", "数据库 *"),
+    ("mongo_auth_source", ""),
+    ("odbc_dsn", ""),
+    ("odbc_driver", ""),
+    ("odbc_parameters", ""),
     ("timeout", "连接超时（秒）"),
+    ("execution_timeout", ""),
     ("ca", "CA 证书路径"),
     ("cert", "客户端证书路径"),
     ("key", "客户端私钥路径"),
@@ -469,7 +478,9 @@ impl DatabaseView {
                             }
                             _ => SharedString::from(*label),
                         });
-                        if *key == "password" {
+                        if *key == "odbc_parameters" {
+                            input.multi_line(true)
+                        } else if *key == "password" {
                             input.masked(true)
                         } else if *key == "port" {
                             input.validate(|value, _| {
@@ -536,6 +547,7 @@ impl DatabaseView {
             choosing_type: false,
             type_grid: true,
             typed_drafts: HashMap::new(),
+            url_drafts: Vec::new(),
             navigation,
             navigation_error,
             nav_writer,
@@ -706,6 +718,7 @@ impl DatabaseView {
         self.baseline = profile.clone();
         self.clear_password = false;
         self.load_password(&profile, window, cx);
+        let effective_timeouts = profile.resolve_timeouts();
         let data = [
             ("sqlite_path", profile.sqlite_path),
             ("charset", profile.charset),
@@ -718,7 +731,15 @@ impl DatabaseView {
             ("user", profile.user),
             ("password", self.loaded_password.clone()),
             ("database", profile.database),
-            ("timeout", profile.timeout_seconds.to_string()),
+            ("mongo_auth_source", profile.mongo_auth_source),
+            ("odbc_dsn", profile.odbc.dsn),
+            ("odbc_driver", profile.odbc.driver),
+            ("odbc_parameters", profile.odbc.parameters),
+            ("timeout", effective_timeouts.timeout_seconds.to_string()),
+            (
+                "execution_timeout",
+                effective_timeouts.execution_timeout_seconds.to_string(),
+            ),
             ("ca", profile.ca),
             ("cert", profile.client_cert),
             ("key", profile.client_key),
@@ -730,6 +751,11 @@ impl DatabaseView {
     }
     fn raw_draft(&self, cx: &App) -> Result<Profile, String> {
         let profile = Profile {
+            odbc: turbodbn_core::odbc::Options {
+                dsn: self.text("odbc_dsn", cx),
+                driver: self.text("odbc_driver", cx),
+                parameters: self.text("odbc_parameters", cx),
+            },
             sqlite_path: self.text("sqlite_path", cx),
             charset: self.text("charset", cx).to_ascii_lowercase(),
             legacy_library: self.text("legacy", cx),
@@ -742,11 +768,35 @@ impl DatabaseView {
                 .parse()
                 .map_err(|_| "端口应为 1–65535")?,
             user: self.text("user", cx),
-            database: self.text("database", cx),
-            timeout_seconds: self
-                .text("timeout", cx)
-                .parse()
-                .map_err(|_| "超时应为 1–60 秒")?,
+            database: if self.editing.driver_id == "odbc" {
+                self.text("odbc_dsn", cx)
+            } else {
+                self.text("database", cx)
+            },
+            mongo_auth_source: if self.text("mongo_auth_source", cx).is_empty() {
+                let database = self.text("database", cx);
+                if database.is_empty() {
+                    "admin".into()
+                } else {
+                    database
+                }
+            } else {
+                self.text("mongo_auth_source", cx)
+            },
+            execution_timeout_seconds: if self.editing.inherit_timeouts {
+                self.editing.execution_timeout_seconds
+            } else {
+                self.text("execution_timeout", cx)
+                    .parse()
+                    .map_err(|_| "database.timeout.execution_invalid")?
+            },
+            timeout_seconds: if self.editing.inherit_timeouts {
+                self.editing.timeout_seconds
+            } else {
+                self.text("timeout", cx)
+                    .parse()
+                    .map_err(|_| "database.timeout.defaults_invalid")?
+            },
             ca: self.text("ca", cx),
             client_cert: self.text("cert", cx),
             client_key: self.text("key", cx),
@@ -758,6 +808,9 @@ impl DatabaseView {
         let mut p = driver.profile();
         p.name.clear();
         p.group.clear();
+        if driver.id == "mongodb" {
+            p.mongo_auth_source.clear();
+        }
         p.remember_password = cfg!(windows) && !driver.file;
         p.tls = TlsMode::Disabled;
         p.allow_old_auth = driver.id == "mysql";
@@ -797,9 +850,23 @@ impl DatabaseView {
         self.draft_for(false, cx)
     }
     pub(crate) fn dirty(&self, cx: &App) -> bool {
-        self.clear_password
+        self.url_drafts
+            .iter()
+            .any(|(p, _)| !self.profiles.iter().any(|saved| saved.id == p.id))
+            || self.clear_password
             || self.raw_draft(cx).ok().as_ref() != Some(&self.baseline)
             || self.fields["password"].read(cx).value().as_str() != self.loaded_password
+    }
+    pub(crate) fn discard_message(&self, fallback: &'static str, cx: &App) -> SharedString {
+        if self.url_drafts.is_empty() {
+            crate::locale::t(cx, fallback)
+        } else {
+            crate::locale::tr(
+                cx,
+                "url.discard_body",
+                &[("count", &self.url_drafts.len().to_string())],
+            )
+        }
     }
     fn select(&mut self, id: Uuid, open_editor: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving {
@@ -817,7 +884,7 @@ impl DatabaseView {
                     let view = cx.entity().downgrade();
                     feedback::confirm_labels(
                         crate::locale::t(cx, "dbwork.draft.switch_title"),
-                        crate::locale::t(cx, "dbwork.draft.switch_body"),
+                        self.discard_message("dbwork.draft.switch_body", cx),
                         crate::locale::t(cx, "dbwork.draft.keep"),
                         crate::locale::t(cx, "dbwork.draft.discard"),
                         window,
@@ -1018,7 +1085,7 @@ impl DatabaseView {
         }
         let attempted_mode = profile.tls;
         catalog_source.database.clear();
-        profile.list_all_databases = true;
+        profile.list_all_databases = profile.driver_id != "mongodb" || discover;
         if discover && profile.kind != DatabaseKind::PostgreSql {
             profile.database.clear();
         }
@@ -1168,10 +1235,12 @@ impl DatabaseView {
                                     }
                                     this.remember_connection(id, cx);
                                     this.status = format!(
-                                        "连接成功 · {} {} · {} ms",
+                                        "连接成功 · {} {} · {}",
                                         snapshot.kind.label(),
                                         info.version,
-                                        info.elapsed_ms
+                                        crate::duration::elapsed(
+                                            info.elapsed_ms.min(u64::MAX as u128) as u64
+                                        )
                                     );
                                     if trial.is_some() {
                                         this.status.push_str(&format!(
@@ -1204,10 +1273,12 @@ impl DatabaseView {
                                         this.temporary_passwords.insert(id, cached.clone());
                                     }
                                     this.status = format!(
-                                        "测试成功 · {} {} · {} ms（测试连接已释放）",
+                                        "测试成功 · {} {} · {}（测试连接已释放）",
                                         snapshot.kind.label(),
                                         info.version,
-                                        info.elapsed_ms
+                                        crate::duration::elapsed(
+                                            info.elapsed_ms.min(u64::MAX as u128) as u64
+                                        )
                                     );
                                     if discover {
                                         this.status = crate::locale::tr(
@@ -1440,6 +1511,7 @@ impl DatabaseView {
                             }
                             this.temporary_passwords
                                 .insert(id, connection_secret::Cached::new(&profile, password));
+                            this.url_drafts.retain(|(p, _)| p.id != id);
                             this.fill(profile, window, cx);
                             this.status =
                                 crate::locale::t(cx, "feedback.connection.saved").to_string();
@@ -1542,6 +1614,7 @@ impl DatabaseView {
     }
     pub(crate) fn discard_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.typed_drafts.clear();
+        self.url_drafts.clear();
         self.reset(window, cx);
     }
     fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1933,17 +2006,17 @@ impl DatabaseView {
             )
             .into_any_element()
     }
-    fn field(&self, key: &'static str, label: &'static str) -> AnyElement {
+    fn field(&self, key: &'static str, label: impl Into<SharedString>) -> AnyElement {
         div()
             .v_flex()
             .gap_1()
             .w_full()
-            .child(label)
-            .child(
-                Input::new(&self.fields[key])
-                    .cleanable(true)
-                    .disabled(self.saving),
-            )
+            .child(label.into())
+            .child(Input::new(&self.fields[key]).cleanable(true).disabled(
+                self.saving
+                    || self.editing.inherit_timeouts
+                        && matches!(key, "timeout" | "execution_timeout"),
+            ))
             .into_any_element()
     }
     fn sync_database_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2210,6 +2283,21 @@ impl Panel for DatabaseView {
 }
 impl Render for DatabaseView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.editing.inherit_timeouts {
+            let effective = self.editing.resolve_timeouts();
+            for (key, value) in [
+                ("timeout", effective.timeout_seconds.to_string()),
+                (
+                    "execution_timeout",
+                    effective.execution_timeout_seconds.to_string(),
+                ),
+            ] {
+                if self.fields[key].read(cx).value().as_str() != value {
+                    self.fields[key].update(cx, |field, cx| field.set_value(value, window, cx));
+                }
+            }
+        }
+
         self.sync_database_picker(window, cx);
         if let Some(prompt) = self.pending_tls.take() {
             cx.defer_in(window, move |this, window, cx| {
@@ -2234,8 +2322,10 @@ impl Render for DatabaseView {
             .child(div().h_flex().justify_between().child(div().text_lg().child(format!("{} 连接",self.editing.driver_label())))
                 .when(!self.profiles.iter().any(|p|p.id==id),|el|el.child(Button::new("choose-database-type").icon(IconName::ArrowLeft).label("选择类型")
                     .on_click(cx.listener(|this,_,_,cx|{this.choosing_type=true;cx.notify();})))))
+            .when(!self.url_drafts.is_empty(),|el|el.child(self.url_draft_picker(cx)))
+            .child(Button::new("paste-connection-url").tooltip(crate::locale::t(cx,"url.format_tip")).ghost().icon(IconName::Copy).label(crate::locale::t(cx,"url.import")).disabled(self.saving).on_click(cx.listener(|this,_,window,cx|this.paste_connection_urls(window,cx))))
             .child(div().h_flex().gap_2().children(["连接信息", "TLS / SSL", "高级"].into_iter().enumerate().map(|(index,label)| {
-                Button::new(("connection-tab",index)).label(label).selected(self.tab==index).disabled(index==1&&(self.editing.is_file_database() || self.editing.driver_id == "db2"))
+                Button::new(("connection-tab",index)).label(label).selected(self.tab==index).disabled(index==1&&(self.editing.is_file_database() || ["db2", "odbc"].contains(&self.editing.driver_id.as_str())))
                     .on_click(cx.listener(move |this,_,_,cx|{this.tab=index;cx.notify();}))
             })))
             .child(div().id("connection-form-body").flex_1().min_h_0().overflow_y_scroll().v_flex().gap_3()
@@ -2253,8 +2343,7 @@ impl Render for DatabaseView {
                 div()
                     .h_flex()
                     .gap_3()
-                    .child(self.field("host", "主机"))
-                    .child(self.field("port", "端口")),
+                    .when(self.editing.driver_id!="odbc",|el|el.child(self.field("host", "主机")).child(self.field("port", "端口"))),
             )
             .when(self.editing.kind==DatabaseKind::ClickHouse,|el|el.child("ClickHouse HTTP：通常 8123；HTTPS：通常 8443，请与 TLS 模式对应。"))
             .child(self.field("user", if self.editing.kind==DatabaseKind::Redis {"用户名（可选，Redis ACL）"}else{"用户名"}))
@@ -2278,6 +2367,11 @@ impl Render for DatabaseView {
                         } else { "feedback.password.memory_only" })))
             ))
             )
+            .when(self.editing.driver_id=="odbc",|el|el
+                .child(self.field("odbc_dsn", crate::locale::t(cx,"odbc.dsn")))
+                .child(self.field("odbc_driver", crate::locale::t(cx,"odbc.driver")))
+                .child(div().v_flex().gap_1().child(crate::locale::t(cx,"odbc.parameters")).child(Input::new(&self.fields["odbc_parameters"]).cleanable(true).disabled(self.saving)))
+                .child(div().text_sm().whitespace_normal().child(crate::locale::t(cx,"odbc.help"))))
             .when(self.editing.driver_id=="access",|el|el.child(self.password_field(cx)))
             .when(self.editing.is_file_database(),|el|el
                 .child(self.required_field("sqlite_path","dbwork.connection.file","dbwork.connection.file.required",cx))
@@ -2288,7 +2382,7 @@ impl Render for DatabaseView {
                     .on_click(cx.listener(|this,v:&bool,_,cx|{this.editing.sqlite_read_only = *v;cx.notify();}))))
             .when(self.editing.kind==DatabaseKind::Redis,|el|el.child(Switch::new("redis-cluster").label("Redis 集群（仅 DB 0，浏览当前节点）").checked(self.editing.redis_cluster).disabled(self.saving)
                 .on_click(cx.listener(|this,v:&bool,_,cx|{this.editing.redis_cluster = *v;cx.notify();}))))
-            .when(!self.editing.is_file_database(),|el|el
+            .when(!self.editing.is_file_database() && self.editing.driver_id!="odbc",|el|el
             .child(div().h_flex().gap_2().items_end()
                 .child(div().flex_1().min_w_0().child(self.combo("database","数据库 *",self.raw_draft(cx).ok().map(|p|self.catalog(&p)).unwrap_or_default(),cx)))
                 .child(Button::new("detect-databases").flex_shrink_0().icon(IconName::Search).label("检测")
@@ -2296,11 +2390,22 @@ impl Render for DatabaseView {
                     .disabled(self.saving||running).on_click(cx.listener(|this,_,_,cx|this.start_request(true,true,cx)))))
             )
             )
+
             .when(self.editing.kind==DatabaseKind::External,|el|el.child(div().text_sm().whitespace_normal().child(crate::locale::t(cx,"drivers.external_scope"))))
             .when(self.editing.kind==DatabaseKind::External,|el|el.child(div().text_sm().whitespace_normal().child(crate::locale::t(cx,match self.editing.driver_id.as_str() {
-                "access" => "drivers.hint.access", "sqlserver" => "drivers.hint.sqlserver", "oracle" => "drivers.hint.oracle", "mongodb" => "drivers.hint.mongodb", "h2" => "drivers.removed", "db2" => "drivers.hint.db2", "cassandra" => "drivers.hint.cassandra", "tdengine" => "drivers.hint.tdengine", _ => "drivers.hint.elasticsearch"
+                "odbc" => "odbc.scope", "access" => "drivers.hint.access", "sqlserver" => "drivers.hint.sqlserver", "oracle" => "drivers.hint.oracle", "mongodb" => "drivers.hint.mongodb", "h2" => "drivers.removed", "db2" => "drivers.hint.db2", "cassandra" => "drivers.hint.cassandra", "tdengine" => "drivers.hint.tdengine", _ => "drivers.hint.elasticsearch"
             }))))
             .when(self.tab==2,|el|el
+            .when(self.editing.driver_id=="mongodb",|el|el.child(Switch::new("mongo-read-only").label(crate::locale::t(cx,"mongo.connection.readonly")).checked(self.editing.mongo_read_only).disabled(self.saving)
+                .on_click(cx.listener(|this,value:&bool,window,cx|{
+                    if *value{this.editing.mongo_read_only=true;cx.notify();return;}
+                    let owner=cx.entity().downgrade();let id=this.editing.id;
+                    feedback::confirm(crate::locale::t(cx,"mongo.connection.enable_write"),crate::locale::t(cx,"mongo.connection.enable_hint"),window,cx,move |_,cx|{let _=owner.update(cx,|this,cx|{if this.editing.id==id && !this.saving{this.editing.mongo_read_only=false;cx.notify();}});});
+                }))))
+            .when(self.editing.driver_id=="mongodb",|el|el.child(div().v_flex().gap_2()
+                .child(crate::locale::t(cx,"mongo.auth_source"))
+                .child(Input::new(&self.fields["mongo_auth_source"]).cleanable(true).disabled(self.saving))
+                .child(div().text_sm().text_color(cx.theme().muted_foreground).child(crate::locale::t(cx,"mongo.auth_source_hint")))))
             .when(self.editing.kind==DatabaseKind::MySql,|el|el
             .child(Button::new("driver-override").ghost().icon(IconName::Settings2).label(crate::locale::t(cx,"dbwork.driver_override"))
                   .on_click(cx.listener(|this,_,_,cx|{this.driver_override = !this.driver_override;cx.notify();})))
@@ -2360,7 +2465,21 @@ impl Render for DatabaseView {
                     })))
                 .when(self.driver_override, |el| el.child("兼容驱动运行于独立进程。当前需显式禁用 TLS；4.0 使用服务器默认字符集。请选择可信驱动库。")))
             )
-            .child(self.field("timeout", "连接/测试总超时（1–60 秒）"))
+            .child(Switch::new("inherit-global-timeouts").label(crate::locale::t(cx,"database.timeout.inherit")).checked(self.editing.inherit_timeouts).disabled(self.saving)
+                .on_click(cx.listener(|this,value:&bool,window,cx|{
+                    if *value && !this.editing.inherit_timeouts {
+                        if let Ok(v)=this.text("timeout",cx).parse::<u64>() && (1..=60).contains(&v) {this.editing.timeout_seconds=v;}
+                        if let Ok(v)=this.text("execution_timeout",cx).parse::<u64>() && (1..=turbodbn_core::timeouts::MAX_EXECUTION_SECONDS).contains(&v) {this.editing.execution_timeout_seconds=v;}
+                    }
+                    this.editing.inherit_timeouts = *value;
+                    let effective=if *value {this.editing.resolve_timeouts()}else{this.editing.clone()};
+                    this.fields["timeout"].update(cx,|field,cx|field.set_value(effective.timeout_seconds.to_string(),window,cx));
+                    this.fields["execution_timeout"].update(cx,|field,cx|field.set_value(effective.execution_timeout_seconds.to_string(),window,cx));cx.notify();
+                })))
+            .child(div().text_sm().text_color(cx.theme().muted_foreground).child(crate::locale::t(cx,if self.editing.inherit_timeouts {"database.timeout.from_global"}else{"database.timeout.custom"})))
+            .child(self.field("timeout", crate::locale::t(cx,"database.timeout.connect")))
+            .child(self.field("execution_timeout", crate::locale::t(cx,"database.timeout.execute")))
+            .child(div().text_sm().whitespace_normal().child(crate::locale::t(cx,"database.timeout.hint")))
             .when(self.editing.kind==DatabaseKind::MySql && self.driver_override,|el|el.child(self.drivers.clone()))
             )
             .when(self.tab==1,|el|el
@@ -2428,7 +2547,7 @@ impl Render for DatabaseView {
                 el.child(Button::new("connection-details").ghost().icon(IconName::Info).label(if self.connection_details {"收起连接详情"}else{"连接详情"})
                     .on_click(cx.listener(|this,_,_,cx|{this.connection_details = !this.connection_details;cx.notify();})))
                     .when(self.connection_details,|el|el.child(div().v_flex().gap_1().text_sm()
-                        .child(format!("{} {} · 会话 {} · {} ms",self.editing.driver_label(),info.version,info.session_id,info.elapsed_ms))
+                        .child(format!("{} {} · 会话 {} · {}",self.editing.driver_label(),info.version,info.session_id,crate::duration::elapsed(info.elapsed_ms.min(u64::MAX as u128) as u64)))
                         .child(format!("字符集：{} · 数据库：{}",info.charset,info.database.as_deref().unwrap_or("未选择")))
                         .child(format!("TLS：{}",if info.tls_cipher.is_empty(){"未加密"}else{&info.tls_cipher}))
                         .when_some(info.database_list_error.as_ref(),|el,error|el.child(crate::locale::message(cx,error)))))
@@ -2439,6 +2558,8 @@ impl Render for DatabaseView {
 fn required_connection_field(profile: &Profile, discover: bool) -> Option<&'static str> {
     if !discover && profile.name.trim().is_empty() {
         Some("dbwork.connection.name.required")
+    } else if profile.driver_id == "odbc" {
+        None
     } else if profile.is_file_database() {
         profile
             .sqlite_path
@@ -2462,18 +2583,16 @@ fn generated_connection_name(profile: &Profile, profiles: &[Profile]) -> String 
     } else {
         profile.driver_label().to_string()
     };
-    let prefix = prefix.chars().take(18).collect::<String>();
+    let prefix = prefix.chars().take(128).collect::<String>();
     let used = |name: &str| {
         profiles
             .iter()
             .any(|p| p.id != profile.id && p.name.to_lowercase() == name.to_lowercase())
     };
-    if !used(&prefix) {
+    if profile.is_file_database() && !used(&prefix) {
         return prefix;
     }
-    let host = if profile.host == "127.0.0.1" || profile.host.eq_ignore_ascii_case("localhost") {
-        "local".into()
-    } else {
+    let host = {
         profile
             .host
             .rsplit('.')
@@ -2503,18 +2622,18 @@ mod connection_form_tests {
         draft.host = "127.0.0.1".into();
         let mut saved = draft.clone();
         saved.id = Uuid::new_v4();
-        saved.name = "DEMO".into();
-        assert_eq!(generated_connection_name(&draft, &[]), "demo");
+        saved.name = "DEMO@1".into();
+        assert_eq!(generated_connection_name(&draft, &[]), "demo@1");
         assert_eq!(
             generated_connection_name(&draft, std::slice::from_ref(&saved)),
-            "demo@local"
+            "demo@1-2"
         );
         let mut second = saved.clone();
         second.id = Uuid::new_v4();
-        second.name = "demo@local".into();
+        second.name = "demo@1-2".into();
         assert_eq!(
             generated_connection_name(&draft, &[saved, second]),
-            "demo@local-2"
+            "demo@1-3"
         );
     }
     #[::core::prelude::v1::test]

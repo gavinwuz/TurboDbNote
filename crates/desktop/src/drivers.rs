@@ -14,7 +14,7 @@ use std::{
 use turbodbn_services::mysql_drivers;
 
 pub struct DriverManager {
-    pub selected_group: &'static str,
+    pub components: Entity<crate::driver_components::DriverComponents>,
     root: PathBuf,
     details: bool,
     path: Option<PathBuf>,
@@ -24,7 +24,7 @@ pub struct DriverManager {
     task: Option<Task<()>>,
 }
 impl DriverManager {
-    pub fn new(_: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         let root = Preferences::path()
             .unwrap_or_else(|_| PathBuf::from("settings.json"))
             .with_file_name("drivers");
@@ -37,7 +37,7 @@ impl DriverManager {
                     .then_some(local)
             });
         Self {
-            selected_group: "all",
+            components: cx.new(crate::driver_components::DriverComponents::new),
             helper_available: std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.join("turbodbnote-mysql-legacy.exe")))

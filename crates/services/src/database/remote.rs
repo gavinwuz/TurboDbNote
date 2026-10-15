@@ -29,7 +29,8 @@ impl HttpDatabase {
         url.set_port(Some(p.port)).map_err(|_| "端口无效")?;
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(p.timeout_seconds))
+            .connect_timeout(Duration::from_secs(p.timeout_seconds.clamp(1, 60)))
+            .timeout(p.execution_timeout())
             .danger_accept_invalid_certs(p.tls == TlsMode::Required);
         if !p.ca.is_empty() {
             builder = builder.add_root_certificate(

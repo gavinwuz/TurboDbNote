@@ -80,7 +80,7 @@ fn group(p: &Profile) -> String {
         p.group.clone()
     }
 }
-pub(super) fn environment_color(name: &str) -> Hsla {
+pub(crate) fn environment_color(name: &str) -> Hsla {
     let n = name.to_lowercase();
     if n.contains("正式") || n.contains("生产") || n == "prod" {
         hsla(0., 0.7, 0.55, 1.)
@@ -574,6 +574,19 @@ impl DatabaseView {
             .size_full()
             .p_4()
             .gap_4()
+            .child(
+                Button::new("url-new-connection")
+                    .tooltip(crate::locale::t(cx, "url.format_tip"))
+                    .icon(IconName::Copy)
+                    .label(crate::locale::t(cx, "url.import"))
+                    .disabled(self.saving)
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.paste_connection_urls(window, cx)),
+                    ),
+            )
+            .when(!self.url_drafts.is_empty(), |el| {
+                el.child(self.url_draft_picker(cx))
+            })
             .child(
                 div()
                     .text_lg()

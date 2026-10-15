@@ -155,6 +155,20 @@ impl Release {
             PackageKind::WindowsPortable => "windows-x64-portable.zip",
             PackageKind::Linux => "linux-x64.tar.gz",
         };
+        let minimal = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("package-flavor.txt")))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .is_some_and(|s| s.trim() == "minimal");
+        let suffix = if minimal {
+            match kind {
+                PackageKind::WindowsInstaller => "windows-x64-minimal-setup.exe",
+                PackageKind::WindowsPortable => "windows-x64-minimal-portable.zip",
+                PackageKind::Linux => "linux-x64-minimal.tar.gz",
+            }
+        } else {
+            suffix
+        };
         self.asset(&format!("TurboDBNote-v{version}-{suffix}"))
     }
     fn asset(&self, name: &str) -> Result<&Asset, String> {
@@ -213,6 +227,57 @@ pub fn download(
             _ = wait_for_cancel(cancel) => Err("updates.status.cancelled".into()),
         }
     })
+}
+/// Acquire the exact application version's driver asset using the same trusted release transport.
+pub fn download_components(
+    version: &str,
+    directory: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(Progress),
+) -> Result<PathBuf, String> {
+    let version = semver::Version::parse(version).map_err(|_| "updates.error.app_version")?;
+    let response = client(Duration::from_secs(15))?
+        .get(format!(
+            "https://api.github.com/repos/gavinwuz/TurboDbNote/releases/tags/v{version}"
+        ))
+        .send()
+        .map_err(|_| "updates.error.request")?;
+    if response.status().as_u16() == 404 {
+        return Err("components.error.unpublished".into());
+    }
+    if !response.status().is_success() {
+        return Err("updates.error.request".into());
+    }
+    let release = match parse_release(&bounded(response, MAX_METADATA)?, "0.0.0")? {
+        Check::Available(release) => release,
+        _ => return Err("components.error.unpublished".into()),
+    };
+    if release.tag_name != format!("v{version}") {
+        return Err("updates.error.version_invalid".into());
+    }
+    let asset = release
+        .asset(&crate::driver_packages::archive_name(
+            &version.to_string(),
+            crate::driver_packages::target(),
+        ))
+        .map_err(|e| {
+            if e == "updates.error.package_missing" {
+                "components.error.unpublished".into()
+            } else {
+                e
+            }
+        })?;
+    let sums = release.asset("SHA256SUMS.txt")?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "updates.error.request")?;
+    let kind = if cfg!(windows) {
+        PackageKind::WindowsPortable
+    } else {
+        PackageKind::Linux
+    };
+    runtime.block_on(async { tokio::select! { result = download_transfer(asset, &sums.browser_download_url, kind, directory, cancel, &progress) => result.map(|p| p.path), _ = wait_for_cancel(cancel) => Err("updates.status.cancelled".into()) } })
 }
 async fn wait_for_cancel(cancel: &AtomicBool) {
     while !cancel.load(Ordering::Relaxed) {

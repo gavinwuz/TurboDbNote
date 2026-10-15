@@ -7,12 +7,27 @@ pub const TOO_LARGE: &str = "drivers.value_limit";
 pub fn string<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
 }
+pub fn execution_seconds(p: &Value) -> u64 {
+    turbodbn_core::timeouts::execution_seconds(p["execution_timeout_seconds"].as_u64())
+}
 pub fn validate_profile(p: &Value) -> Result<()> {
+    if string(p, "driver_id") == "odbc" {
+        let options: turbodbn_core::odbc::Options =
+            serde_json::from_value(p["odbc"].clone()).map_err(|_| "odbc.invalid_options")?;
+        options.attributes()?;
+    }
+    if p.get("execution_timeout_seconds").is_some_and(|v| {
+        !v.as_u64()
+            .is_some_and(|n| (1..=turbodbn_core::timeouts::MAX_EXECUTION_SECONDS).contains(&n))
+    }) {
+        return Err("database.timeout.execution_invalid");
+    }
     if ![
         "sqlserver",
         "access",
         "oracle",
         "db2",
+        "odbc",
         "mongodb",
         "elasticsearch",
         "tdengine",
@@ -30,7 +45,7 @@ pub fn validate_profile(p: &Value) -> Result<()> {
     {
         return Err("drivers.invalid_target");
     }
-    for key in ["host", "database", "user"] {
+    for key in ["host", "database", "user", "mongo_auth_source"] {
         let text = string(p, key);
         if text.len() > 1024 || text.chars().any(char::is_control) {
             return Err("drivers.invalid_target");
@@ -149,6 +164,15 @@ pub fn allowed(kind: &Value) -> Result<()> {
     }
     let a = &kind["Workbench"]["action"];
     if a == "Catalog" {
+        return Ok(());
+    }
+    if let Some(change) = a.get("MongoWrite") {
+        if a.as_object().is_none_or(|m| m.len() != 1) {
+            return Err(UNSUPPORTED);
+        }
+        let change: turbodbn_core::mongo::Mutation =
+            serde_json::from_value(change.clone()).map_err(|_| "mongo.document.invalid")?;
+        turbodbn_core::mongo::validate_mutation(&change)?;
         return Ok(());
     }
     if let Some(map) = a.as_object()

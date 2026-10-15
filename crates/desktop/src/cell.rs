@@ -6,7 +6,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, Selectable, Sizable, StyledExt,
+    ActiveTheme, Disableable, IconName, Selectable, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
     menu::{DropdownMenu, PopupMenuItem},
@@ -34,6 +34,7 @@ pub(super) mod markdown_tools;
 
 pub enum CellEvent {
     Changed,
+    PermissionBlocked(crate::note_permissions::Advice),
     SelectTarget,
     BatchFinished { token: Uuid, success: bool },
     Remove,
@@ -55,6 +56,7 @@ pub struct CellView {
     connections: Entity<DatabaseView>,
     inherited_connection: Option<Uuid>,
     inherited_database: String,
+    access_mode: turbodbn_services::access_mode::AccessMode,
     editing: bool,
     note_active: bool,
     formatting: Option<Task<()>>,
@@ -97,6 +99,7 @@ pub struct CellView {
     executing_write: Option<String>,
     results: Option<Entity<crate::table_view::TableView>>,
     _results_observer: Option<Subscription>,
+    _results_permission: Option<Subscription>,
     page_size: Entity<InputState>,
     _subscriptions: Vec<Subscription>,
     _connections: Subscription,
@@ -308,6 +311,9 @@ impl CellView {
                         cx.notify();
                     }
                 }
+                crate::script_cell::ScriptEvent::PermissionBlocked(advice) => {
+                    cx.emit(CellEvent::PermissionBlocked(advice.clone()))
+                }
                 crate::script_cell::ScriptEvent::SelectTarget => {
                     cx.emit(CellEvent::SelectTarget);
                 }
@@ -341,6 +347,7 @@ impl CellView {
             connections,
             inherited_connection: None,
             inherited_database: String::new(),
+            access_mode: Default::default(),
             editing: false,
             note_active: true,
             formatting: None,
@@ -383,6 +390,7 @@ impl CellView {
             executing_write: None,
             results: None,
             _results_observer: None,
+            _results_permission: None,
             page_size,
             _subscriptions: subscriptions,
             _connections: observed,
@@ -399,6 +407,136 @@ impl CellView {
                 ..
             }
         )
+    }
+    pub fn permission_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.working(cx) || self.result_pending(cx) {
+            feedback::error(t(cx, "permissions.busy"), cx);
+            return;
+        }
+        let required_kind = match &self.cell.content {
+            CellContent::SqlScript { script, .. } => {
+                Some(turbodbn_services::sql_script::kind(script.dialect))
+            }
+            _ => None,
+        };
+        let profiles = self
+            .connections
+            .read(cx)
+            .note_profiles()
+            .into_iter()
+            .filter(|p| p.supports_mutation() && required_kind.is_none_or(|kind| p.kind == kind))
+            .collect::<Vec<_>>();
+        let cell = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            dialog
+                .title(t(cx, "permissions.choose_connection"))
+                .w(px(480.))
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .child(t(
+                            cx,
+                            if profiles.is_empty() {
+                                "permissions.no_writable"
+                            } else {
+                                "permissions.connection"
+                            },
+                        ))
+                        .child(
+                            Button::new("permission-connection-picker")
+                                .disabled(profiles.is_empty())
+                                .label(t(cx, "permissions.choose_connection"))
+                                .dropdown_caret(true)
+                                .dropdown_menu({
+                                    let profiles = profiles.clone();
+                                    let cell = cell.clone();
+                                    move |mut menu, _, _| {
+                                        for profile in &profiles {
+                                            let profile = profile.clone();
+                                            let cell = cell.clone();
+                                            menu = menu.item(
+                                                crate::connection_choice::item(&profile).on_click(
+                                                    move |_, window, cx| {
+                                                        window.close_dialog(cx);
+                                                        let _ = cell.update(cx, |this, cx| {
+                                                            if this.working(cx)
+                                                                || this.result_pending(cx)
+                                                            {
+                                                                feedback::error(
+                                                                    t(cx, "permissions.busy"),
+                                                                    cx,
+                                                                );
+                                                                return;
+                                                            }
+                                                            match &mut this.cell.content {
+                                                                CellContent::Sql {
+                                                                    connection_id,
+                                                                    ..
+                                                                }
+                                                                | CellContent::SqlScript {
+                                                                    connection_id,
+                                                                    ..
+                                                                } => {
+                                                                    *connection_id =
+                                                                        Some(profile.id)
+                                                                }
+                                                                _ => return,
+                                                            }
+                                                            this.database.update(
+                                                                cx,
+                                                                |field, cx| {
+                                                                    field.set_value(
+                                                                        profile.database.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            );
+                                                            this.revision += 1;
+                                                            this.database_names.clear();
+                                                            this.picker_context = None;
+                                                            if let Some(script) = &this.script {
+                                                                script.update(cx, |script, cx| {
+                                                                    script.scope_changed(cx)
+                                                                });
+                                                            }
+                                                            if let Some(results) = &this.results {
+                                                                results.update(
+                                                                    cx,
+                                                                    |results, cx| {
+                                                                        results.stale_result(cx)
+                                                                    },
+                                                                );
+                                                            }
+                                                            cx.emit(CellEvent::Changed);
+                                                            cx.notify();
+                                                        });
+                                                    },
+                                                ),
+                                            );
+                                        }
+                                        menu.scrollable(true).min_w(px(360.)).max_h(px(280.))
+                                    }
+                                }),
+                        )
+                        .child(feedback::actions().child(feedback::close_button(cx))),
+                )
+        });
+    }
+    pub fn set_access_mode(
+        &mut self,
+        mode: turbodbn_services::access_mode::AccessMode,
+        cx: &mut Context<Self>,
+    ) {
+        self.access_mode = mode;
+        if let Some(script) = &self.script {
+            script.update(cx, |script, cx| script.set_access_mode(mode, cx));
+        }
+        if let Some(results) = &self.results {
+            results.update(cx, |results, cx| results.set_note_access_mode(mode, cx));
+        }
+        cx.notify();
     }
     pub fn set_defaults(
         &mut self,
@@ -1126,19 +1264,32 @@ impl CellView {
             self.finish_batch(false, cx);
             return;
         }
-        if let Action::NoteExecute { plan, .. } = &action
-            && turbodbn_services::database::notebook_query::command_required(
-                saved.profile.kind,
-                &plan.sql,
-            )
-            .is_none_or(|key| {
-                !cx.global::<crate::preferences::Preferences>()
-                    .database
-                    .command_enabled(key)
-            })
+        if matches!(action, Action::NoteExplain { .. })
+            && !cx
+                .global::<crate::preferences::Preferences>()
+                .database
+                .command_enabled("explain")
         {
             feedback::error(t(cx, "settings.sql_policy_blocked"), cx);
             self.finish_batch(false, cx);
+            return;
+        }
+        let sql = match &action {
+            Action::NotePrepare { sql } => Some(sql.as_str()),
+            Action::NoteExecute { plan, .. } => Some(plan.sql.as_str()),
+            _ => None,
+        };
+        if let Some(advice) = sql.and_then(|sql| {
+            crate::note_permissions::Advice::for_sql(
+                self.access_mode,
+                &saved.profile,
+                sql,
+                false,
+                cx,
+            )
+        }) {
+            self.finish_batch(false, cx);
+            cx.emit(CellEvent::PermissionBlocked(advice));
             return;
         }
         if self.execution_summary.take().is_some() {
@@ -1309,6 +1460,7 @@ impl CellView {
                                                         cx,
                                                     )
                                                 });
+                                                this._results_permission=Some(cx.subscribe(&view,|_,_,advice:&crate::note_permissions::Advice,cx|cx.emit(CellEvent::PermissionBlocked(advice.clone()))));
                                                 this._results_observer =
                                                     Some(cx.observe(&view, |_, _, cx| cx.notify()));
                                                 this.grid.update(cx, |grid, cx| {
@@ -1318,6 +1470,7 @@ impl CellView {
                                                 });
                                                 this.document = None;
                                                 this.json_mode = false;
+                                                view.update(cx,|view,cx|view.set_note_access_mode(this.access_mode,cx));
                                                 this.results = Some(view);
                                             } else {
                                                 this.results = None;
@@ -1338,7 +1491,7 @@ impl CellView {
                                                 )
                                                 .to_string()
                                             } else {
-                                                crate::locale::tr(cx, "notes.command_result", &[("count", &affected.map(|n| n.to_string()).unwrap_or_else(|| t(cx, "output.operation.unavailable").to_string())), ("elapsed", &elapsed_ms.to_string())]).to_string()
+                                                crate::locale::tr(cx, "notes.command_result", &[("count", &affected.map(|n| n.to_string()).unwrap_or_else(|| t(cx, "output.operation.unavailable").to_string())), ("elapsed", &crate::duration::elapsed(elapsed_ms))]).to_string()
                                             };
                                             if !read_only {
                                                 feedback::success(this.notice.clone(), cx);
@@ -1443,32 +1596,17 @@ impl CellView {
             return;
         }
 
-        if let Some(extension) = turbodbn_services::database::notebook_query::command_required(
-            saved.profile.kind,
+        if let Some(advice) = crate::note_permissions::Advice::for_sql(
+            self.access_mode,
+            &saved.profile,
             &plan.sql,
-        ) && !cx
-            .global::<crate::preferences::Preferences>()
-            .database
-            .command_enabled(extension)
-        {
-            self.policy_help = true;
-            self.notice = t(cx, "settings.sql_policy_title").to_string();
+            false,
+            cx,
+        ) {
             self.finish_batch(false, cx);
-            feedback::confirm_labels(
-                t(cx, "settings.sql_policy_title"),
-                t(cx, "settings.sql_policy_blocked"),
-                t(cx, "feedback.close"),
-                t(cx, "settings.sql_policy_open"),
-                window,
-                cx,
-                |_, cx| {
-                    let hub = cx.global::<feedback::Hub>().0.clone();
-                    cx.defer(move |cx| hub.update(cx, |_, cx| cx.emit(feedback::OpenSqlSettings)));
-                },
-            );
+            cx.emit(CellEvent::PermissionBlocked(advice));
             return;
         }
-
         if !plan.read_only
             && saved.profile.sqlite_read_only
             && saved.profile.kind == DatabaseKind::Sqlite
@@ -1624,7 +1762,7 @@ impl CellView {
                             .map(|n| n.to_string())
                             .unwrap_or_else(|| unavailable.clone()),
                     ),
-                    Some(format!("{} ms", summary.elapsed_ms)),
+                    Some(crate::duration::elapsed(summary.elapsed_ms)),
                 ]],
             };
             for (key, count) in [
@@ -1692,8 +1830,11 @@ impl CellView {
                 Button::new("note-connection")
                     .small()
                     .ghost()
-                    .icon(gpui_component::Icon::default().path("icons/database.svg"))
-                    .label(label.clone())
+                    .child(
+                        selected
+                            .map(crate::connection_choice::identity)
+                            .unwrap_or_else(|| div().truncate().child(label.clone())),
+                    )
                     .tooltip(label)
                     .dropdown_caret(true)
                     .disabled(locked || self.discovery.is_some())
@@ -1726,7 +1867,7 @@ impl CellView {
                         for profile in &profiles {
                             let owner = owner.clone();
                             let profile = profile.clone();
-                            menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(
+                            menu = menu.item(crate::connection_choice::item(&profile).on_click(
                                 move |_, window, cx| {
                                     owner.update(cx, |this, cx| {
                                         if this.busy() {
@@ -1755,7 +1896,7 @@ impl CellView {
                                 },
                             ));
                         }
-                        menu.scrollable(true).max_h(px(300.))
+                        menu.scrollable(true).min_w(px(360.)).max_h(px(300.))
                     }),
             );
             if sqlite {
@@ -2510,7 +2651,11 @@ impl Render for CellView {
                                 .child(if self.notice.is_empty() {
                                     String::new()
                                 } else {
-                                    format!("{} · {} ms", self.notice, self.elapsed)
+                                    format!(
+                                        "{} · {}",
+                                        self.notice,
+                                        crate::duration::elapsed(self.elapsed)
+                                    )
                                 }),
                         ),
                 );

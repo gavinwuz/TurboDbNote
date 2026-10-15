@@ -123,7 +123,7 @@ impl Workspace {
                             matches!(
                                 event.kind,
                                 gpui_component::notification::NotificationType::Error
-                            ),
+                            ) && event.action.is_none(),
                             |notification| {
                                 notification.action(move |_, _, cx| {
                                     let copy = copy.clone();
@@ -139,7 +139,23 @@ impl Workspace {
                                         })
                                 })
                             },
-                        ),
+                        )
+                        .when_some(event.action.clone(), |notification, action| {
+                            notification.action(move |_, _, cx| {
+                                let dismiss = cx.entity().downgrade();
+                                let handler = action.handler.clone();
+                                Button::new("notification-resolve")
+                                    .ghost()
+                                    .label(action.label.clone())
+                                    .icon(IconName::ArrowRight)
+                                    .on_click(move |_, window, cx| {
+                                        let _ = dismiss.update(cx, |notification, cx| {
+                                            notification.dismiss(window, cx)
+                                        });
+                                        handler(window, cx);
+                                    })
+                            })
+                        }),
                     cx,
                 );
             },
@@ -162,6 +178,13 @@ impl Workspace {
         navigation.update(cx, |panel, cx| panel.show_notes(notes.clone(), cx));
         let output = cx.new(AiLog::new);
         database.update(cx, |database, _| database.output = Some(output.clone()));
+        database
+            .read(cx)
+            .drivers()
+            .read(cx)
+            .components
+            .clone()
+            .update(cx, |components, _| components.output = Some(output.clone()));
         let ai = cx.new(|cx| ChatView::new(output.clone(), window, cx));
         ai.update(cx, |chat, _| chat.databases = Some(database.downgrade()));
         let settings =
@@ -269,28 +292,6 @@ impl Workspace {
                         names.push("settings".into());
                     }
                     this.close_names(&names, window, cx);
-                }
-                SettingsRequest::ReturnToChat => {
-                    this.leave_focus(window, cx);
-                    this.dock
-                        .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
-                    this.ai.update(cx, |chat, cx| chat.sync_zoom(false, cx));
-                    if this
-                        .right_tabs
-                        .read(cx)
-                        .active_panel(cx)
-                        .is_none_or(|panel| panel.view().entity_id() != this.ai.entity_id())
-                    {
-                        // Rebuild only the tab container: the three tools and their
-                        // editor/session entities remain alive, in the same order.
-                        this.rebuild_tabs(false, window, cx);
-                    }
-                    if !this.dock.read(cx).is_dock_open(DockPlacement::Right, cx) {
-                        this.dock.update(cx, |dock, cx| {
-                            dock.toggle_dock(DockPlacement::Right, window, cx)
-                        });
-                    }
-                    window.focus(&this.ai.read(cx).focus_handle(cx));
                 }
             },
         );
@@ -865,6 +866,37 @@ impl Workspace {
             crate::feedback::error(t(cx, "updates.install.blocked"), cx);
             return false;
         }
+        let pending = self
+            .table_panels
+            .values()
+            .filter(|table| table.read(cx).mongo_unsaved())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            let owner = cx.entity().downgrade();
+            crate::feedback::confirm_labels(
+                t(cx, "mongo.document.close_title"),
+                t(cx, "mongo.document.close_body"),
+                t(cx, "dbwork.draft.keep"),
+                t(cx, "dbwork.draft.discard"),
+                window,
+                cx,
+                move |window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        for table in &pending {
+                            table.update(cx, |table, cx| table.discard_mongo(cx));
+                        }
+                        if pending.iter().any(|table| table.read(cx).mongo_unsaved()) {
+                            return;
+                        }
+                        if this.prepare_close(window, cx) {
+                            this.finish_close(window, cx);
+                        }
+                    });
+                },
+            );
+            return false;
+        }
         let running = self.notes.read(cx).running(cx);
         if self.pending_install.is_some() && self.notes.read(cx).pending(cx) {
             // The install confirmation explicitly authorizes saving, even with autosave disabled.
@@ -1101,6 +1133,36 @@ impl Workspace {
         });
     }
     fn close_names(&mut self, names: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        let pending = names
+            .iter()
+            .filter_map(|name| self.table_panels.get(name))
+            .filter(|table| table.read(cx).mongo_unsaved())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            let owner = cx.entity().downgrade();
+            let names = names.to_vec();
+            crate::feedback::confirm_labels(
+                t(cx, "mongo.document.close_title"),
+                t(cx, "mongo.document.close_body"),
+                t(cx, "dbwork.draft.keep"),
+                t(cx, "dbwork.draft.discard"),
+                window,
+                cx,
+                move |window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        for table in &pending {
+                            table.update(cx, |table, cx| table.discard_mongo(cx));
+                        }
+                        if pending.iter().any(|table| table.read(cx).mongo_unsaved()) {
+                            return;
+                        }
+                        this.close_names(&names, window, cx);
+                    });
+                },
+            );
+            return;
+        }
         let has_running = names
             .iter()
             .filter_map(|name| self.note_panels.get(name))
@@ -1157,7 +1219,9 @@ impl Workspace {
                 let names = names.to_vec();
                 crate::feedback::confirm_labels(
                     t(cx, "dbwork.draft.close_title"),
-                    t(cx, "dbwork.draft.close_body"),
+                    self.database
+                        .read(cx)
+                        .discard_message("dbwork.draft.close_body", cx),
                     crate::locale::t(cx, "dbwork.draft.keep"),
                     crate::locale::t(cx, "dbwork.draft.discard"),
                     window,

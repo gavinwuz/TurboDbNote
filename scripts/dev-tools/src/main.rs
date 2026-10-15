@@ -146,9 +146,12 @@ fn main() {
         Some("version") => release::version(&root).map(|v| {println!("{v}"); 0}),
         Some("release") => release::validate_cli(&root, &args[1..]).map(|_| 0),
         Some("build-diagnostics") => diagnostics().map(|_| 0),
+        Some("prepare-db2") if args.len() == 3 || args.len() == 4 => turbodbn_services::db2_bundle::prepare(std::path::Path::new(&args[1]), std::path::Path::new(&args[2]), args.get(3).map(std::path::Path::new), &std::sync::atomic::AtomicBool::new(false)).map(|_|0),
+        Some("prepare-oracle") if args.len() == 4 || args.len() == 5 => turbodbn_services::oracle_bundle::prepare(std::path::Path::new(&args[1]), std::path::Path::new(&args[2]), &args[3], args.get(4).map(std::path::Path::new), &std::sync::atomic::AtomicBool::new(false)).map(|_|0),
+        Some("driver-components") if args.len() == 5 => turbodbn_services::driver_packages::build(std::path::Path::new(&args[1]), std::path::Path::new(&args[2]), &args[3], &args[4]).map(|_| 0),
         Some("package-linux") => package::linux(&root).map(|_| 0),
         Some("prepare-release") => release::prepare(&root, &args[1..]).map(|_| 0),
-        _ => Err("Usage: turbodbnote-tools version | release --version V [--notes FILE] [--publication] | prepare-release VERSION | package-linux | run-cargo ARGS | build-diagnostics".into()),
+        _ => Err("Usage: turbodbnote-tools version | release --version V [--notes FILE] [--publication] | prepare-release VERSION | driver-components NATIVE-DIR ZIP VERSION TARGET | package-linux | run-cargo ARGS | build-diagnostics".into()),
     };
     match result {
         Ok(code) => std::process::exit(code),

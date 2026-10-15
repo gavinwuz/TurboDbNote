@@ -7923,6 +7923,7 @@ dependencies = [
  "tiberius",
  "tokio",
  "tokio-util",
+ "turbodbn-core",
  "zeroize",
 ]
 
@@ -7936,6 +7937,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "toml 0.8.23",
+ "turbodbn-services",
 ]
 
 [[package]]

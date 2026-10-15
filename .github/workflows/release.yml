@@ -92,6 +92,7 @@ jobs:
             dist/*-portable.zip
             dist/*-setup.exe
             dist/*-sources.zip
+            dist/*-drivers.zip
             dist/SHA256SUMS.txt
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
@@ -112,7 +113,7 @@ jobs:
       - name: Install native build and X11 verification dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake clang libasound2-dev libfontconfig1-dev libglib2.0-dev libssl-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libx11-dev libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libvulkan-dev libzstd-dev libsqlite3-dev unixodbc-dev mesa-vulkan-drivers xvfb x11-utils
+          sudo apt-get install -y build-essential cmake clang libasound2-dev libfontconfig1-dev libglib2.0-dev libssl-dev libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libx11-dev libxcb1-dev libxrandr-dev libxi-dev libxcursor-dev libxinerama-dev libvulkan-dev libzstd-dev libsqlite3-dev unixodbc-dev libaio1 mesa-vulkan-drivers xvfb x11-utils
       - uses: dtolnay/rust-toolchain@1.92.0
         with:
           components: rustfmt, clippy
@@ -138,6 +139,7 @@ jobs:
           name: release-linux
           path: |
             dist/*.tar.gz
+            dist/*-drivers.zip
             dist/SHA256SUMS-linux.txt
           if-no-files-found: error
   publish:
@@ -170,7 +172,7 @@ jobs:
           sha256sum --check SHA256SUMS-linux.txt
           cd ../..
           mkdir upload
-          cp candidate/windows/*-portable.zip candidate/windows/*-setup.exe candidate/windows/*-sources.zip candidate/linux/*.tar.gz upload/
+          cp candidate/windows/*-portable.zip candidate/windows/*-setup.exe candidate/windows/*-sources.zip candidate/windows/*-drivers.zip candidate/linux/*.tar.gz candidate/linux/*-drivers.zip upload/
           cd upload
           sha256sum *.zip *.exe *.tar.gz > SHA256SUMS.txt
           cd ..

@@ -14,7 +14,7 @@ fn odbc_value(v: &str) -> Result<String> {
     if v.contains('\0') {
         return Err("drivers.invalid_target");
     }
-    Ok(format!("{{{}}}", v.replace('}', "}}")))
+    Ok(odbc_api::escape_attribute_value(v).into_owned())
 }
 fn oracle_address(p: &Value, timeout: u64) -> Result<String> {
     // OCI system trust is supported; PEM profiles must not be silently ignored.
@@ -102,7 +102,14 @@ impl Relational {
                 .parent()
                 .ok_or(FAILED)?
                 .join("oracle");
-            if library.join("oci.dll").is_file() {
+            if library
+                .join(if cfg!(windows) {
+                    "oci.dll"
+                } else {
+                    "libclntsh.so"
+                })
+                .is_file()
+            {
                 oracle::InitParams::new()
                     .oracle_client_lib_dir(library)
                     .map_err(|_| "drivers.oracle_client_required")?
@@ -117,14 +124,14 @@ impl Relational {
                         FAILED
                     }
                 })?;
-            c.set_call_timeout(Some(Duration::from_secs(timeout)))
+            c.set_call_timeout(Some(Duration::from_secs(execution_seconds(p))))
                 .map_err(|_| FAILED)?;
             return Ok(Self::Oracle(c));
         }
-        if !["access", "db2"].contains(&driver) {
+        if !["access", "db2", "odbc"].contains(&driver) {
             return Err(UNSUPPORTED);
         }
-        if driver == "db2"
+        if ["db2", "odbc"].contains(&driver)
             && (string(p, "tls") != "Disabled"
                 || !string(p, "ca").is_empty()
                 || !string(p, "client_cert").is_empty())
@@ -137,36 +144,53 @@ impl Relational {
         ));
         let drivers = env.drivers().map_err(|_| "drivers.odbc_missing")?;
         let mut parts = Vec::new();
-        if driver == "access" {
+        if driver == "odbc" {
+            let options: turbodbn_core::odbc::Options =
+                serde_json::from_value(p["odbc"].clone()).map_err(|_| "odbc.invalid_options")?;
+            parts.extend(options.attributes()?);
+            if !options.dsn.is_empty() {
+                parts.push(("DSN".into(), options.dsn));
+            } else {
+                let provider = drivers
+                    .iter()
+                    .find(|d| d.description == options.driver)
+                    .ok_or("odbc.driver_missing")?;
+                parts.push(("DRIVER".into(), provider.description.clone()));
+            }
+            if !string(p, "user").is_empty() {
+                parts.push(("UID".into(), string(p, "user").into()));
+            }
+            if !password.is_empty() {
+                parts.push(("PWD".into(), password.into()));
+            }
+        } else if driver == "access" {
             let provider = drivers
                 .iter()
-                .find(|d| {
-                    d.description.contains("Access Driver") && d.description.contains("*.accdb")
-                })
+                .find(|d| crate::probe::matches_driver("access", &d.description))
                 .ok_or("drivers.odbc_missing")?;
             let path = Path::new(string(p, "sqlite_path"));
             if !path.is_absolute() || !path.is_file() {
                 return Err("drivers.invalid_target");
             }
             parts.extend([
-                ("DRIVER", provider.description.clone()),
-                ("DBQ", path.to_string_lossy().into_owned()),
-                ("READONLY", "1".into()),
-                ("PWD", password.into()),
+                ("DRIVER".into(), provider.description.clone()),
+                ("DBQ".into(), path.to_string_lossy().into_owned()),
+                ("READONLY".into(), "1".into()),
+                ("PWD".into(), password.into()),
             ]);
         } else {
             let provider = drivers
                 .iter()
-                .find(|d| d.description.to_uppercase().contains("IBM DB2 ODBC DRIVER"))
+                .find(|d| crate::probe::matches_driver("db2", &d.description))
                 .ok_or("drivers.odbc_missing")?;
             parts.extend([
-                ("DRIVER", provider.description.clone()),
-                ("DATABASE", string(p, "database").into()),
-                ("HOSTNAME", string(p, "host").into()),
-                ("PORT", p["port"].to_string()),
-                ("PROTOCOL", "TCPIP".into()),
-                ("UID", string(p, "user").into()),
-                ("PWD", password.into()),
+                ("DRIVER".into(), provider.description.clone()),
+                ("DATABASE".into(), string(p, "database").into()),
+                ("HOSTNAME".into(), string(p, "host").into()),
+                ("PORT".into(), p["port"].to_string()),
+                ("PROTOCOL".into(), "TCPIP".into()),
+                ("UID".into(), string(p, "user").into()),
+                ("PWD".into(), password.into()),
             ]);
         }
         let text = zeroize::Zeroizing::new(
@@ -206,10 +230,7 @@ impl Relational {
                 }
                 Ok(rows)
             }
-            Self::Odbc(c) => match c.execute(sql, (), Some(timeout)).map_err(|_| FAILED)? {
-                Some(cursor) => odbc_rows(cursor, maximum),
-                None => Ok(Rows::default()),
-            },
+            Self::Odbc(c) => odbc_query(c, sql, maximum, 0, timeout),
             Self::Oracle(c) => {
                 let mut statement = c
                     .statement(sql)
@@ -238,19 +259,51 @@ impl Relational {
             }
         }
     }
-    pub fn access_catalog(&self) -> Result<Rows> {
+    pub fn odbc_page(
+        &self,
+        obj: &Value,
+        maximum: usize,
+        offset: u64,
+        timeout: usize,
+    ) -> Result<Rows> {
         if let Self::Odbc(c) = self {
+            let dbms = c
+                .database_management_system_name()
+                .map_err(|_| FAILED)?
+                .to_ascii_lowercase();
+            let dialect = if dbms.contains("mysql") || dbms.contains("mariadb") {
+                "tdengine"
+            } else if dbms.contains("access") || dbms.contains("sql server") {
+                "sqlserver"
+            } else {
+                "odbc"
+            };
+            let sql = format!("SELECT * FROM {}", qualified(obj, dialect)?);
+            odbc_query(c, &sql, maximum, offset, timeout)
+        } else {
+            Err(UNSUPPORTED)
+        }
+    }
+    pub fn odbc_catalog(&self, all_schemas: bool) -> Result<Rows> {
+        if let Self::Odbc(c) = self {
+            let all_schemas = all_schemas
+                && !c
+                    .database_management_system_name()
+                    .map_err(|_| FAILED)?
+                    .to_ascii_lowercase()
+                    .contains("access");
             odbc_rows(
-                c.tables("", "", "%", "TABLE,VIEW").map_err(|_| FAILED)?,
+                c.tables("", if all_schemas { "%" } else { "" }, "%", "TABLE,VIEW")
+                    .map_err(|_| FAILED)?,
                 501,
             )
         } else {
             Err(UNSUPPORTED)
         }
     }
-    pub fn access_columns(&self, name: &str) -> Result<Rows> {
+    pub fn odbc_columns(&self, schema: &str, name: &str) -> Result<Rows> {
         if let Self::Odbc(c) = self {
-            odbc_rows(c.columns("", "", name, "%").map_err(|_| FAILED)?, 512)
+            odbc_rows(c.columns("", schema, name, "%").map_err(|_| FAILED)?, 512)
         } else {
             Err(UNSUPPORTED)
         }
@@ -305,7 +358,33 @@ fn oracle_value(row: &oracle::Row, index: usize) -> Result<Option<String>> {
         _ => row.get::<_, Option<String>>(index).map_err(|_| FAILED),
     }
 }
-fn odbc_rows(mut cursor: impl Cursor, maximum: usize) -> Result<Rows> {
+fn odbc_query(
+    c: &odbc_api::Connection<'_>,
+    sql: &str,
+    maximum: usize,
+    offset: u64,
+    timeout: usize,
+) -> Result<Rows> {
+    let result = c.execute(sql, (), Some(timeout));
+    let cursor = match result {
+        // Some drivers (including ACE) reject SQL_ATTR_QUERY_TIMEOUT before SQLExecute.
+        // The parent still enforces its bounded worker deadline and kills hung workers.
+        Err(odbc_api::Error::Diagnostics { record, function })
+            if function == "SQLSetStmtAttr" && record.state.0 == *b"HYC00" =>
+        {
+            c.execute(sql, (), None).map_err(|_| FAILED)?
+        }
+        other => other.map_err(|_| FAILED)?,
+    };
+    match cursor {
+        Some(cursor) => odbc_rows_at(cursor, maximum, offset),
+        None => Ok(Rows::default()),
+    }
+}
+fn odbc_rows(cursor: impl Cursor, maximum: usize) -> Result<Rows> {
+    odbc_rows_at(cursor, maximum, 0)
+}
+fn odbc_rows_at(mut cursor: impl Cursor, maximum: usize, offset: u64) -> Result<Rows> {
     let mut rows = Rows::new(
         cursor
             .column_names()
@@ -328,6 +407,11 @@ fn odbc_rows(mut cursor: impl Cursor, maximum: usize) -> Result<Rows> {
                 .map_err(|_| FAILED)
         })
         .collect::<Result<Vec<_>>>()?;
+    for _ in 0..offset {
+        if cursor.next_row().map_err(|_| FAILED)?.is_none() {
+            return Ok(rows);
+        }
+    }
     while rows.values.len() < maximum {
         let Some(mut row) = cursor.next_row().map_err(|_| FAILED)? else {
             break;

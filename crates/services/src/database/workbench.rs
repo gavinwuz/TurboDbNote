@@ -60,6 +60,7 @@ pub struct Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Action {
+    MongoWrite(turbodbn_core::mongo::Mutation),
     RedisWrite(super::redis_value::Mutation),
     RedisScan {
         cursor: Option<String>,
@@ -82,6 +83,7 @@ pub enum Action {
     NotePrepare {
         sql: String,
     },
+    ScriptDiagnostics,
     ScriptPrepare {
         sql: String,
     },
@@ -125,7 +127,12 @@ pub enum Action {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    MongoPage(turbodbn_core::mongo::Page),
+    MongoWritten {
+        inserted: bool,
+    },
     RedisValue(super::redis_value::ValuePage),
+    ScriptDiagnostics(super::notebook_query::ScriptDiagnostics),
     NotePrepared(super::notebook_query::Plan),
     NoteResult(super::notebook_query::ResultPage),
     GridPage {
@@ -426,9 +433,10 @@ pub async fn run(
     r: &Request,
 ) -> Result<Reply, String> {
     match &r.action {
-        Action::RedisScan { .. } | Action::RedisValue { .. } | Action::RedisWrite(_) => {
-            Err("此操作仅适用于 Redis".into())
-        }
+        Action::MongoWrite(_)
+        | Action::RedisScan { .. }
+        | Action::RedisValue { .. }
+        | Action::RedisWrite(_) => Err("此操作仅适用于 Redis".into()),
         Action::NoteGrid {
             plan,
             confirmed,
@@ -469,6 +477,9 @@ pub async fn run(
                 .await
                 .map(Reply::NotePrepared)
         }
+        Action::ScriptDiagnostics => super::notebook_query::script_diagnostics(c, kind)
+            .await
+            .map(Reply::ScriptDiagnostics),
         Action::ScriptPrepare { sql } => {
             super::notebook_query::prepare_script(c, kind, &r.database, version, sql)
                 .await

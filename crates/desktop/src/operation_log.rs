@@ -21,6 +21,7 @@ pub enum Kind {
     Import,
     Copy,
     Update,
+    Driver,
 }
 impl Kind {
     pub fn key(self) -> &'static str {
@@ -34,6 +35,7 @@ impl Kind {
             Self::Import => "output.operation.import",
             Self::Copy => "output.operation.copy",
             Self::Update => "output.operation.update",
+            Self::Driver => "output.operation.driver",
         }
     }
     fn code(self) -> &'static str {
@@ -47,6 +49,7 @@ impl Kind {
             Self::Import => "import",
             Self::Copy => "copy",
             Self::Update => "update",
+            Self::Driver => "driver",
         }
     }
 }
@@ -157,7 +160,16 @@ pub fn failure_class(error: &str) -> &'static str {
         "authentication"
     } else if s.contains("tls") || s.contains("证书") {
         "tls"
-    } else if s.contains("权限") {
+    } else if s.contains("权限")
+        || matches!(
+            error,
+            "notes.access.blocked"
+                | "settings.sql_policy_blocked"
+                | "mysql.error.command_denied"
+                | "mysql.error.privilege_1227"
+                | "mysql.error.trigger_privilege_1419"
+        )
+    {
         "permission"
     } else if s.contains("网络") {
         "network"

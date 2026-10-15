@@ -90,7 +90,7 @@ impl NoteView {
             });
         }
     }
-    fn defaults_locked(&self, cx: &App) -> bool {
+    pub(super) fn defaults_locked(&self, cx: &App) -> bool {
         self.active_queries(cx) || self.cells.iter().any(|c| c.read(cx).result_pending(cx))
     }
     pub(super) fn add_cell(&mut self, kind: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -127,14 +127,57 @@ impl NoteView {
     ) -> AnyElement {
         div()
             .h_flex()
-            .flex_wrap()
             .gap_1()
             .min_h(px(32.))
             .border_b_1()
             .border_color(cx.theme().border)
             .child(self.toolbar_actions(cx))
-            .child(div().flex_1())
             .child(self.toolbar_scope(window, cx))
+            .child(self.access_control(cx))
+            .into_any_element()
+    }
+    fn access_control(&self, cx: &Context<Self>) -> AnyElement {
+        use turbodbn_services::access_mode::AccessMode;
+        let mode = self.access_mode;
+        let view = cx.entity();
+        Button::new("note-access-mode")
+            .flex_shrink_0()
+            .small()
+            .ghost()
+            .icon(gpui_component::Icon::default().path("icons/ai-permissions.svg"))
+            .label(t(cx, mode.label()))
+            .tooltip(t(cx, "notes.access.hint"))
+            .disabled(self.defaults_locked(cx))
+            .dropdown_caret(true)
+            .dropdown_menu(move |mut menu, _, cx| {
+                for candidate in [
+                    AccessMode::ReadOnly,
+                    AccessMode::ReadWrite,
+                    AccessMode::Admin,
+                ] {
+                    let view = view.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(t(cx, candidate.label()))
+                            .checked(candidate == mode)
+                            .on_click(move |_, _, cx| {
+                                view.update(cx, |this, cx| {
+                                    if this.defaults_locked(cx) {
+                                        return;
+                                    }
+                                    this.access_mode = candidate;
+                                    for cell in &this.cells {
+                                        cell.update(cx, |cell, cx| {
+                                            cell.set_access_mode(candidate, cx)
+                                        });
+                                    }
+                                    feedback::success(t(cx, "notes.access.changed"), cx);
+                                    cx.notify();
+                                });
+                            }),
+                    );
+                }
+                menu
+            })
             .into_any_element()
     }
     fn toolbar_actions(&self, cx: &Context<Self>) -> AnyElement {
@@ -300,23 +343,20 @@ impl NoteView {
         let clear_binding = binding.clone();
         div()
             .h_flex()
+            .flex_1()
+            .min_w_0()
             .gap_1()
             .flex_wrap()
             .child(
                 Button::new("note-default-connection")
                     .small()
                     .ghost()
-                    .w(px(160.))
+                    .w(px(150.))
                     .justify_start()
-                    .icon(gpui_component::Icon::default().path("icons/database.svg"))
                     .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(connection),
+                        selected
+                            .map(crate::connection_choice::identity)
+                            .unwrap_or_else(|| div().truncate().child(connection)),
                     )
                     .tooltip(t(cx, "notes.default_hint"))
                     .dropdown_caret(true)
@@ -340,7 +380,7 @@ impl NoteView {
                         for profile in &profiles {
                             let owner = binding.clone();
                             let profile = profile.clone();
-                            menu = menu.item(PopupMenuItem::new(profile.name.clone()).on_click(
+                            menu = menu.item(crate::connection_choice::item(&profile).on_click(
                                 move |_, window, cx| {
                                     owner.update(cx, |this, cx| {
                                         if this.defaults_locked(cx) {
@@ -356,7 +396,7 @@ impl NoteView {
                                 },
                             ));
                         }
-                        menu.scrollable(true).max_h(px(280.))
+                        menu.scrollable(true).min_w(px(360.)).max_h(px(280.))
                     }),
             )
             .child(if sqlite {
@@ -368,8 +408,9 @@ impl NoteView {
             } else {
                 Input::new(&self.default_database)
                     .small()
-                    .w(px(280.))
-                    .flex_shrink_0()
+                    .w(px(220.))
+                    .min_w(px(96.))
+                    .flex_1()
                     .cleanable(!self.defaults_locked(cx))
                     .disabled(self.defaults_locked(cx))
                     .suffix(

@@ -9,16 +9,21 @@ mod cell;
 mod chat;
 mod chat_history;
 mod configuration;
+mod connection_choice;
 mod connection_secret;
 mod connection_store;
 mod context_menu;
 mod database;
 mod diagnostics;
+mod driver_components;
 mod drivers;
+mod duration;
 mod feedback;
 mod locale;
 mod locale_catalog;
+mod mongo_tree;
 mod note_library;
+mod note_permissions;
 mod notebook;
 mod operation_log;
 mod panels;
@@ -77,7 +82,17 @@ fn main() {
         cx.set_global(locale::Locale::load(preferences.general.language.clone()));
         let events = cx.new(|_| tabs::TabEvents);
         cx.set_global(tabs::TabRouter(events));
+        let _ =
+            turbodbn_services::timeout_policy::configure(preferences.database.timeout_defaults());
         cx.set_global(preferences);
+        cx.observe_global::<preferences::Preferences>(|cx| {
+            let _ = turbodbn_services::timeout_policy::configure(
+                cx.global::<preferences::Preferences>()
+                    .database
+                    .timeout_defaults(),
+            );
+        })
+        .detach();
         feedback::init(cx);
         crate::locale::apply_font(cx);
         // Theme reloads can reset typography. User font settings take precedence.

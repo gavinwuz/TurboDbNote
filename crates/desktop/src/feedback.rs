@@ -11,6 +11,32 @@ pub struct Message {
     pub persistent: bool,
     pub id: Option<SharedString>,
     pub text: SharedString,
+    pub action: Option<NotificationAction>,
+}
+pub type NotificationHandler = dyn Fn(&mut Window, &mut App);
+#[derive(Clone)]
+pub struct NotificationAction {
+    pub label: SharedString,
+    pub handler: std::rc::Rc<NotificationHandler>,
+}
+pub fn action_error(
+    text: SharedString,
+    label: SharedString,
+    handler: impl Fn(&mut Window, &mut App) + 'static,
+    cx: &mut App,
+) {
+    let event = Message {
+        kind: NotificationType::Error,
+        persistent: true,
+        id: None,
+        text,
+        action: Some(NotificationAction {
+            label,
+            handler: std::rc::Rc::new(handler),
+        }),
+    };
+    let hub = cx.global::<Hub>().0.clone();
+    hub.update(cx, |_, cx| cx.emit(event));
 }
 #[derive(Clone, PartialEq, Eq)]
 pub struct SqlScope {
@@ -45,6 +71,7 @@ pub fn notify(kind: NotificationType, text: impl Into<SharedString>, cx: &mut Ap
         persistent: false,
         id: None,
         text: text.into(),
+        action: None,
     };
     let hub = cx.global::<Hub>().0.clone();
     hub.update(cx, |_, cx| cx.emit(event));
@@ -55,6 +82,7 @@ pub fn task_reminder(id: uuid::Uuid, scheduled: i64, text: impl Into<SharedStrin
         persistent: true,
         id: Some(format!("task-{id}-{scheduled}").into()),
         text: text.into(),
+        action: None,
     };
     let hub = cx.global::<Hub>().0.clone();
     hub.update(cx, |_, cx| cx.emit(event));

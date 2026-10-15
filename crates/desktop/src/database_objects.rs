@@ -284,7 +284,10 @@ impl DatabaseView {
                 | Reply::Count(_)
                 | Reply::NotePrepared(_)
                 | Reply::NoteResult(_)
-                | Reply::RedisValue(_) => {}
+                | Reply::ScriptDiagnostics(_)
+                | Reply::RedisValue(_)
+                | Reply::MongoPage(_)
+                | Reply::MongoWritten { .. } => {}
             },
             Err(error) => {
                 self.pending_object_action = None;

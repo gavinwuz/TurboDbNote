@@ -226,22 +226,7 @@ impl ScriptResults {
         plan: &turbodbn_services::database::notebook_query::Plan,
     ) {
         self.register_targets(plan.guards.iter().take(32).map(|g| g.object.clone()));
-        let first = plan.sql.split_whitespace().next().unwrap_or_default();
-        let operation = if first.len() <= 16 {
-            first.to_ascii_uppercase()
-        } else {
-            String::new()
-        };
-        let operation = if [
-            "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP", "TRUNCATE", "SELECT",
-            "EXPLAIN",
-        ]
-        .contains(&operation.as_str())
-        {
-            operation
-        } else {
-            "COMMAND".into()
-        };
+        let operation = statement_operation(plan);
         let target = plan
             .guards
             .iter()
@@ -388,7 +373,7 @@ impl ScriptResults {
                             Some(d.target.clone()),
                             Some(
                                 d.elapsed
-                                    .map(|n| format!("{n} ms"))
+                                    .map(crate::duration::elapsed)
                                     .unwrap_or_else(|| "—".into()),
                             ),
                         ]
@@ -718,7 +703,7 @@ impl Render for ScriptResults {
                         ("session", &self.stats.session.to_string()),
                         ("reads", &self.stats.reads.to_string()),
                         ("mixed", &self.stats.mixed.text(cx)),
-                        ("elapsed", &self.elapsed.to_string()),
+                        ("elapsed", &crate::duration::elapsed(self.elapsed)),
                     ],
                 )),
         )
@@ -738,6 +723,9 @@ impl Render for ScriptResults {
         }))
         .into_any_element()
     }
+}
+fn statement_operation(plan: &turbodbn_services::database::notebook_query::Plan) -> String {
+    turbodbn_services::database::notebook_query::script_operation_label(&plan.sql).into()
 }
 #[cfg(test)]
 mod tests {
