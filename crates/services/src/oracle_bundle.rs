@@ -1,11 +1,9 @@
 //! Build-machine acquisition of Oracle's pinned Basic client; no driver is loaded here.
-use crate::driver_packages::hash;
 use std::{
     fs::{self, File},
-    io::{Read, Write},
+    io::Read,
     path::Path,
     sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
 };
 pub const VERSION: &str = "21.23.0.0.0";
 fn error<T>(_: T) -> String {
@@ -31,53 +29,23 @@ pub fn prepare(
         ),
         _ => return Err("components.error.version".into()),
     };
-    fs::create_dir_all(cache).map_err(error)?;
-    let cached = cache.join(format!("oracle-{VERSION}-{platform}.zip"));
-    let archive = if let Some(path) = supplied {
-        path.to_path_buf()
-    } else {
-        if !cached.exists() {
-            let client = reqwest::blocking::Client::builder()
-                .no_proxy()
-                .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(300))
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .map_err(error)?;
-            let mut response = client
-                .get(url)
-                .send()
-                .map_err(|_| "updates.error.request")?;
-            if !response.status().is_success() {
-                return Err("updates.error.request".into());
-            }
-            let mut temp = tempfile::NamedTempFile::new_in(cache).map_err(error)?;
-            let mut buffer = [0; 65536];
-            let mut total = 0u64;
-            loop {
-                if flag.load(Ordering::Relaxed) {
-                    return Err("components.cancelled".into());
-                }
-                let n = response.read(&mut buffer).map_err(error)?;
-                if n == 0 {
-                    break;
-                }
-                total += n as u64;
-                if total > size {
-                    return Err("components.error.checksum".into());
-                }
-                temp.write_all(&buffer[..n]).map_err(error)?;
-            }
-            if total != size || hash(temp.path(), flag)? != sha {
-                return Err("components.error.checksum".into());
-            }
-            temp.persist_noclobber(&cached).map_err(error)?;
-        }
-        cached
-    };
-    if fs::metadata(&archive).map_err(error)?.len() != size || hash(&archive, flag)? != sha {
-        return Err("components.error.checksum".into());
+    let archive = crate::bundle_download::Archive {
+        component: if platform == "windows-x64" {
+            "Oracle 21.23 Windows x64"
+        } else {
+            "Oracle 21.23 Linux x64"
+        },
+        url,
+        name: if platform == "windows-x64" {
+            "oracle-21.23.0.0.0-windows-x64.zip"
+        } else {
+            "oracle-21.23.0.0.0-linux-x64.zip"
+        },
+        sha256: sha,
+        size: Some(size),
+        offline: "-OracleClientArchive",
     }
+    .acquire(cache, supplied, flag)?;
     let destination = native.join("oracle");
     if destination.exists() {
         return Err("components.error.package".into());

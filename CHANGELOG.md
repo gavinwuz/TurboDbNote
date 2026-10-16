@@ -4,7 +4,9 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
-## [0.1.2] - 2026-10-15
+## [0.1.2] - 2026-10-16
+
+- Verify and cache official Oracle/Db2 clients before release compilation; retry transient downloads and report actionable component-specific failures.
 
 - Support independent MongoDB authSource and target-scoped connection tests without requiring admin database listing; classify authentication, permissions and connection failures.
 

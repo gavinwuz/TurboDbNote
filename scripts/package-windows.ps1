@@ -61,6 +61,9 @@ try {
     }
     $notes = Get-VersionReleaseNotes -ChangelogPath (Join-Path $root 'CHANGELOG.md') -Version $version
     $notesZh = Get-VersionReleaseNotes -ChangelogPath (Join-Path $root 'CHANGELOG.zh-CN.md') -Version $version
+    $oraclePreflight = if ($OracleClientArchive) { (Resolve-Path -LiteralPath $OracleClientArchive).Path } else { '-' }
+    $db2Preflight = if ($Db2ClientArchive) { (Resolve-Path -LiteralPath $Db2ClientArchive).Path } else { '-' }
+    Invoke-Checked $devTools @('prefetch-clients', 'windows-x64', $oraclePreflight, $db2Preflight)
     Invoke-Checked cargo @('fmt', '--all', '--', '--check')
     Invoke-Checked cargo @('test', '--locked', '-j', '1', '-p', 'turbodbn-core', '-p', 'turbodbn-services', '-p', 'turbodbnote-driver-host', '--', '--test-threads=1')
     Invoke-Checked cargo @('clippy', '--locked', '-j', '1', '--workspace', '--all-targets', '--', '-D', 'warnings')

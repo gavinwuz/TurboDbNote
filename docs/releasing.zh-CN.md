@@ -333,3 +333,5 @@ Windows 绿色 ZIP 排除 `sources/` 与 `drivers/mysql-5.1.73-winx64/mysql-5.1.
 Release 标题与生成的版本标题仅显示 `v<版本号>`。已发布版本替换仅在明确授权时使用：手动触发同时勾选 publish 与 replace_existing，或默认分支提交同时带 `[release]`、`[replace-release]`。两平台构建和校验全部通过后，先删除旧 Release 与标签，再按新提交重新创建；期间旧下载链接可能短暂不可用。普通发布仍拒绝覆盖；若删除后创建失败，对同一源码重新运行发布。
 
 驱动发行新增完整／最小 Windows 绿色包与安装包、Linux 完整／最小 tarball 和各平台 `*-drivers.zip` 离线组件包。完整包沿用旧名称兼容更新链接。构建机将固定官方 Oracle Basic 客户端缓存于 `target/tools/oracle-bundle`；Windows 可通过 `-OracleClientArchive` 提供同一版本官方离线 ZIP。应用更新保留包型；Access Runtime／DB2 提供方不静默安装，依赖缺失不会显示就绪。新增产物统一校验并接入 CI 上传／发布。
+
+Oracle／Db2 原厂客户端在发行编译前获取并校验 SHA256；CI 在预检成功后立即保存按平台、版本及摘要区分的缓存。连接失败、超时及 HTTP 429/500/502/503/504 最多尝试三次，仅允许同一官方主机的 HTTPS 重定向；归档校验失败直接停止。本地 Windows 打包保留 -OracleClientArchive 与 -Db2ClientArchive 离线入口。

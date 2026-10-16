@@ -142,6 +142,7 @@ fn main() {
     let args: Vec<_> = env::args().skip(1).collect();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let result = match args.first().map(String::as_str) {
+        Some("prefetch-clients") if args.len() == 2 || args.len() == 4 => package::prefetch(&root, &args[1], args.get(2).filter(|v| v.as_str() != "-").map(std::path::Path::new), args.get(3).filter(|v| v.as_str() != "-").map(std::path::Path::new)).map(|_|0),
         Some("run-cargo") => cargo(&args[1..]),
         Some("version") => release::version(&root).map(|v| {println!("{v}"); 0}),
         Some("release") => release::validate_cli(&root, &args[1..]).map(|_| 0),
@@ -151,7 +152,7 @@ fn main() {
         Some("driver-components") if args.len() == 5 => turbodbn_services::driver_packages::build(std::path::Path::new(&args[1]), std::path::Path::new(&args[2]), &args[3], &args[4]).map(|_| 0),
         Some("package-linux") => package::linux(&root).map(|_| 0),
         Some("prepare-release") => release::prepare(&root, &args[1..]).map(|_| 0),
-        _ => Err("Usage: turbodbnote-tools version | release --version V [--notes FILE] [--publication] | prepare-release VERSION | driver-components NATIVE-DIR ZIP VERSION TARGET | package-linux | run-cargo ARGS | build-diagnostics".into()),
+        _ => Err("Usage: turbodbnote-tools version | release --version V [--notes FILE] [--publication] | prepare-release VERSION | driver-components NATIVE-DIR ZIP VERSION TARGET | prefetch-clients TARGET [ORACLE-ZIP|- DB2-ZIP|-] | package-linux | run-cargo ARGS | build-diagnostics".into()),
     };
     match result {
         Ok(code) => std::process::exit(code),

@@ -152,3 +152,5 @@ pub mod db2_bundle;
 pub mod access_mode;
 
 pub mod timeout_policy;
+
+mod bundle_download;

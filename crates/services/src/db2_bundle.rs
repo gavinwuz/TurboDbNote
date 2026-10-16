@@ -1,11 +1,5 @@
 //! Stage the unchanged IBM Windows client archive for explicit, offline installation.
-use std::{
-    fs,
-    io::{Read, Write},
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+use std::{fs, path::Path, sync::atomic::AtomicBool};
 pub const VERSION: &str = "12.1.4";
 pub const URL: &str = "https://public.dhe.ibm.com/ibmdl/export/pub/software/data/db2/drivers/odbc_cli/v12.1.4/ntx64_odbc_cli.zip";
 pub const SHA256: &str = "28748e451e628c41a49676548439c980f02155890d4126342c167fed27a0d63f";
@@ -17,51 +11,18 @@ pub fn prepare(
     flag: &AtomicBool,
 ) -> Result<(), String> {
     let error = || "components.error.package".to_string();
-    fs::create_dir_all(cache).map_err(|_| error())?;
-    let cached = cache.join(ARCHIVE);
-    let archive = supplied.unwrap_or(&cached);
-    if supplied.is_none() && !cached.exists() {
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(300))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|_| error())?;
-        let mut response = client
-            .get(URL)
-            .send()
-            .map_err(|_| "updates.error.request")?
-            .error_for_status()
-            .map_err(|_| "updates.error.request")?;
-        let mut temp = tempfile::NamedTempFile::new_in(cache).map_err(|_| error())?;
-        let mut buffer = [0; 65536];
-        let mut total = 0;
-        loop {
-            if flag.load(Ordering::Relaxed) {
-                return Err("components.cancelled".into());
-            }
-            let count = response.read(&mut buffer).map_err(|_| error())?;
-            if count == 0 {
-                break;
-            }
-            total += count;
-            if total > 256 * 1024 * 1024 {
-                return Err(error());
-            }
-            temp.write_all(&buffer[..count]).map_err(|_| error())?;
-        }
-        if crate::driver_packages::hash(temp.path(), flag)? != SHA256 {
-            return Err(error());
-        }
-        temp.persist_noclobber(&cached).map_err(|_| error())?;
+    let archive = crate::bundle_download::Archive {
+        component: "IBM Db2 CLI 12.1.4 Windows x64",
+        url: URL,
+        name: ARCHIVE,
+        sha256: SHA256,
+        size: None,
+        offline: "-Db2ClientArchive",
     }
-    if crate::driver_packages::hash(archive, flag)? != SHA256 {
-        return Err(error());
-    }
+    .acquire(cache, supplied, flag)?;
     let destination = native.join("db2-offline");
     fs::create_dir_all(&destination).map_err(|_| error())?;
-    fs::copy(archive, destination.join(ARCHIVE)).map_err(|_| error())?;
+    fs::copy(&archive, destination.join(ARCHIVE)).map_err(|_| error())?;
     fs::write(
         destination.join("SHA256SUMS"),
         format!("{SHA256}  {ARCHIVE}\n"),

@@ -63,6 +63,20 @@ jobs:
         with:
           path: target/tools/mysql-bundle
           key: mysql-5.1.73-winx64-verified-v1
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/tools/oracle-bundle
+            target/tools/db2-client
+          key: official-clients-windows-x64-oracle21.23-f0125305-68a6ccd7-db212.1.4-28748e45-v1
+      - name: Prefetch and verify official clients
+        run: cargo run --quiet --locked -j 1 -p turbodbnote-tools -- prefetch-clients windows-x64
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            target/tools/oracle-bundle
+            target/tools/db2-client
+          key: official-clients-windows-x64-oracle21.23-f0125305-68a6ccd7-db212.1.4-28748e45-v1
       - name: Install pinned Inno Setup
         shell: pwsh
         run: |
@@ -122,6 +136,20 @@ jobs:
           key: release-linux
           cache-targets: 'true'
           cache-all-crates: 'true'
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/tools/oracle-bundle
+            target/tools/db2-client
+          key: official-clients-linux-x64-oracle21.23-f0125305-68a6ccd7-db212.1.4-28748e45-v1
+      - name: Prefetch and verify official clients
+        run: cargo run --quiet --locked -j 1 -p turbodbnote-tools -- prefetch-clients linux-x64
+      - uses: actions/cache/save@v4
+        with:
+          path: |
+            target/tools/oracle-bundle
+            target/tools/db2-client
+          key: official-clients-linux-x64-oracle21.23-f0125305-68a6ccd7-db212.1.4-28748e45-v1
       - name: Verify Rust workspace
         run: |
           cargo fmt --all -- --check

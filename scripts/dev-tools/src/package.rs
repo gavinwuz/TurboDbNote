@@ -30,6 +30,7 @@ pub fn linux(root: &Path) -> Result<(), String> {
     {
         return Err("Refusing to overwrite an existing Linux package".into());
     }
+    prefetch(root, "linux-x64", None, None)?;
     let args = [
         "build",
         "--locked",
@@ -184,5 +185,31 @@ pub fn linux(root: &Path) -> Result<(), String> {
     }
     fs::write(checksum, sums).map_err(|_| "Cannot write checksums")?;
     println!("{name}.tar.gz");
+    Ok(())
+}
+
+pub fn prefetch(
+    root: &Path,
+    platform: &str,
+    oracle: Option<&Path>,
+    db2: Option<&Path>,
+) -> Result<(), String> {
+    let stage = tempfile::tempdir().map_err(|_| "Cannot stage client preflight")?;
+    let flag = std::sync::atomic::AtomicBool::new(false);
+    turbodbn_services::oracle_bundle::prepare(
+        &root.join("target/tools/oracle-bundle"),
+        stage.path(),
+        platform,
+        oracle,
+        &flag,
+    )?;
+    if platform == "windows-x64" {
+        turbodbn_services::db2_bundle::prepare(
+            &root.join("target/tools/db2-client"),
+            stage.path(),
+            db2,
+            &flag,
+        )?;
+    }
     Ok(())
 }
