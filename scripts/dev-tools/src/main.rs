@@ -116,6 +116,7 @@ fn diagnostics() -> Result<(), String> {
             "no space",
             "killed",
             "not found",
+            "verification failed",
         ]
         .iter()
         .any(|s| lower.contains(s))
