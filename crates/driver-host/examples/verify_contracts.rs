@@ -71,12 +71,18 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        if let Some(thread) = self.thread.take()
+            && let Ok(Err(error)) = thread.join()
+        {
+            eprintln!("Fixture server failed: {error}");
         }
     }
 }
 fn respond(mut stream: TcpStream) -> Check<()> {
+    // Accepted sockets inherit listener nonblocking mode on Windows.
+    stream
+        .set_nonblocking(false)
+        .map_err(|_| "Fixture blocking setup failed")?;
     stream
         .set_read_timeout(Some(TIMEOUT))
         .map_err(|_| "Fixture timeout setup failed")?;
@@ -85,9 +91,13 @@ fn respond(mut stream: TcpStream) -> Check<()> {
         .map_err(|_| "Fixture timeout setup failed")?;
     let mut reader = BufReader::new(&mut stream);
     let mut request = String::new();
-    reader
+    if reader
         .read_line(&mut request)
-        .map_err(|_| "Fixture request failed")?;
+        .map_err(|_| "Fixture request failed")?
+        == 0
+    {
+        return Ok(());
+    }
     let path = request
         .split_whitespace()
         .nth(1)
@@ -296,6 +306,24 @@ fn run() -> Check<()> {
     .canonicalize()
     .map_err(|_| "Runtime directory unavailable")?;
     let mut server = Server::start()?;
+    let mut delayed = TcpStream::connect(("127.0.0.1", server.port))
+        .map_err(|_| "Cannot connect delayed fixture request")?;
+    delayed
+        .set_read_timeout(Some(TIMEOUT))
+        .map_err(|_| "Cannot bound delayed fixture request")?;
+    thread::sleep(Duration::from_millis(25));
+    delayed
+        .write_all(b"GET / HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n")
+        .map_err(|_| "Cannot send delayed fixture request")?;
+    let mut response = vec![];
+    delayed
+        .take(4096)
+        .read_to_end(&mut response)
+        .map_err(|_| "Delayed fixture response failed")?;
+    require(
+        response.starts_with(b"HTTP/1.1 200 OK\r\n"),
+        "Delayed fixture request was not served",
+    )?;
     for driver in ["elasticsearch", "tdengine"] {
         let mut worker = Worker::start(&runtime)?;
         let profile = json!({"driver_id":driver,"kind":"External","host":"127.0.0.1","port":server.port,"user":"","database":"fixture","timeout_seconds":10,"tls":"Disabled","list_all_databases":false});
