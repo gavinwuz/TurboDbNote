@@ -296,15 +296,8 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<reqwest::Response,
         _ => Err("updates.error.request".into()),
     }
 }
-async fn download_transfer(
-    package: &Asset,
-    sums_url: &str,
-    kind: PackageKind,
-    directory: &Path,
-    cancel: &AtomicBool,
-    progress: &impl Fn(Progress),
-) -> Result<Download, String> {
-    let client = reqwest::Client::builder()
+fn transfer_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(15))
         .timeout(Duration::from_secs(30 * 60))
@@ -317,7 +310,48 @@ async fn download_transfer(
             }
         }))
         .build()
+        .map_err(|_| "updates.error.request".into())
+}
+/// Trusted, hash-pinned component downloads share cancellation, bounds and atomic publication.
+pub fn acquire_verified(
+    package: &Asset,
+    hash: &str,
+    directory: &Path,
+    cancel: &AtomicBool,
+    progress: impl Fn(Progress),
+) -> Result<PathBuf, String> {
+    if !trusted_url(&package.browser_download_url)
+        || package.name.contains(['/', '\\'])
+        || package.name == "."
+        || package.name == ".."
+        || hash.len() != 64
+        || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+        || package.size == 0
+        || package.size > MAX_PACKAGE
+    {
+        return Err("updates.error.url".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
         .map_err(|_| "updates.error.request")?;
+    runtime.block_on(async {
+        let client = transfer_client()?;
+        tokio::select! {
+            result = verified_transfer(&client, package, hash, PackageKind::WindowsPortable, directory, cancel, &progress) => result.map(|v| v.path),
+            _ = wait_for_cancel(cancel) => Err("updates.status.cancelled".into()),
+        }
+    })
+}
+async fn download_transfer(
+    package: &Asset,
+    sums_url: &str,
+    kind: PackageKind,
+    directory: &Path,
+    cancel: &AtomicBool,
+    progress: &impl Fn(Progress),
+) -> Result<Download, String> {
+    let client = transfer_client()?;
     let mut sums = fetch(&client, sums_url).await?;
     let mut bytes = Vec::new();
     while let Some(chunk) = sums.chunk().await.map_err(|_| "updates.error.request")? {
@@ -330,19 +364,30 @@ async fn download_transfer(
         std::str::from_utf8(&bytes).map_err(|_| "updates.error.checksum")?,
         &package.name,
     )?;
+    verified_transfer(&client, package, &hash, kind, directory, cancel, progress).await
+}
+async fn verified_transfer(
+    client: &reqwest::Client,
+    package: &Asset,
+    hash: &str,
+    kind: PackageKind,
+    directory: &Path,
+    cancel: &AtomicBool,
+    progress: &impl Fn(Progress),
+) -> Result<Download, String> {
     cancelled(cancel)?;
     std::fs::create_dir_all(directory).map_err(|_| "updates.error.disk")?;
     let path = directory.join(&package.name);
     if path.exists() {
-        verify(&path, &hash, cancel)?;
+        verify(&path, hash, cancel)?;
         return Ok(Download {
             path,
-            sha256: hash,
+            sha256: hash.to_owned(),
             kind,
             bytes: package.size,
         });
     }
-    let mut source = fetch(&client, &package.browser_download_url).await?;
+    let mut source = fetch(client, &package.browser_download_url).await?;
     let mut temp = tempfile::NamedTempFile::new_in(directory).map_err(|_| "updates.error.disk")?;
     let mut digest = Sha256::new();
     let mut bytes = 0u64;
@@ -388,7 +433,7 @@ async fn download_transfer(
         .map_err(|_| "updates.error.disk")?;
     Ok(Download {
         path,
-        sha256: hash,
+        sha256: hash.to_owned(),
         kind,
         bytes: package.size,
     })

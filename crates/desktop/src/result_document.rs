@@ -212,6 +212,12 @@ pub struct ResultDocument {
     horizontal: ScrollHandle,
 }
 impl ResultDocument {
+    pub(crate) fn note_scroll_handles(&self) -> [ScrollHandle; 2] {
+        [
+            self.vertical.0.borrow().base_handle.clone(),
+            self.horizontal.clone(),
+        ]
+    }
     pub fn new(rows: Rows, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "result.search")));
         let mut this = Self {

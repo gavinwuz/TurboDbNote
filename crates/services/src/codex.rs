@@ -108,6 +108,8 @@ pub enum Event {
     Completed(String),
     Error(String),
     Log(String),
+    Login { url: String, code: Option<String> },
+    LoginFinished { ready: bool },
     Disconnected,
 }
 
@@ -126,6 +128,22 @@ impl Connection {
         cwd: PathBuf,
         mcp: Option<crate::sql_mcp::Config>,
     ) -> (Self, Receiver<Event>) {
+        Self::start_mode(executable, cwd, mcp, None)
+    }
+    /// Authentication owns a separate process and never creates a thread or sends a prompt.
+    pub fn authenticate(
+        executable: PathBuf,
+        cwd: PathBuf,
+        device: bool,
+    ) -> (Self, Receiver<Event>) {
+        Self::start_mode(executable, cwd, None, Some(device))
+    }
+    fn start_mode(
+        executable: PathBuf,
+        cwd: PathBuf,
+        mcp: Option<crate::sql_mcp::Config>,
+        login: Option<bool>,
+    ) -> (Self, Receiver<Event>) {
         let (commands, receiver) = async_channel::bounded(16);
         let (events, output) = async_channel::bounded(128);
         std::thread::spawn(move || {
@@ -134,7 +152,9 @@ impl Connection {
                 .build();
             match runtime {
                 Ok(runtime) => runtime.block_on(async {
-                    if let Err(error) = run(executable, cwd, receiver, events.clone(), mcp).await {
+                    if let Err(error) =
+                        run(executable, cwd, receiver, events.clone(), mcp, login).await
+                    {
                         let _ = events.send(Event::Error(error)).await;
                     }
                     let _ = events.send(Event::Disconnected).await;
@@ -196,12 +216,17 @@ async fn read_stream(reader: impl AsyncRead + Unpin, stderr: bool, tx: Sender<Wi
 enum RpcKind {
     Init,
     Account,
+    LoginStart,
     Models,
     Thread(Prompt),
     Turn,
     Interrupt,
 }
 struct Session {
+    login: Option<bool>,
+    login_id: Option<String>,
+    login_done: bool,
+    login_deadline: Option<Instant>,
     stdin: Box<dyn AsyncWrite + Unpin + Send>,
     next_id: u64,
     pending: HashMap<u64, (Instant, RpcKind)>,
@@ -261,7 +286,17 @@ async fn run(
     commands: Receiver<ClientCommand>,
     events: Sender<Event>,
     mcp: Option<crate::sql_mcp::Config>,
+    login: Option<bool>,
 ) -> Result<(), String> {
+    let isolated = if login.is_some() {
+        Some(tempfile::tempdir().map_err(|_| "agents.setup.error.disk")?)
+    } else {
+        None
+    };
+    let cwd = isolated
+        .as_ref()
+        .map(|dir| dir.path().to_path_buf())
+        .unwrap_or(cwd);
     if !executable.is_absolute() || !executable.is_file() {
         return Err("请选择 Codex 可执行文件的绝对路径".into());
     }
@@ -302,6 +337,10 @@ async fn run(
     let out_task = tokio::spawn(read_stream(stdout, false, tx.clone()));
     let err_task = tokio::spawn(read_stream(stderr, true, tx));
     let mut session = Session {
+        login,
+        login_id: None,
+        login_done: false,
+        login_deadline: login.map(|_| Instant::now() + Duration::from_secs(600)),
         stdin: Box::new(stdin),
         next_id: 0,
         pending: HashMap::new(),
@@ -341,7 +380,13 @@ async fn drive(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
-                Err(_) => return Ok(()),
+                Err(_) => {
+                    if let Some(id) = &s.login_id {
+                        s.write(json!({"id":s.next_id+1,"method":"account/login/cancel","params":{"loginId":id}})).await?;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    return Ok(());
+                },
                 Ok(ClientCommand::NewThread) if !s.busy => { s.thread = None;restore_thread=None; }
                 Ok(ClientCommand::NewThread) => {}
                 Ok(ClientCommand::RestoreThread(id))=>{if !s.busy&&s.thread.is_none(){restore_thread=Some(id);}}
@@ -349,6 +394,7 @@ async fn drive(
                     if !s.cancel { s.cancel = true; s.turn_deadline=Some(Instant::now()+Duration::from_secs(15)); s.interrupt().await?; }
                 }
                 Ok(ClientCommand::Interrupt) => {}
+                Ok(ClientCommand::Send(_)) if s.login.is_some() => return Err("agents.setup.error.login".into()),
                 Ok(ClientCommand::Send(prompt)) => {
                     if s.busy || !s.ready { events.send(Event::Error("AI 未就绪或正在生成".into())).await.map_err(|e| e.to_string())?; continue; }
                     if prompt.text.trim().is_empty() || prompt.text.len() > 65536 { return Err("输入必须为 1–65536 字节".into()); }
@@ -378,12 +424,16 @@ async fn drive(
             },
             _ = ticker.tick() => {
                 if events.is_closed() { return Ok(()); }
+                if s.login_deadline.is_some_and(|at| Instant::now() > at) { return Err("agents.setup.error.login_timeout".into()); }
                 if child.try_wait().map_err(|e| e.to_string())?.is_some() { return Err("Codex 进程已退出，请重新连接".into()); }
                 if s.pending.values().any(|(at,_)| at.elapsed() > RPC_TIMEOUT) { return Err("Codex 协议请求超时，请重新连接".into()); }
                 if s.turn_deadline.is_some_and(|at| Instant::now() > at) {
                     return Err(if s.cancel {"中断超过 15 秒，已终止后台服务"}else{"分析超过 5 分钟，已停止本次服务"}.into());
                 }
             }
+        }
+        if s.login_done {
+            return Ok(());
         }
     }
 }
@@ -402,6 +452,22 @@ pub fn validate_model(models: &[Model], prompt: &Prompt) -> Result<(), String> {
         return Err("所选模型不支持该推理强度".into());
     }
     Ok(())
+}
+
+pub fn login_url(value: &str) -> bool {
+    value.len() <= 8192
+        && reqwest::Url::parse(value).is_ok_and(|url| {
+            url.scheme() == "https"
+                && url.username().is_empty()
+                && url.password().is_none()
+                && url.port_or_known_default() == Some(443)
+                && matches!(
+                    url.host_str(),
+                    Some(
+                        "auth.openai.com" | "auth0.openai.com" | "chatgpt.com" | "chat.openai.com"
+                    )
+                )
+        })
 }
 
 async fn handle_message(
@@ -434,6 +500,9 @@ async fn handle_message(
             return Ok(());
         };
         if let Some(error) = value.get("error") {
+            if s.login.is_some() {
+                return Err("agents.setup.error.login".into());
+            }
             return Err(error["message"]
                 .as_str()
                 .unwrap_or("Codex 请求失败")
@@ -451,11 +520,32 @@ async fn handle_message(
                     RpcKind::Account,
                 )
                 .await?;
-                s.request("model/list", json!({"limit":100}), RpcKind::Models)
-                    .await?;
+                if s.login.is_none() {
+                    s.request("model/list", json!({"limit":100}), RpcKind::Models)
+                        .await?;
+                }
             }
             RpcKind::Account => {
                 s.ready = !result["account"].is_null() || result["requiresOpenaiAuth"] == false;
+                if let Some(device) = s.login {
+                    if s.ready {
+                        events
+                            .send(Event::LoginFinished { ready: true })
+                            .await
+                            .map_err(|_| "agents.setup.error.login")?;
+                        s.login_done = true;
+                    } else if s.login_id.is_none() {
+                        s.request(
+                            "account/login/start",
+                            json!({"type":if device {"chatgptDeviceCode"} else {"chatgpt"}}),
+                            RpcKind::LoginStart,
+                        )
+                        .await?;
+                    } else {
+                        return Err("agents.setup.error.login".into());
+                    }
+                    return Ok(());
+                }
                 let label = if s.ready {
                     "账号已就绪"
                 } else {
@@ -468,6 +558,42 @@ async fn handle_message(
                     })
                     .await
                     .map_err(|e| e.to_string())?;
+            }
+            RpcKind::LoginStart => {
+                let id = result["loginId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 128)
+                    .ok_or("agents.setup.error.login")?;
+                let device = s.login == Some(true);
+                let url = result[if device { "verificationUrl" } else { "authUrl" }]
+                    .as_str()
+                    .ok_or("agents.setup.error.login")?;
+                if !login_url(url) {
+                    return Err("agents.setup.error.login".into());
+                }
+                let code = if device {
+                    Some(
+                        result["userCode"]
+                            .as_str()
+                            .filter(|c| {
+                                !c.is_empty()
+                                    && c.len() <= 64
+                                    && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                            })
+                            .ok_or("agents.setup.error.login")?
+                            .to_owned(),
+                    )
+                } else {
+                    None
+                };
+                s.login_id = Some(id.to_owned());
+                events
+                    .send(Event::Login {
+                        url: url.to_owned(),
+                        code,
+                    })
+                    .await
+                    .map_err(|_| "agents.setup.error.login")?;
             }
             RpcKind::Models => {
                 let models: Vec<Model> = serde_json::from_value(result["data"].clone())
@@ -521,6 +647,21 @@ async fn handle_message(
         return Ok(());
     }
     let params = &value["params"];
+    if value["method"] == "account/login/completed" && s.login.is_some() {
+        if params["loginId"].as_str() != s.login_id.as_deref() || s.login_id.is_none() {
+            return Ok(());
+        }
+        if params["success"] != true {
+            return Err("agents.setup.error.login".into());
+        }
+        s.request(
+            "account/read",
+            json!({"refreshToken":false}),
+            RpcKind::Account,
+        )
+        .await?;
+        return Ok(());
+    }
     if params["threadId"].as_str() != s.thread.as_deref() || !s.busy {
         return Ok(());
     }
@@ -584,6 +725,10 @@ mod tests {
     use super::*;
     fn state() -> Session {
         Session {
+            login: None,
+            login_id: None,
+            login_done: false,
+            login_deadline: None,
             stdin: Box::new(tokio::io::sink()),
             next_id: 0,
             pending: HashMap::new(),
@@ -710,5 +855,140 @@ mod tests {
         let response: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(response["id"], "approval-1");
         assert_eq!(response["result"]["decision"], "decline");
+    }
+}
+
+#[cfg(test)]
+mod authentication_tests {
+    use super::*;
+    fn state() -> Session {
+        Session {
+            login: Some(false),
+            login_id: None,
+            login_done: false,
+            login_deadline: None,
+            stdin: Box::new(tokio::io::sink()),
+            next_id: 0,
+            pending: HashMap::new(),
+            thread: None,
+            turn: None,
+            busy: false,
+            cancel: false,
+            models: vec![],
+            ready: false,
+            cwd: PathBuf::new(),
+            turn_deadline: None,
+        }
+    }
+    #[test]
+    fn authentication_urls_are_exact_official_https_origins() {
+        assert!(login_url("https://auth.openai.com/authorize"));
+        for url in [
+            "http://auth.openai.com/",
+            "https://auth.openai.com.evil.invalid/",
+            "https://user@auth.openai.com/",
+            "file:///tmp/login",
+            "https://chatgpt.com:8443/",
+        ] {
+            assert!(!login_url(url));
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn login_has_no_models_threads_or_prompts_and_ignores_other_attempts() {
+        let (events, out) = async_channel::bounded(16);
+        let mut state = state();
+        state.pending.insert(1, (Instant::now(), RpcKind::Init));
+        state.next_id = 1;
+        handle_message(&mut state, json!({"id":1,"result":{}}), &events)
+            .await
+            .unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert!(matches!(state.pending[&2].1, RpcKind::Account));
+        handle_message(
+            &mut state,
+            json!({"id":2,"result":{"account":null,"requiresOpenaiAuth":true}}),
+            &events,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(state.pending[&3].1, RpcKind::LoginStart));
+        let login_id = uuid::Uuid::new_v4().to_string();
+        handle_message(&mut state,json!({"id":3,"result":{"loginId":login_id,"authUrl":"https://auth.openai.com/authorize"}}),&events).await.unwrap();
+        assert!(matches!(
+            out.try_recv().unwrap(),
+            Event::Login { code: None, .. }
+        ));
+        handle_message(
+            &mut state,
+            json!({"method":"account/login/completed","params":{"loginId":"other","success":true}}),
+            &events,
+        )
+        .await
+        .unwrap();
+        assert!(state.pending.is_empty());
+        handle_message(&mut state,json!({"method":"account/login/completed","params":{"loginId":login_id,"success":true}}),&events).await.unwrap();
+        handle_message(
+            &mut state,
+            json!({"id":4,"result":{"account":{"type":"chatgpt"}}}),
+            &events,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            out.try_recv().unwrap(),
+            Event::LoginFinished { ready: true }
+        ));
+        assert!(
+            state.login_done
+                && state.thread.is_none()
+                && state.turn.is_none()
+                && state.models.is_empty()
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn device_login_requires_official_url_and_a_bounded_user_code() {
+        let (events, out) = async_channel::bounded(8);
+        let mut state = state();
+        state.login = Some(true);
+        state
+            .pending
+            .insert(1, (Instant::now(), RpcKind::LoginStart));
+        let code = uuid::Uuid::new_v4().simple().to_string()[..8].to_uppercase();
+        handle_message(&mut state,json!({"id":1,"result":{"loginId":"device-fixture","verificationUrl":"https://auth.openai.com/codex/device","userCode":code}}),&events).await.unwrap();
+        let event = out.try_recv().unwrap();
+        assert!(matches!(event,Event::Login{code:Some(value),..} if value==code));
+        state
+            .pending
+            .insert(2, (Instant::now(), RpcKind::LoginStart));
+        assert!(handle_message(&mut state,json!({"id":2,"result":{"loginId":"device-fixture","verificationUrl":"https://auth.openai.com/codex/device","userCode":"invalid code"}}),&events).await.is_err());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn login_errors_do_not_return_remote_messages_or_accept_external_links() {
+        let (events, _) = async_channel::bounded(16);
+        let mut state = state();
+        state
+            .pending
+            .insert(1, (Instant::now(), RpcKind::LoginStart));
+        let random = uuid::Uuid::new_v4().to_string();
+        let error = handle_message(
+            &mut state,
+            json!({"id":1,"error":{"message":random}}),
+            &events,
+        )
+        .await
+        .unwrap_err();
+        assert!(error == "agents.setup.error.login");
+        state
+            .pending
+            .insert(2, (Instant::now(), RpcKind::LoginStart));
+        assert!(
+            handle_message(
+                &mut state,
+                json!({"id":2,"result":{"loginId":"fixture","authUrl":"https://example.invalid/"}}),
+                &events
+            )
+            .await
+            .is_err()
+        );
     }
 }

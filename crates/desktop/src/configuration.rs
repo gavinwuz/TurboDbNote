@@ -24,6 +24,7 @@ const MODES: [&str; 3] = [
 
 pub struct Configuration {
     pub category: Category,
+    sidebar_layout_focus: FocusHandle,
     general: GeneralPreferences,
     database: DatabasePreferences,
     timeout_fields: [Entity<InputState>; 2],
@@ -129,6 +130,7 @@ impl Configuration {
         ));
         Self {
             category: Category::General,
+            sidebar_layout_focus: cx.focus_handle(),
             general: prefs.general.clone(),
             baseline: (
                 prefs.general,
@@ -311,6 +313,22 @@ impl Configuration {
         self.baseline.0.close_to_tray = value;
         cx.notify();
     }
+    pub fn set_sidebar_layout(
+        &mut self,
+        layout: crate::preferences::SidebarLayout,
+        cx: &mut Context<Self>,
+    ) {
+        if self.locked {
+            return;
+        }
+        self.database.sidebar_layout = layout;
+        // Preview immediately; SettingsView persists the draft through its shared debounce.
+        let mut prefs = cx.global::<Preferences>().clone();
+        prefs.database.sidebar_layout = layout;
+        cx.set_global(prefs);
+        cx.refresh_windows();
+        cx.notify();
+    }
     pub fn save(&mut self, cx: &mut Context<Self>) -> bool {
         if self.locked {
             return false;
@@ -469,6 +487,69 @@ impl Configuration {
     fn render_database(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let mut body = div().v_flex().gap_4().w_full().max_w(px(760.));
         if self.database_tab == 0 {
+            body = body
+                .child(t(cx, "database.sidebar.title"))
+                .child(
+                    div()
+                        .track_focus(&self.sidebar_layout_focus)
+                        .h_flex()
+                        .gap_3()
+                        .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                            let layout = match event.keystroke.key.as_str() {
+                                "left" => crate::preferences::SidebarLayout::Split,
+                                "right" => crate::preferences::SidebarLayout::Tree,
+                                _ => return,
+                            };
+                            this.set_sidebar_layout(layout, cx);
+                            cx.stop_propagation();
+                        }))
+                        .children(
+                            [
+                                crate::preferences::SidebarLayout::Split,
+                                crate::preferences::SidebarLayout::Tree,
+                            ]
+                            .into_iter()
+                            .map(|layout| {
+                                Button::new(layout.key())
+                                    .flex_1()
+                                    .h(px(148.))
+                                    .selected(self.database.sidebar_layout == layout)
+                                    .disabled(self.locked)
+                                    .child(
+                                        div()
+                                            .v_flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                gpui_component::Icon::default()
+                                                    .path(layout.icon())
+                                                    .size(px(48.)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .h_flex()
+                                                    .gap_2()
+                                                    .when(
+                                                        self.database.sidebar_layout == layout,
+                                                        |el| el.child(IconName::Check),
+                                                    )
+                                                    .child(t(cx, layout.key())),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(t(cx, layout.hint())),
+                                            ),
+                                    )
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.sidebar_layout_focus.focus(window);
+                                        this.set_sidebar_layout(layout, cx)
+                                    }))
+                            }),
+                        ),
+                )
+                .child(t(cx, "database.sidebar.hint"));
             body = body
                 .child(t(cx, "settings2.page_size"))
                 .child(

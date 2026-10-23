@@ -7,7 +7,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, Selectable, StyledExt,
+    ActiveTheme, Disableable, Selectable, Sizable, StyledExt,
     button::{Button, ButtonVariants},
     menu::{DropdownMenu, PopupMenuItem},
     table::{Table, TableState},
@@ -99,6 +99,20 @@ struct Detail {
     status: &'static str,
 }
 pub struct ScriptResults {
+    rowsets: VecDeque<(
+        u64,
+        Entity<crate::table_view::TableView>,
+        String,
+        usize,
+        bool,
+        String,
+    )>,
+    active_rowset: Option<u64>,
+    rowset_subscriptions: std::collections::HashMap<u64, Subscription>,
+    query_scroll: ScrollHandle,
+    rowsets_evicted: bool,
+    session_changed: bool,
+    current_plan: Option<turbodbn_services::database::notebook_query::Plan>,
     connections: Entity<DatabaseView>,
     binding: Option<(SavedConnection, String)>,
     stats: Stats,
@@ -111,6 +125,8 @@ pub struct ScriptResults {
     schema_label: SharedString,
     selected: Option<Object>,
     tab: usize,
+    show_details: bool,
+    details_rowset: Option<u64>,
     success: u64,
     failed: u64,
     total: u64,
@@ -133,6 +149,13 @@ impl ScriptResults {
     ) -> Self {
         cx.on_release(|this, cx| this.cancel_metadata(cx)).detach();
         Self {
+            rowsets: VecDeque::new(),
+            active_rowset: None,
+            rowset_subscriptions: Default::default(),
+            query_scroll: ScrollHandle::new(),
+            rowsets_evicted: false,
+            current_plan: None,
+            session_changed: false,
             connections,
             binding: None,
             stats: Stats::default(),
@@ -149,6 +172,8 @@ impl ScriptResults {
             schema_label: "".into(),
             selected: None,
             tab: 0,
+            show_details: false,
+            details_rowset: None,
             success: 0,
             failed: 0,
             total: 0,
@@ -181,10 +206,117 @@ impl ScriptResults {
         self.loading = false;
         self.revision += 1;
     }
+    pub fn note_scroll_handles(&self, cx: &App) -> Vec<ScrollHandle> {
+        let mut handles = vec![self.query_scroll.clone()];
+        if let Some((_, view, ..)) = self
+            .rowsets
+            .iter()
+            .find(|r| Some(r.0) == self.active_rowset)
+        {
+            handles.extend(view.read(cx).note_scroll_handles(cx));
+        } else {
+            let grid = self.grid.read(cx);
+            handles.push(grid.vertical_scroll_handle.0.borrow().base_handle.clone());
+            handles.push(grid.horizontal_scroll_handle.base_handle().clone());
+        }
+        handles
+    }
+    pub fn details_open(&self) -> bool {
+        self.show_details
+    }
+    pub fn toggle_details(&mut self, cx: &mut Context<Self>) {
+        self.show_details = !self.show_details;
+        if self.show_details {
+            self.details_rowset = self.active_rowset;
+            if self.active_rowset.is_some() {
+                self.tab = 1;
+            }
+        }
+        if !self.show_details {
+            if self.active_rowset.is_none() {
+                self.active_rowset = self
+                    .details_rowset
+                    .filter(|number| self.rowsets.iter().any(|rowset| rowset.0 == *number))
+                    .or_else(|| self.rowsets.front().map(|r| r.0));
+            }
+            self.tab = if self.active_rowset.is_some() { 1 } else { 0 };
+            self.sync_grid(cx);
+        }
+        cx.notify();
+    }
+    pub fn status_text(&self, fallback: SharedString, cx: &App) -> SharedString {
+        let pending = self.total.saturating_sub(self.success + self.failed);
+        if self.running || !self.shown || pending > 0 && self.failed == 0 {
+            return fallback;
+        }
+        if self.failed > 0 {
+            tr(
+                cx,
+                if pending > 0 {
+                    "notes.results.partial_pending"
+                } else {
+                    "notes.results.partial"
+                },
+                &[
+                    ("success", &self.success.to_string()),
+                    ("failed", &self.failed.to_string()),
+                    ("pending", &pending.to_string()),
+                ],
+            )
+        } else {
+            let counts = [
+                &self.stats.inserted,
+                &self.stats.updated,
+                &self.stats.deleted,
+                &self.stats.mixed,
+            ];
+            let affected = counts.iter().map(|count| count.known).sum::<u64>();
+            if affected > 0 && counts.iter().all(|count| count.unknown == 0) {
+                return tr(
+                    cx,
+                    "notes.results.affected",
+                    &[
+                        ("count", &self.success.to_string()),
+                        ("rows", &affected.to_string()),
+                        ("elapsed", &crate::duration::elapsed(self.elapsed)),
+                    ],
+                );
+            }
+            tr(
+                cx,
+                "notes.results.complete",
+                &[
+                    ("count", &self.success.to_string()),
+                    ("elapsed", &crate::duration::elapsed(self.elapsed)),
+                ],
+            )
+        }
+    }
+    pub fn has_report(&self) -> bool {
+        self.shown
+    }
+    pub fn stale_scope(&mut self, cx: &mut Context<Self>) {
+        self.cancel_metadata(cx);
+        self.binding = None;
+        self.current_plan = None;
+        for (_, view, ..) in &self.rowsets {
+            view.update(cx, |view, cx| view.stale_result(cx));
+        }
+        self.schema_notice = t(cx, "notes.results_stale");
+        cx.notify();
+    }
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.cancel_metadata(cx);
         self.binding = None;
         self.shown = false;
+        self.show_details = false;
+        self.details_rowset = None;
+        self.rowset_subscriptions.clear();
+        self.rowsets.clear();
+        self.active_rowset = None;
+        self.current_plan = None;
+        self.session_changed = false;
+        self.rowsets_evicted = false;
         self.query = Rows::default();
         self.schema = Rows::default();
         self.details.clear();
@@ -226,6 +358,7 @@ impl ScriptResults {
         plan: &turbodbn_services::database::notebook_query::Plan,
     ) {
         self.register_targets(plan.guards.iter().take(32).map(|g| g.object.clone()));
+        self.current_plan = Some(plan.clone());
         let operation = statement_operation(plan);
         let target = plan
             .guards
@@ -247,6 +380,7 @@ impl ScriptResults {
         number: u64,
         line: u64,
         refresh: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.pending = None;
@@ -288,6 +422,112 @@ impl ScriptResults {
         });
         if self.details.len() > MAX_DETAILS {
             self.details.pop_front();
+        }
+        if result.execution.is_none()
+            && result.read_only
+            && let (Some((saved, database)), Some(plan)) =
+                (self.binding.clone(), self.current_plan.take())
+        {
+            let sql = plan.sql.clone();
+            let pageable = !self.session_changed
+                && turbodbn_services::database::notebook_query::automatic_table_read(
+                    saved.profile.kind,
+                    &sql,
+                );
+            let connections = self.connections.downgrade();
+            let bytes = sql.len()
+                + result
+                    .rows
+                    .values
+                    .iter()
+                    .flatten()
+                    .filter_map(|v| v.as_ref())
+                    .map(String::len)
+                    .sum::<usize>();
+            let label = if pageable && plan.guards.len() == 1 {
+                plan.guards[0].object.name.clone()
+            } else {
+                String::new()
+            };
+            let kind = saved.profile.kind;
+            let scope = (saved.profile.id, saved.generation, database.clone());
+            let view = cx.new(|cx| {
+                let mut view = crate::table_view::TableView::from_note(
+                    connections,
+                    (saved, database),
+                    (plan, true, result.clone()),
+                    window,
+                    cx,
+                );
+                view.compact_note_result();
+                view.set_note_access_mode(turbodbn_services::access_mode::AccessMode::ReadOnly, cx);
+                if !pageable {
+                    view.freeze_note_page(cx);
+                }
+                view
+            });
+            self.rowset_subscriptions.insert(
+                number,
+                cx.subscribe(
+                    &view,
+                    move |this, _, _: &crate::table_view::ClearNoteResults, cx| {
+                        this.rowsets.retain(|r| r.0 != number);
+                        this.rowset_subscriptions.remove(&number);
+                        if this.active_rowset == Some(number) {
+                            this.active_rowset = this.rowsets.front().map(|r| r.0);
+                        }
+                        cx.notify();
+                    },
+                ),
+            );
+            let named_sql = sql.clone();
+            self.rowsets
+                .push_back((number, view, sql, bytes, pageable, label));
+            let work = cx.background_executor().spawn(async move {
+                let label =
+                    turbodbn_services::database::notebook_query::query_table_name(kind, &named_sql)
+                        .unwrap_or_default();
+                (named_sql, label)
+            });
+            cx.spawn(async move |owner, cx| {
+                let (sql, label) = work.await;
+                let _ = owner.update(cx, |this, cx| {
+                    if this.binding.as_ref().is_some_and(|(saved, database)| {
+                        (saved.profile.id, saved.generation, database.clone()) == scope
+                    }) && let Some(rowset) = this
+                        .rowsets
+                        .iter_mut()
+                        .find(|rowset| rowset.0 == number && rowset.2 == sql)
+                    {
+                        rowset.5 = label;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+            while self.rowsets.len() > 50
+                || self.rowsets.len() > 1
+                    && self.rowsets.iter().map(|r| r.3).sum::<usize>() > 16 * 1024 * 1024
+            {
+                if let Some((number, ..)) = self.rowsets.pop_front() {
+                    self.rowset_subscriptions.remove(&number);
+                }
+                self.rowsets_evicted = true;
+            }
+            if self.active_rowset.is_none() && self.rowsets.len() == 1 {
+                self.active_rowset = Some(number);
+            }
+        } else {
+            self.current_plan = None;
+        }
+        if result.execution.is_some() {
+            self.session_changed = true;
+        }
+        if self
+            .active_rowset
+            .is_some_and(|n| !self.rowsets.iter().any(|(number, ..)| *number == n))
+        {
+            self.active_rowset = self.rowsets.front().map(|(n, ..)| *n);
         }
         // DDL/session results never replace the last genuine rowset with an empty grid.
         if !result.rows.columns.is_empty() || result.read_only && result.execution.is_none() {
@@ -429,6 +669,7 @@ impl ScriptResults {
             return;
         }
         self.cancel_metadata(cx);
+        self.active_rowset = None;
         self.tab = 2;
         self.selected = Some(object.clone());
         self.schema = Rows::default();
@@ -574,56 +815,61 @@ impl Render for ScriptResults {
                 ("deleted", &self.stats.deleted.text(cx)),
             ],
         );
-        let mut body = div().v_flex().gap_2().min_w_0().child(summary).child(
-            div()
-                .h_flex()
-                .gap_2()
-                .child(
-                    Button::new("script-report-details")
-                        .ghost()
-                        .icon(gpui_component::Icon::default().path("icons/md-list.svg"))
-                        .label(t(cx, "script.report.details"))
-                        .selected(self.tab == 0)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.tab = 0;
-                            this.sync_grid(cx);
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("script-report-query")
-                        .ghost()
-                        .icon(gpui_component::Icon::default().path("icons/note-sql.svg"))
-                        .label(t(cx, "script.report.query_tab"))
-                        .selected(self.tab == 1)
-                        .disabled(self.query_label.is_empty())
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.tab = 1;
-                            this.sync_grid(cx);
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    Button::new("script-report-schema")
-                        .ghost()
-                        .icon(gpui_component::Icon::default().path("icons/note-ddl.svg"))
-                        .max_w(px(220.))
-                        .label(if self.schema_label.is_empty() {
-                            t(cx, "script.report.schema_tab")
-                        } else {
-                            self.schema_label.clone()
-                        })
-                        .disabled(self.running || self.objects.is_empty())
-                        .selected(self.tab == 2)
-                        .dropdown_menu({
-                            let objects = self.objects.clone();
-                            let weak = cx.entity().downgrade();
-                            move |mut menu, _, _| {
-                                for object in &objects {
-                                    let object = object.clone();
-                                    let weak = weak.clone();
-                                    menu =
-                                        menu.item(
+        let mut body = div().v_flex().gap_1().min_w_0();
+        if self.show_details {
+            body = body.child(summary).child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(
+                        Button::new("script-report-details")
+                            .ghost()
+                            .icon(gpui_component::Icon::default().path("icons/md-list.svg"))
+                            .label(t(cx, "script.report.details"))
+                            .selected(self.tab == 0 && self.active_rowset.is_none())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_rowset = None;
+                                this.tab = 0;
+                                this.sync_grid(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("script-report-query")
+                            .ghost()
+                            .icon(gpui_component::Icon::default().path("icons/note-sql.svg"))
+                            .label(t(cx, "script.report.query_tab"))
+                            .selected(self.tab == 1 && self.active_rowset.is_some())
+                            .disabled(self.query_label.is_empty())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_rowset = this.rowsets.back().map(|(n, ..)| *n);
+                                this.tab = 1;
+                                this.sync_grid(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("script-report-schema")
+                            .ghost()
+                            .icon(gpui_component::Icon::default().path("icons/note-ddl.svg"))
+                            .max_w(px(220.))
+                            .label(if self.schema_label.is_empty() {
+                                t(cx, "script.report.schema_tab")
+                            } else {
+                                self.schema_label.clone()
+                            })
+                            .disabled(
+                                self.running || self.binding.is_none() || self.objects.is_empty(),
+                            )
+                            .selected(self.tab == 2)
+                            .dropdown_menu({
+                                let objects = self.objects.clone();
+                                let weak = cx.entity().downgrade();
+                                move |mut menu, _, _| {
+                                    for object in &objects {
+                                        let object = object.clone();
+                                        let weak = weak.clone();
+                                        menu = menu.item(
                                             PopupMenuItem::new(format!(
                                                 "{}.{}",
                                                 object.schema, object.name
@@ -634,12 +880,87 @@ impl Render for ScriptResults {
                                                 });
                                             }),
                                         );
+                                    }
+                                    menu.scrollable(true).max_h(px(280.))
                                 }
-                                menu.scrollable(true).max_h(px(280.))
-                            }
-                        }),
-                ),
-        );
+                            }),
+                    ),
+            );
+        }
+        if self.rowsets.len() > 1 {
+            let tabs = div()
+                .id("statement-result-tabs")
+                .h_flex()
+                .gap_1()
+                .overflow_x_scroll()
+                .children(self.rowsets.iter().map(|(number, _, sql, _, _, name)| {
+                    let number = *number;
+                    Button::new(("statement-rowset", number as usize))
+                        .ghost()
+                        .small()
+                        .max_w(px(180.))
+                        .label(if name.is_empty() {
+                            tr(
+                                cx,
+                                "notes.multi.results",
+                                &[("number", &(number + 1).to_string())],
+                            )
+                        } else {
+                            let names: Vec<_> = self.rowsets.iter().map(|r| r.5.as_str()).collect();
+                            result_name(
+                                &names,
+                                self.rowsets.iter().position(|r| r.0 == number).unwrap_or(0),
+                            )
+                            .into()
+                        })
+                        .tooltip(sql.chars().take(512).collect::<String>())
+                        .selected(self.active_rowset == Some(number))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.active_rowset = Some(number);
+                            cx.notify();
+                        }))
+                }));
+            body = body.child(tabs);
+        }
+        if self.rowsets_evicted {
+            body = body.child(t(cx, "notes.multi.evicted"));
+        }
+        if let Some((_, view, sql, _, pageable, _)) = self
+            .rowsets
+            .iter()
+            .find(|(n, ..)| Some(*n) == self.active_rowset)
+        {
+            return body
+                .when(self.show_details, |body| {
+                    body.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(t(
+                                cx,
+                                if *pageable {
+                                    "notes.multi.readonly"
+                                } else {
+                                    "notes.multi.session_result"
+                                },
+                            )),
+                    )
+                    .child(
+                        div()
+                            .id("frozen-result-sql")
+                            .track_scroll(&self.query_scroll)
+                            .max_h(px(80.))
+                            .overflow_y_scroll()
+                            .text_xs()
+                            .child(sql.clone()),
+                    )
+                })
+                .child(div().h(px(340.)).w_full().min_w_0().child(view.clone()))
+                .into_any_element();
+        }
+        if !self.show_details {
+            return body.into_any_element();
+        }
         if self.tab == 1 {
             body = body.child(self.query_label.clone());
         }
@@ -724,12 +1045,32 @@ impl Render for ScriptResults {
         .into_any_element()
     }
 }
+fn result_name(names: &[&str], index: usize) -> String {
+    let name = names[index];
+    if names.iter().filter(|candidate| **candidate == name).count() <= 1 {
+        return name.to_owned();
+    }
+    let ordinal = names[..=index]
+        .iter()
+        .filter(|candidate| **candidate == name)
+        .count();
+    format!("{name} ({ordinal})")
+}
 fn statement_operation(plan: &turbodbn_services::database::notebook_query::Plan) -> String {
     turbodbn_services::database::notebook_query::script_operation_label(&plan.sql).into()
 }
 #[cfg(test)]
 mod tests {
     use super::Stats;
+    #[test]
+    fn repeated_table_names_are_distinct_without_changing_source_identity() {
+        let names = ["game_account", "用户", "game_account", "game_account"];
+        assert_eq!(super::result_name(&names, 0), "game_account (1)");
+        assert_eq!(super::result_name(&names, 1), "用户");
+        assert_eq!(super::result_name(&names, 2), "game_account (2)");
+        assert_eq!(super::result_name(&names, 3), "game_account (3)");
+    }
+
     use turbodbn_services::database::{
         notebook_query::{ExecutionSummary, ResultPage},
         workbench::Rows,

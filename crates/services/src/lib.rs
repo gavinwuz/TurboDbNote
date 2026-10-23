@@ -3,6 +3,7 @@ pub mod agent;
 pub mod claude;
 pub mod codex;
 pub mod codex_discovery;
+pub mod codex_install;
 pub mod connection_url;
 pub mod credentials;
 pub mod database;

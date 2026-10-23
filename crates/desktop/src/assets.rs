@@ -49,6 +49,8 @@ impl AssetSource for Assets {
             return Ok(Some(Cow::Borrowed(*bytes)));
         }
         let bytes: Option<&'static [u8]> = match path {
+            "icons/sidebar-split.svg" => Some(include_bytes!("../assets/icons/sidebar-split.svg")),
+            "icons/sidebar-tree.svg" => Some(include_bytes!("../assets/icons/sidebar-tree.svg")),
             "icons/md-bold.svg" => Some(include_bytes!("../assets/icons/md-bold.svg")),
             "icons/md-italic.svg" => Some(include_bytes!("../assets/icons/md-italic.svg")),
             "icons/md-strike.svg" => Some(include_bytes!("../assets/icons/md-strike.svg")),
@@ -65,6 +67,7 @@ impl AssetSource for Assets {
             "icons/task-lines.svg" => Some(include_bytes!("../assets/icons/task-lines.svg")),
             "icons/note-frame.svg" => Some(include_bytes!("../assets/icons/note-frame.svg")),
             "icons/note-file.svg" => Some(include_bytes!("../assets/icons/note-file.svg")),
+            "icons/note-script.svg" => Some(include_bytes!("../assets/icons/note-script.svg")),
             "icons/note-sql.svg" => Some(include_bytes!("../assets/icons/note-sql.svg")),
             "icons/note-import-sql.svg" => {
                 Some(include_bytes!("../assets/icons/note-import-sql.svg"))
@@ -74,6 +77,7 @@ impl AssetSource for Assets {
             "icons/note-run-all.svg" => Some(include_bytes!("../assets/icons/note-run-all.svg")),
             "icons/note-collapse.svg" => Some(include_bytes!("../assets/icons/note-collapse.svg")),
             "icons/note-expand.svg" => Some(include_bytes!("../assets/icons/note-expand.svg")),
+            "icons/note-clear.svg" => Some(include_bytes!("../assets/icons/note-clear.svg")),
 
             "icons/note-delete.svg" => Some(include_bytes!("../assets/icons/note-delete.svg")),
             "icons/note-read-mode.svg" => {
@@ -94,6 +98,7 @@ impl AssetSource for Assets {
                 Some(include_bytes!("../assets/icons/note-copy-insert.svg"))
             }
             "icons/note-columns.svg" => Some(include_bytes!("../assets/icons/note-columns.svg")),
+            "icons/note-tables.svg" => Some(include_bytes!("../assets/icons/note-tables.svg")),
             "icons/note-format.svg" => Some(include_bytes!("../assets/icons/note-format.svg")),
             "icons/note-run.svg" => Some(include_bytes!("../assets/icons/note-run.svg")),
             "icons/note-insert-before.svg" => {
@@ -110,7 +115,11 @@ impl AssetSource for Assets {
             "icons/name-generate.svg" => Some(include_bytes!("../assets/icons/name-generate.svg")),
             "icons/project-add.svg" => Some(include_bytes!("../assets/icons/project-add.svg")),
             "icons/group-list.svg" => Some(include_bytes!("../assets/icons/group-list.svg")),
+            "icons/load-more.svg" => Some(include_bytes!("../assets/icons/load-more.svg")),
             "icons/refresh.svg" => Some(include_bytes!("../assets/icons/refresh.svg")),
+            "icons/database-filter.svg" => {
+                Some(include_bytes!("../assets/icons/database-filter.svg"))
+            }
             "icons/focus-cross.svg" => Some(include_bytes!("../assets/icons/focus-cross.svg")),
             "icons/index.svg" => Some(include_bytes!("../assets/icons/index.svg")),
             "icons/key.svg" => Some(include_bytes!("../assets/icons/key.svg")),
@@ -152,12 +161,14 @@ impl AssetSource for Assets {
                 "icons/note-frame.svg",
                 "icons/note-file.svg",
                 "icons/note-sql.svg",
+                "icons/note-script.svg",
                 "icons/note-import-sql.svg",
                 "icons/note-md.svg",
                 "icons/note-save.svg",
                 "icons/note-run-all.svg",
                 "icons/note-collapse.svg",
                 "icons/note-expand.svg",
+                "icons/note-clear.svg",
                 "icons/note-delete.svg",
                 "icons/note-run.svg",
                 "icons/note-read-mode.svg",
@@ -180,7 +191,9 @@ impl AssetSource for Assets {
                 "icons/row-count.svg",
                 "icons/name-generate.svg",
                 "icons/group-list.svg",
+                "icons/load-more.svg",
                 "icons/refresh.svg",
+                "icons/database-filter.svg",
                 "icons/focus-cross.svg",
                 "icons/index.svg",
                 "icons/key.svg",
@@ -220,6 +233,7 @@ pub fn note_color(kind: usize, cx: &gpui::App) -> gpui::Hsla {
         0 => (0x69b8ff, 0x1763a6),
         1 => (0x6bcea0, 0x18784b),
         3 => (0xf87171, 0xb91c1c),
+        4 => (0xfbbf24, 0x996000),
         _ => (0xb79afa, 0x7543b5),
     };
     gpui::rgb(if cx.theme().is_dark() { dark } else { light }).into()
@@ -229,6 +243,7 @@ pub fn note_icon(kind: usize, cx: &gpui::App) -> gpui::AnyElement {
     let path = match kind {
         0 => "icons/note-sql.svg",
         1 => "icons/note-md.svg",
+        3 => "icons/note-script.svg",
         _ => "icons/note-file.svg",
     };
     layered_icon("icons/note-frame.svg", path, note_color(kind, cx), cx)

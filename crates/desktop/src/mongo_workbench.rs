@@ -52,6 +52,9 @@ impl TableView {
                                 .iter()
                                 .zip(&projection.types)
                                 .map(|(name, ty)| workbench::Column {
+                                    not_null: None,
+                                    auto_increment: None,
+                                    extra: String::new(),
                                     name: name.clone(),
                                     data_type: ty.clone(),
                                     comment: String::new(),

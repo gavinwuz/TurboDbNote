@@ -1,4 +1,5 @@
 use super::*;
+use gpui_component::Icon;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -10,9 +11,12 @@ pub(super) struct Navigation {
     pub mode: GroupMode,
     pub recent: Vec<Uuid>,
     pub databases: HashMap<Uuid, String>,
+    pub database_rules: HashMap<Uuid, crate::catalog_cache::DatabaseRule>,
     pub created: HashMap<Uuid, String>,
     pub categories: Vec<String>,
     pub environments: Vec<String>,
+    pub tree_connections: std::collections::HashSet<Uuid>,
+    pub tree_nodes: std::collections::HashSet<String>,
     pub top_height: f32,
     pub top_ratio: f32,
     pub collapsed: std::collections::HashSet<String>,
@@ -44,7 +48,12 @@ impl GroupMode {
     }
 }
 pub(super) fn load(path: &Path) -> Result<Navigation, String> {
-    crate::app_store::load(path, "navigation", 65536, |_: &Navigation| true)
+    crate::app_store::load(path, "navigation", 65536, |state: &Navigation| {
+        state
+            .database_rules
+            .values()
+            .all(crate::catalog_cache::DatabaseRule::valid)
+    })
 }
 
 pub(super) fn writer(
@@ -120,7 +129,7 @@ impl DatabaseView {
         }
         let _ = self.nav_writer.force_send(self.navigation.clone());
     }
-    fn group_key(&self, p: &Profile) -> String {
+    pub(super) fn group_key(&self, p: &Profile) -> String {
         match self.navigation.mode {
             GroupMode::Group => group(p),
             GroupMode::Environment => {
@@ -144,7 +153,7 @@ impl DatabaseView {
             .unwrap_or_else(|| "日期未知".into()),
         }
     }
-    fn ordered_groups(&self) -> Vec<String> {
+    pub(super) fn ordered_groups(&self) -> Vec<String> {
         let mut names = self
             .profiles
             .iter()
@@ -211,6 +220,11 @@ impl DatabaseView {
         cx: &Context<Self>,
     ) -> gpui_component::menu::PopupMenu {
         let view = cx.entity().downgrade();
+        if cx.global::<Preferences>().database.sidebar_layout
+            != crate::preferences::SidebarLayout::Split
+        {
+            return menu;
+        }
         menu.item(
             PopupMenuItem::new(crate::locale::t(cx, "dbwork.split.reset"))
                 .icon(IconName::Redo)
@@ -366,6 +380,24 @@ impl DatabaseView {
                             ),
                         )
                     }),
+            )
+            .child(
+                Button::new("toggle-database-sidebar-layout")
+                    .ghost()
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path(cx.global::<Preferences>().database.sidebar_layout.icon()),
+                    )
+                    .tooltip(crate::locale::t(
+                        cx,
+                        cx.global::<Preferences>()
+                            .database
+                            .sidebar_layout
+                            .toggle_tip(),
+                    ))
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.emit(crate::settings::SettingsRequest::ToggleSidebarLayout);
+                    })),
             )
             .into_any_element()
     }
@@ -796,6 +828,29 @@ impl DatabaseView {
 
     pub fn navigation(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         use gpui_component::resizable::{resizable_panel, v_resizable};
+        let layout = cx.global::<Preferences>().database.sidebar_layout;
+        if self.active_sidebar_layout != layout {
+            self.active_sidebar_layout = layout;
+            if layout == crate::preferences::SidebarLayout::Split
+                && !self.browser.supported
+                && !self.object_catalog_loaded
+                && let Some((id, database)) = self.selected_database.clone()
+                && self.note_connection_state(id) == Some(true)
+            {
+                cx.defer_in(window, move |this, _, cx| {
+                    if cx.global::<Preferences>().database.sidebar_layout
+                        == crate::preferences::SidebarLayout::Split
+                        && this.selected_database.as_ref() == Some(&(id, database.clone()))
+                        && this.note_connection_state(id) == Some(true)
+                    {
+                        this.select_database(id, database, cx);
+                    }
+                });
+            }
+        }
+        if layout == crate::preferences::SidebarLayout::Tree {
+            return self.render_merged_navigation(window, cx);
+        }
         let search = self.search.read(cx).value().trim().to_lowercase();
         let mut sections = Vec::new();
         for name in self.ordered_groups() {
@@ -843,6 +898,7 @@ impl DatabaseView {
             .child(
                 div()
                     .id("connection-sections")
+                    .track_scroll(&self.connections_scroll)
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
@@ -886,7 +942,7 @@ impl DatabaseView {
             )
             .into_any_element()
     }
-    fn connection_section(
+    pub(super) fn connection_section(
         &self,
         key: &str,
         label: String,
@@ -1019,185 +1075,231 @@ impl DatabaseView {
             .child(header);
         if !collapsed {
             for p in profiles {
-                let haystack = format!(
-                    "{} {} {} {} {} {} {}",
-                    p.name,
-                    p.host,
-                    p.database,
-                    p.environment,
-                    p.driver_label(),
-                    p.group,
-                    self.catalog(&p).join(" ")
-                )
-                .to_lowercase();
-                if !search.is_empty() && !haystack.contains(search) {
+                if !self.connection_matches(&p, search) {
                     continue;
                 }
-                let id = p.id;
-                let connected = self.states.get(&id).is_some_and(|s| s == "已连接");
-                let state = self
-                    .states
-                    .get(&id)
-                    .cloned()
-                    .unwrap_or_else(|| "未连接".into());
-                let label = if p.name.trim().is_empty() {
-                    crate::locale::t(cx, "dbwork.connection.name.required").to_string()
-                } else {
-                    p.name.clone()
-                };
-                let address = connection_address(&p);
-                let pending = state.ends_with("中…");
-                let failed = state.contains("失败") || state.contains("错误");
-                let selected = self
-                    .selected_database
-                    .as_ref()
-                    .is_some_and(|(current, _)| *current == id);
-                let scope = key.to_string();
-                let menu_view = cx.entity().downgrade();
-                block = block.child(
-                    div()
-                        .h_flex()
-                        .items_center()
-                        .h(px(32.))
-                        .flex_shrink_0()
-                        .gap_1()
-                        .child(
-                            div()
-                                .w(px(4.))
-                                .h(px(18.))
-                                .rounded_sm()
-                                .bg(environment_color(&p.environment)),
-                        )
-                        .child(
-                            div().flex_1().min_w_0().child(crate::context_menu::scoped(
-                                SharedString::from(format!("connection-menu-{scope}-{id}")),
-                                Button::new(SharedString::from(format!("connection-{scope}-{id}")))
-                                    .ghost()
-                                    .icon(type_icon(p.kind))
-                                    .child(
-                                        div()
-                                            .max_w(relative(0.55))
-                                            .flex_shrink_0()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .child(label.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .text_xs()
-                                            .text_color(cx.theme().muted_foreground)
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .child(address.clone()),
-                                    )
-                                    .overflow_hidden()
-                                    .tooltip(format!(
-                                        "{label} · {address} · {} · {}",
-                                        p.environment,
-                                        p.driver_label()
-                                    ))
-                                    .justify_start()
-                                    .selected(selected)
-                                    .w_full()
-                                    .min_w_0()
-                                    .on_click(cx.listener(
-                                        move |this, event: &ClickEvent, window, cx| {
-                                            if event.click_count() == 2
-                                                && this
-                                                    .states
-                                                    .get(&id)
-                                                    .is_none_or(|s| s != "已连接")
-                                            {
-                                                this.connect_saved(id, window, cx);
-                                            } else {
-                                                this.follow_connection(id, false, cx);
-                                            }
-                                        },
-                                    )),
-                                move |menu, _, cx| {
-                                    if let Some(view) = menu_view.upgrade() {
-                                        view.update(cx, |this, cx| {
-                                            this.connection_menu(menu, id, false, cx)
-                                        })
-                                    } else {
-                                        menu
-                                    }
-                                },
-                            )),
-                        )
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("status-dot-{scope}-{id}")))
-                                .w(px(20.))
-                                .h(px(32.))
-                                .h_flex()
-                                .justify_center()
-                                .child(if pending {
-                                    gpui_component::Icon::new(IconName::LoaderCircle)
-                                        .into_any_element()
-                                } else {
-                                    div()
-                                        .w(px(7.))
-                                        .h(px(7.))
-                                        .rounded_full()
-                                        .bg(if connected {
-                                            hsla(0.4, 0.65, 0.48, 1.)
-                                        } else if failed {
-                                            cx.theme().danger
-                                        } else {
-                                            cx.theme().muted_foreground
-                                        })
-                                        .into_any_element()
-                                })
-                                .tooltip(move |window, cx| {
-                                    gpui_component::tooltip::Tooltip::new(state.clone())
-                                        .build(window, cx)
-                                }),
-                        )
-                        .child(
-                            div()
-                                .w(px(28.))
-                                .flex_shrink_0()
-                                .when(connected || pending, |el| {
-                                    el.child(
-                                        Button::new(SharedString::from(format!(
-                                            "disconnect-{scope}-{id}"
-                                        )))
-                                        .ghost()
-                                        .icon(IconName::Close)
-                                        .tooltip(crate::locale::t(
-                                            cx,
-                                            if pending {
-                                                "dbwork.connection.cancel"
-                                            } else {
-                                                "dbwork.connection.disconnect"
-                                            },
-                                        ))
-                                        .on_click(
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.disconnect(id, cx);
-                                                feedback::success(
-                                                    crate::locale::t(
-                                                        cx,
-                                                        "feedback.connection.disconnected",
-                                                    ),
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                    )
-                                }),
-                        ),
-                );
+                block = block.child(self.connection_row(key, &p, cx));
             }
         }
         block.into_any_element()
+    }
+    pub(super) fn connection_matches(&self, p: &Profile, search: &str) -> bool {
+        let names = format!(
+            "{} {} {} {} {} {} {} {} {}",
+            p.name,
+            p.group,
+            p.kind.label(),
+            p.driver_label(),
+            p.driver_id,
+            p.host,
+            p.database,
+            p.environment,
+            self.catalog(p).join(" ")
+        )
+        .to_lowercase();
+        search.split_whitespace().all(|word| names.contains(word))
+    }
+    pub(super) fn connection_row(&self, key: &str, p: &Profile, cx: &Context<Self>) -> AnyElement {
+        let id = p.id;
+        let connected = self.states.get(&id).is_some_and(|s| s == "已连接");
+        let state = self
+            .states
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| "未连接".into());
+        let label = if p.name.trim().is_empty() {
+            crate::locale::t(cx, "dbwork.connection.name.required").to_string()
+        } else {
+            p.name.clone()
+        };
+        let address = connection_address(p);
+        let pending = state.ends_with("中…");
+        let failed = state.contains("失败") || state.contains("错误");
+        let selected = self
+            .selected_database
+            .as_ref()
+            .is_some_and(|(current, _)| *current == id);
+        let scope = key.to_string();
+        let menu_view = cx.entity().downgrade();
+
+        div()
+            .group("database-connection-row")
+            .h_flex()
+            .items_center()
+            .h(px(32.))
+            .flex_shrink_0()
+            .gap_1()
+            .child(
+                div()
+                    .w(px(4.))
+                    .h(px(18.))
+                    .rounded_sm()
+                    .bg(environment_color(&p.environment)),
+            )
+            .child(
+                div().flex_1().min_w_0().child(crate::context_menu::scoped(
+                    SharedString::from(format!("connection-menu-{scope}-{id}")),
+                    Button::new(SharedString::from(format!("connection-{scope}-{id}")))
+                        .ghost()
+                        .icon(type_icon(p.kind))
+                        .child(
+                            div()
+                                .max_w(relative(0.55))
+                                .flex_shrink_0()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(label.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(address.clone()),
+                        )
+                        .overflow_hidden()
+                        .tooltip(format!(
+                            "{label} · {address} · {} · {}",
+                            p.environment,
+                            p.driver_label()
+                        ))
+                        .justify_start()
+                        .selected(selected)
+                        .w_full()
+                        .min_w_0()
+                        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                            if event.click_count() == 2
+                                && this.states.get(&id).is_none_or(|s| s != "已连接")
+                            {
+                                this.connect_saved(id, window, cx);
+                            } else {
+                                this.follow_connection(id, false, cx);
+                            }
+                        })),
+                    move |menu, _, cx| {
+                        if let Some(view) = menu_view.upgrade() {
+                            view.update(cx, |this, cx| this.connection_menu(menu, id, false, cx))
+                        } else {
+                            menu
+                        }
+                    },
+                )),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("status-dot-{scope}-{id}")))
+                    .w(px(20.))
+                    .h(px(32.))
+                    .h_flex()
+                    .justify_center()
+                    .child(if pending {
+                        gpui_component::Icon::new(IconName::LoaderCircle).into_any_element()
+                    } else {
+                        div()
+                            .w(px(7.))
+                            .h(px(7.))
+                            .rounded_full()
+                            .bg(if connected {
+                                hsla(0.4, 0.65, 0.48, 1.)
+                            } else if failed {
+                                cx.theme().danger
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .into_any_element()
+                    })
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(state.clone()).build(window, cx)
+                    }),
+            )
+            .when(key == "merged" && connected, |row| {
+                row.when(
+                    self.info
+                        .get(&id)
+                        .is_some_and(|info| info.database_list_error.is_some()),
+                    |row| {
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("directory-incomplete-{id}")))
+                                .child(Icon::new(IconName::TriangleAlert).size_3())
+                                .tooltip(|window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(crate::locale::t(
+                                        cx,
+                                        "database.cache.database_incomplete",
+                                    ))
+                                    .build(window, cx)
+                                }),
+                        )
+                    },
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "refresh-database-directory-{id}"
+                    )))
+                    .ghost()
+                    .icon(crate::assets::refresh_icon())
+                    .opacity(0.)
+                    .group_hover("database-connection-row", |style| style.opacity(1.))
+                    .focus(|style| style.opacity(1.))
+                    .tooltip(crate::locale::t(cx, "database.cache.refresh_databases"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request_operation(id, OperationKind::Databases, cx);
+                    })),
+                )
+                .child(
+                    Button::new(SharedString::from(format!(
+                        "filter-connection-databases-{id}"
+                    )))
+                    .ghost()
+                    .icon(IconName::Search)
+                    .when(!self.database_filter_active(id, cx), |button| {
+                        button
+                            .opacity(0.)
+                            .group_hover("database-connection-row", |style| style.opacity(1.))
+                            .focus(|style| style.opacity(1.))
+                    })
+                    .selected(self.database_filter_active(id, cx))
+                    .tooltip(crate::locale::t(cx, "database.tree.database_filter"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.toggle_database_filter(id, window, cx)
+                    })),
+                )
+            })
+            .child(
+                div()
+                    .w(px(28.))
+                    .flex_shrink_0()
+                    .when(connected || pending, |el| {
+                        el.child(
+                            Button::new(SharedString::from(format!("disconnect-{scope}-{id}")))
+                                .ghost()
+                                .icon(IconName::Close)
+                                .tooltip(crate::locale::t(
+                                    cx,
+                                    if pending {
+                                        "dbwork.connection.cancel"
+                                    } else {
+                                        "dbwork.connection.disconnect"
+                                    },
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.disconnect(id, cx);
+                                    feedback::success(
+                                        crate::locale::t(cx, "feedback.connection.disconnected"),
+                                        cx,
+                                    );
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
     }
 }
 fn connection_address(p: &Profile) -> String {

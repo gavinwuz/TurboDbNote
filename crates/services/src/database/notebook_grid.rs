@@ -35,6 +35,7 @@ pub(super) fn readonly(columns: &[String]) -> GridSource {
                     data_type: "unknown".into(),
                     comment: String::new(),
                     primary: false,
+                    ..Default::default()
                 })
                 .collect(),
             ..Default::default()
@@ -110,6 +111,18 @@ fn identifier(kind: DatabaseKind, id: &ast::Ident) -> String {
         id.value.to_lowercase()
     } else {
         id.value.clone()
+    }
+}
+/// Conservative single-table label for result tabs; no metadata query or editability inference.
+pub fn query_table_name(kind: DatabaseKind, sql: &str) -> Option<String> {
+    let statement = parse(kind, sql).ok()?;
+    let (_, name) = simple_select(&statement)?;
+    if inspect(&statement, kind).ok()?.tables.len() != 1 {
+        return None;
+    }
+    match name.0.last()? {
+        ast::ObjectNamePart::Identifier(id) => Some(identifier(kind, id)),
+        _ => None,
     }
 }
 pub(super) async fn source_info(
@@ -402,6 +415,29 @@ pub async fn grid_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tab_names_require_a_single_unambiguous_table() {
+        assert_eq!(
+            super::query_table_name(DatabaseKind::MySql, "SELECT id FROM `app`.`items`;"),
+            Some("items".into())
+        );
+        assert_eq!(
+            super::query_table_name(DatabaseKind::PostgreSql, "SELECT id FROM Items;"),
+            Some("items".into())
+        );
+        assert_eq!(
+            super::query_table_name(DatabaseKind::Sqlite, "SELECT * FROM \"用户表\";"),
+            Some("用户表".into())
+        );
+        for sql in [
+            "SELECT 1;",
+            "SELECT * FROM a JOIN b ON a.id=b.id;",
+            "WITH t AS (SELECT * FROM a) SELECT * FROM t;",
+            "SELECT * FROM a UNION SELECT * FROM b;",
+        ] {
+            assert!(super::query_table_name(DatabaseKind::Sqlite, sql).is_none());
+        }
+    }
     #[test]
     fn renamed_table_columns_and_composite_wildcards_are_not_editable_sources() {
         for sql in [

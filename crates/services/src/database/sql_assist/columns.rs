@@ -7,11 +7,127 @@ pub struct ColumnRequest {
     pub table: TableName,
     pub prefix: String,
     pub range: Range<usize>,
+    pub local_columns: Option<Vec<String>>,
 }
 
 /// Parse a temporary identifier at the caret, never execute the repaired text.
 /// Derived tables/CTEs and ambiguous bindings are deliberately not guessed.
+fn statement_range(
+    kind: Option<DatabaseKind>,
+    source: &str,
+    offset: usize,
+) -> Option<Range<usize>> {
+    if source.len() > MAX_SOURCE || !source.is_char_boundary(offset) {
+        return None;
+    }
+    let dialect = match kind {
+        Some(DatabaseKind::MySql | DatabaseKind::ClickHouse) => {
+            turbodbn_core::notebook::SqlDialect::MySql
+        }
+        Some(DatabaseKind::Sqlite) => turbodbn_core::notebook::SqlDialect::Sqlite,
+        Some(DatabaseKind::Redis) => return None,
+        _ => turbodbn_core::notebook::SqlDialect::PostgreSql,
+    };
+    crate::sql_script::editor_ranges(source, dialect)
+        .ok()?
+        .into_iter()
+        .find(|range| range.start <= offset && offset <= range.end)
+}
 pub fn column_request(
+    kind: Option<DatabaseKind>,
+    source: &str,
+    offset: usize,
+) -> Option<ColumnRequest> {
+    let range = statement_range(kind, source, offset)?;
+    let sql = &source[range.clone()];
+    let cursor = offset - range.start;
+    let mut request = column_request_inner(kind, sql, cursor)
+        .or_else(|| super::context::column_request(kind, sql, cursor))?;
+    request.range.start += range.start;
+    request.range.end += range.start;
+    Some(request)
+}
+/// Explicit Col fallback: offer only actual relations referenced by this statement.
+pub fn column_sources(kind: Option<DatabaseKind>, source: &str, offset: usize) -> Vec<TableName> {
+    let Some(range) = statement_range(kind, source, offset) else {
+        return vec![];
+    };
+    let fallback = super::context::tables(kind, &source[range.clone()], offset - range.start);
+    let Ok(statements) = Parser::new(dialect(kind).as_ref())
+        .with_recursion_limit(64)
+        .try_with_sql(&source[range])
+        .and_then(|mut p| p.parse_statements())
+    else {
+        return fallback;
+    };
+    struct Tables {
+        tables: Vec<TableName>,
+        ctes: Vec<String>,
+    }
+    impl Visitor for Tables {
+        type Break = ();
+        fn pre_visit_query(&mut self, q: &Query) -> ControlFlow<()> {
+            if let Some(with) = &q.with {
+                self.ctes.extend(
+                    with.cte_tables
+                        .iter()
+                        .map(|c| c.alias.name.value.to_lowercase()),
+                );
+            }
+            ControlFlow::Continue(())
+        }
+        fn pre_visit_relation(&mut self, relation: &sqlparser::ast::ObjectName) -> ControlFlow<()> {
+            let parts = relation
+                .0
+                .iter()
+                .filter_map(|p| p.as_ident().map(|i| i.value.clone()))
+                .collect::<Vec<_>>();
+            if !parts.is_empty()
+                && parts.len() <= 2
+                && parts
+                    .iter()
+                    .all(|p| p.len() <= 256 && !p.chars().any(char::is_control))
+                && !self.ctes.contains(&parts.last().unwrap().to_lowercase())
+            {
+                let table = TableName {
+                    schema: if parts.len() == 2 {
+                        parts[0].clone()
+                    } else {
+                        String::new()
+                    },
+                    name: parts.last().unwrap().clone(),
+                };
+                if !self.tables.contains(&table) && self.tables.len() < 8 {
+                    self.tables.push(table);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+    let mut tables = Tables {
+        tables: vec![],
+        ctes: vec![],
+    };
+    for statement in statements {
+        let _ = statement.visit(&mut tables);
+    }
+    tables.tables
+}
+
+/// Current statement candidates and a unique caret relation, bounded and offline.
+pub fn ddl_tables(
+    kind: Option<DatabaseKind>,
+    source: &str,
+    offset: usize,
+) -> (Vec<TableName>, Option<TableName>) {
+    let result = super::ddl::ddl_target(kind, source, offset..offset, offset);
+    (
+        result.tables.into_iter().map(|table| table.table).collect(),
+        result.selected,
+    )
+}
+
+fn column_request_inner(
     kind: Option<DatabaseKind>,
     source: &str,
     offset: usize,
@@ -202,6 +318,7 @@ pub fn column_request(
         table: resolver.found?,
         prefix: source[start..offset].into(),
         range: start..end,
+        local_columns: None,
     })
 }
 
@@ -232,6 +349,47 @@ pub fn column_suggestions(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ddl_uses_only_current_statement_and_caret_relation() {
+        let sql =
+            "SELECT * FROM unrelated; SELECT u.id,t.name FROM users u JOIN teams t ON u.id=t.id;";
+        let (tables, selected) = ddl_tables(
+            Some(DatabaseKind::MySql),
+            sql,
+            sql.find("t.name").unwrap() + 6,
+        );
+        assert_eq!(tables.len(), 2);
+        assert_eq!(selected.unwrap().name, "teams");
+        assert!(tables.iter().all(|t| t.name != "unrelated"));
+        let (_, selected) = ddl_tables(
+            Some(DatabaseKind::MySql),
+            sql,
+            sql.find("users").unwrap() + 2,
+        );
+        assert_eq!(selected.unwrap().name, "users");
+        let (_, selected) = ddl_tables(Some(DatabaseKind::MySql), sql, sql.find("JOIN").unwrap());
+        assert!(selected.is_none());
+    }
+    #[test]
+    fn completion_uses_only_caret_statement_and_keeps_original_byte_range() {
+        let source = "SELECT * FROM unrelated u; SELECT * FROM cq_user u WHERE u.na;";
+        let cursor = source.find("u.na").unwrap() + 4;
+        let request = column_request(Some(DatabaseKind::MySql), source, cursor).unwrap();
+        assert_eq!(request.table.name, "cq_user");
+        assert_eq!(request.prefix, "na");
+        assert_eq!(&source[request.range], "na");
+        let tables = column_sources(Some(DatabaseKind::MySql), source, cursor);
+        assert_eq!(tables.len(), 1);
+        assert_eq!(tables[0].name, "cq_user");
+    }
+    #[test]
+    fn explicit_column_sources_are_bounded_and_exclude_cte_names() {
+        let source = "WITH filtered AS (SELECT * FROM real_table) SELECT * FROM filtered JOIN other_table o ON 1=1";
+        let tables = column_sources(Some(DatabaseKind::MySql), source, source.len());
+        assert!(tables.iter().all(|t| t.name != "filtered"));
+        assert!(tables.iter().any(|t| t.name == "real_table"));
+        assert!(tables.iter().any(|t| t.name == "other_table"));
+    }
     #[test]
     fn column_metadata_is_read_without_loading_rows() {
         use crate::database::workbench::{Action, Object, Reply, Request, run};
@@ -326,8 +484,6 @@ mod tests {
     #[test]
     fn does_not_guess_derived_cte_ambiguous_or_literal_bindings() {
         for sql in [
-            "SELECT * FROM (SELECT id FROM users) u WHERE u.",
-            "WITH u AS (SELECT * FROM users) SELECT * FROM u WHERE u.",
             "SELECT * FROM users u JOIN teams u ON true WHERE u.",
             "SELECT * FROM users u WHERE 'u.",
             "SELECT * FROM users u -- u.",
@@ -348,6 +504,7 @@ mod tests {
                 data_type: "INT".into(),
                 comment: String::new(),
                 primary: false,
+                ..Default::default()
             })
             .collect::<Vec<_>>();
         let items = column_suggestions(Some(DatabaseKind::MySql), &request, &columns);

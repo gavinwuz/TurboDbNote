@@ -3,19 +3,21 @@ use crate::{
     DatabaseKind,
     mysql::{self, Event, Profile, ServerInfo, Session, TlsMode},
 };
-use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sqlx::{ConnectOptions, Connection, Row};
 use std::{
     path::Path,
     time::{Duration, Instant},
 };
+pub mod catalog_browser;
+pub mod comparison;
 pub mod connection_import;
 pub mod copy;
 pub mod notebook_query;
 pub mod redis_value;
 mod remote;
 pub mod sql_assist;
+pub mod table_design;
 pub mod transfer;
 pub mod workbench;
 use remote::{HttpDatabase, RedisDatabase};
@@ -264,7 +266,7 @@ pub fn start(
             let opened=tokio::select!{_=rx.recv()=>return,result=tokio::time::timeout(timeout,Backend::open(&profile,&password))=>result};
             drop(password);
             let (mut backend,mut info)=match opened {Ok(Ok(result))=>result,Ok(Err(e))=>{let _=events.send(Event::Failed(e)).await;return;},Err(_)=>{let _=events.send(Event::Failed("连接超时，已取消".into())).await;return;}};
-            if info.databases.len()>=512 {info.database_list_error=Some("数据库列表最多显示 512 项，可在连接配置中直接指定库名".into());}
+            if profile.kind != DatabaseKind::MySql && info.databases.len()>=512 {info.database_list_error=Some("数据库列表最多显示 512 项，可在连接配置中直接指定库名".into());}
             if test{let _=events.send(Event::Tested(info)).await;return;}
             if events.send(Event::Connected(info)).await.is_err(){return;}
             let mut ping=tokio::time::interval(Duration::from_secs(30));ping.tick().await;
@@ -641,13 +643,9 @@ async fn mysql_inner(
             if !p.database.is_empty() && !p.list_all_databases {
                 return Ok(OperationResult::Databases(vec![p.database.clone()]));
             }
-            let mut out = Vec::new();
-            let mut rows = sqlx::query("SHOW DATABASES").fetch(c);
-            while let Some(row) = rows.try_next().await.map_err(db_error)? {
-                out.push(mysql_text(&row, 0)?);
-                if out.len() == 512 {
-                    break;
-                }
+            let (out, error) = crate::mysql::database_names(c).await;
+            if let Some(error) = error {
+                return Err(error);
             }
             Ok(OperationResult::Databases(out))
         }

@@ -2,16 +2,41 @@ use super::*;
 use crate::locale::t;
 use gpui_component::WindowExt;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenTable {
     pub connection: Uuid,
     pub database: String,
     pub object: Object,
     pub mode: crate::table_view::Mode,
+    #[serde(skip)]
     pub generation: u64,
     pub kind: DatabaseKind,
+    #[serde(skip)]
     pub writable: bool,
+    #[serde(skip)]
+    pub mysql_raw_gbk: bool,
 }
+pub(super) const TABLE_MENU_ACTIONS: &[(&str, &str, Option<crate::table_view::Mode>)] = &[
+    ("designer.title", "", Some(crate::table_view::Mode::Design)),
+    ("designer.right", "structure", None),
+    ("dbwork.data", "", Some(crate::table_view::Mode::Grid)),
+    ("dbwork.note", "", Some(crate::table_view::Mode::Note)),
+    ("dbwork.er", "", Some(crate::table_view::Mode::Er)),
+    ("", "", None),
+    ("dbwork.rename", "rename", None),
+    ("dbwork.copy.name", "name", None),
+    ("dbwork.copy.ddl", "ddl", None),
+    ("dbwork.compare", "", Some(crate::table_view::Mode::Compare)),
+    (
+        "compare.structure",
+        "",
+        Some(crate::table_view::Mode::StructureCompare),
+    ),
+    ("dbwork.import", "import", None),
+    ("dbwork.export", "export", None),
+    ("", "", None),
+    ("dbwork.delete", "delete", None),
+];
 impl EventEmitter<OpenTable> for DatabaseView {}
 impl DatabaseView {
     pub(crate) fn mongo_context_current(&self, id: Uuid, generation: u64) -> bool {
@@ -35,8 +60,10 @@ impl DatabaseView {
     }
 
     pub(super) fn cancel_table_request(&mut self, cx: &mut Context<Self>) {
-        self.mcp_target = None;
-        self.ddl.pending = false;
+        if let Some(sender) = self.mcp_target.take() {
+            let _ = sender.try_send(Err("dbwork.session.closed".into()));
+        }
+        self.defer_mcp(cx);
         if let Some(view) = self.workbench_target.take() {
             let _ = view.update(cx, |this, cx| {
                 this.receive(
@@ -49,10 +76,7 @@ impl DatabaseView {
     }
 
     pub(super) fn object_key(object: &Object) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            object.schema, object.kind, object.parent, object.name
-        )
+        crate::object_browser::key(object)
     }
     pub(crate) fn table_request(
         &mut self,
@@ -78,14 +102,15 @@ impl DatabaseView {
         {
             return Err("当前连接为只读".into());
         }
-        if self.request_operation(id, OperationKind::Workbench(Box::new(request)), cx) {
-            self.workbench_target = Some(target);
-            Ok(())
-        } else {
-            Err(self.object_notice.clone())
-        }
+        let rx = self.mcp_request(id, generation, request.database, request.action, cx);
+        cx.spawn(async move |_, cx| {
+            let result = rx.recv().await.unwrap_or_else(|_| Err("mcp.stale".into()));
+            let _ = target.update(cx, |table, cx| table.receive(result, cx));
+        })
+        .detach();
+        Ok(())
     }
-    fn describe_object(&mut self, object: Object, cx: &mut Context<Self>) {
+    pub(super) fn describe_object(&mut self, object: Object, cx: &mut Context<Self>) {
         if let Some((id, database)) = self.selected_database.clone() {
             self.request_operation(
                 id,
@@ -114,6 +139,7 @@ impl DatabaseView {
                 generation: self.generation.get(&id).copied().unwrap_or_default(),
                 kind: p.kind,
                 writable: p.supports_mutation(),
+                mysql_raw_gbk: p.mysql_raw_gbk,
             });
         }
     }
@@ -123,14 +149,34 @@ impl DatabaseView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some((object, action)) = self.pending_object_action.clone()
-            && self.schemas.contains_key(&Self::object_key(&object))
+            && self.browser.full.contains(&Self::object_key(&object))
         {
             self.pending_object_action = None;
             cx.defer_in(window, move |this, window, cx| {
                 this.object_action(object, &action, window, cx)
             });
         }
-        let busy = self.active_operation.is_some();
+        if let Some((object, column)) = self.browser.pending_edit.clone()
+            && self.browser.full.contains(&Self::object_key(&object))
+            && let Some(schema) = self.schemas.get(&Self::object_key(&object))
+        {
+            let ddl = schema.ddl.clone();
+            self.browser.pending_edit = None;
+            let context = self.selected_database.clone();
+            let generation = context.as_ref().map(|(id, _)| self.note_generation(*id));
+            cx.defer_in(window, move |this, window, cx| {
+                if this.selected_database != context
+                    || context.as_ref().map(|(id, _)| this.note_generation(*id)) != generation
+                {
+                    return;
+                }
+                this.edit_column(object, column, ddl, window, cx)
+            });
+        }
+        let busy = self
+            .active_operation
+            .as_ref()
+            .is_some_and(|(_, _, kind)| !super::browser_ui::is_request(kind));
         let source = cx.entity().downgrade();
         let selected = self.selected_database.clone();
         let profile = selected
@@ -362,7 +408,11 @@ impl DatabaseView {
                                     .as_ref()
                                     .is_some_and(|(current, db)| *current == id && db != value)
                                 && this.sessions.contains_key(&id)
-                                && this.active_operation.is_none()
+                                && (this.active_operation.is_none()
+                                    || this
+                                        .active_operation
+                                        .as_ref()
+                                        .is_some_and(|(_, _, k)| super::browser_ui::is_request(k)))
                                 && this
                                     .profiles
                                     .iter()
@@ -396,7 +446,11 @@ impl DatabaseView {
                                         .placeholder(summary)
                                         .search_placeholder(t(cx, "dbwork.database.filter"))
                                         .menu_width(px(300.))
-                                        .disabled(busy),
+                                        .disabled(
+                                            busy && !self.active_operation.as_ref().is_some_and(
+                                                |(_, _, k)| super::browser_ui::is_request(k),
+                                            ),
+                                        ),
                                 ),
                             ),
                     );
@@ -434,348 +488,326 @@ impl DatabaseView {
                     .into_any_element();
             }
         }
-        body = body.child(Input::new(&self.object_filter).cleanable(true));
-        let query = self.object_filter.read(cx).value().trim().to_lowercase();
-        let mut roots = Vec::new();
-        for category in categories {
-            let members = self
-                .catalog_objects
-                .iter()
-                .filter(|o| {
-                    o.kind == category
-                        && format!("{} {} {} {}", o.schema, o.name, o.comment, o.parent)
-                            .to_lowercase()
-                            .contains(&query)
+        let all_categories = self.browser.all_categories;
+        let comments = self.browser.include_comments;
+        let source = cx.entity().downgrade();
+        body = body.child(
+            div()
+                .h_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(Input::new(&self.object_filter).cleanable(true)),
+                )
+                .child(
+                    Button::new("browser-search-options")
+                        .ghost()
+                        .icon(IconName::Ellipsis)
+                        .tooltip(t(cx, "browser.options"))
+                        .disabled(!self.browser.supported || !connected)
+                        .dropdown_menu(move |menu, _, cx| {
+                            let v = source.clone();
+                            let v2 = source.clone();
+                            menu.item(
+                                PopupMenuItem::new(t(cx, "browser.all_categories"))
+                                    .checked(all_categories)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = v.update(cx, |this, cx| {
+                                            this.browser.all_categories =
+                                                !this.browser.all_categories;
+                                            this.restart_browser_search(cx);
+                                        });
+                                    }),
+                            )
+                            .item(
+                                PopupMenuItem::new(t(cx, "browser.include_comments"))
+                                    .checked(comments)
+                                    .on_click(move |_, _, cx| {
+                                        let _ = v2.update(cx, |this, cx| {
+                                            this.browser.include_comments =
+                                                !this.browser.include_comments;
+                                            this.browser.pages.clear();
+                                            this.restart_browser_search(cx);
+                                        });
+                                    }),
+                            )
+                        }),
+                ),
+        );
+
+        self.render_browser_list(body, &categories, window, cx)
+    }
+    pub(super) fn render_browser_object(
+        &mut self,
+        object: Object,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let category = object.kind.as_str();
+        let busy = self.active_operation.is_some();
+        let writable = self
+            .selected_database
+            .as_ref()
+            .and_then(|(id, _)| self.profiles.iter().find(|p| p.id == *id))
+            .is_some_and(|p| p.supports_mutation());
+        let mut root = div().v_flex().w_full();
+        let key = Self::object_key(&object);
+        let expanded = self.expanded_objects.contains(&key);
+        let target = object.clone();
+        let open = object.clone();
+        let menu_object = object.clone();
+        let view = cx.entity().downgrade();
+        let name = if !object.parent.is_empty() {
+            format!("{} / {}", object.parent, object.name)
+        } else if object.schema.is_empty() {
+            object.name.clone()
+        } else {
+            format!("{}.{}", object.schema, object.name)
+        };
+        let table = matches!(category, "table" | "view");
+        root = root.child(
+            div()
+                .id(SharedString::from(format!("object-{key}")))
+                .h_flex()
+                .pl(px(20.))
+                .gap_1()
+                .h(px(30.))
+                .cursor_pointer()
+                .child(
+                    Button::new(SharedString::from(format!("expand-object-{key}")))
+                        .ghost()
+                        .icon(if expanded {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .disabled(!table)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let key = Self::object_key(&target);
+                            if !this.expanded_objects.remove(&key) {
+                                this.expanded_objects.insert(key.clone());
+                                this.browser_columns(target.clone(), cx);
+                            }
+                            cx.notify();
+                        })),
+                )
+                .child(if category == "index" {
+                    gpui_component::Icon::default().path("icons/index.svg")
+                } else {
+                    gpui_component::Icon::new(IconName::GalleryVerticalEnd)
                 })
-                .cloned()
-                .collect::<Vec<_>>();
-            if members.is_empty() && !query.is_empty() {
-                continue;
-            }
-            let folded = self.expanded_objects.contains(category) && query.is_empty();
-            let mut root = div().v_flex().child(
-                Button::new(SharedString::from(format!("object-root-{category}")))
-                    .ghost()
-                    .icon(if folded {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .label(format!(
-                        "{} ({})",
-                        t(cx, &format!("dbwork.{category}")),
-                        members.len()
-                    ))
-                    .justify_start()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if !this.expanded_objects.remove(category) {
-                            this.expanded_objects.insert(category.into());
-                        }
-                        cx.notify();
-                    })),
-            );
-            if !folded {
-                for object in members {
-                    let key = Self::object_key(&object);
-                    let expanded = self.expanded_objects.contains(&key);
-                    let target = object.clone();
-                    let open = object.clone();
-                    let menu_object = object.clone();
-                    let view = cx.entity().downgrade();
-                    let name = if !object.parent.is_empty() {
-                        format!("{} / {}", object.parent, object.name)
-                    } else if object.schema.is_empty() {
-                        object.name.clone()
-                    } else {
-                        format!("{}.{}", object.schema, object.name)
-                    };
-                    let table = matches!(category, "table" | "view");
+                .child(
+                    div()
+                        .id(SharedString::from(format!("table-name-scope-{key}")))
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(
+                            div()
+                                .h_full()
+                                .w_full()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .whitespace_nowrap()
+                                .child(name)
+                                .map(|label| {
+                                    if table {
+                                        crate::context_menu::scoped(
+                                            SharedString::from(format!("table-menu-{key}")),
+                                            label,
+                                            move |mut menu, _, cx| {
+                                                for &(label, action, mode) in TABLE_MENU_ACTIONS {
+                                                    if label.is_empty() {
+                                                        menu = menu.separator();
+                                                        continue;
+                                                    }
+                                                    let v = view.clone();
+                                                    let o = menu_object.clone();
+                                                    menu = menu.item(
+                                                        PopupMenuItem::new(t(cx, label))
+                                                            .disabled(
+                                                                (!table || busy)
+                                                                    && action != "name"
+                                                                    || !writable
+                                                                        && matches!(
+                                                                            action,
+                                                                            "rename"
+                                                                                | "delete"
+                                                                                | "import"
+                                                                        ),
+                                                            )
+                                                            .on_click(move |_, window, cx| {
+                                                                let _ = v.update(cx, |this, cx| {
+                                                                    if let Some(mode) = mode {
+                                                                        this.open_table(
+                                                                            o.clone(),
+                                                                            mode,
+                                                                            cx,
+                                                                        );
+                                                                    } else {
+                                                                        this.object_action(
+                                                                            o.clone(),
+                                                                            action,
+                                                                            window,
+                                                                            cx,
+                                                                        );
+                                                                    }
+                                                                });
+                                                            }),
+                                                    );
+                                                }
+                                                menu
+                                            },
+                                        )
+                                        .into_any_element()
+                                    } else {
+                                        label.into_any_element()
+                                    }
+                                }),
+                        ),
+                )
+                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                    if event.click_count() == 2 && table {
+                        this.open_table(open.clone(), crate::table_view::Mode::Grid, cx);
+                    }
+                })),
+        );
+        if expanded && let Some(schema) = self.schemas.get(&key) {
+            let column_key = format!("{key}:columns-folded");
+            let columns_folded = self.expanded_objects.contains(&column_key);
+            root = root.child(self.object_section_toggle(
+                column_key,
+                t(cx, "dbwork.columns").to_string(),
+                schema.columns.len(),
+                columns_folded,
+                cx,
+            ));
+            if !columns_folded {
+                for (index, column) in schema.columns.iter().enumerate() {
+                    let o = object.clone();
+                    let col = column.clone();
+                    let sql = schema.ddl.clone();
                     root = root.child(
                         div()
-                            .id(SharedString::from(format!("object-{key}")))
+                            .id(SharedString::from(format!("column-{key}-{index}")))
                             .h_flex()
-                            .pl(px(20.))
+                            .pl(px(60.))
                             .gap_1()
-                            .h(px(30.))
+                            .h(px(28.))
+                            .text_sm()
                             .cursor_pointer()
                             .child(
-                                Button::new(SharedString::from(format!("expand-object-{key}")))
-                                    .ghost()
-                                    .icon(if expanded {
-                                        IconName::ChevronDown
-                                    } else {
-                                        IconName::ChevronRight
-                                    })
-                                    .disabled(!table || busy)
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        let key = Self::object_key(&target);
-                                        if !this.expanded_objects.remove(&key) {
-                                            this.expanded_objects.insert(key.clone());
-                                            if !this.schemas.contains_key(&key) {
-                                                this.describe_object(target.clone(), cx);
-                                            }
-                                        }
-                                        cx.notify();
-                                    })),
+                                div()
+                                    .w(px(28.))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(crate::table_view::column_icon(Some(column), cx)),
                             )
-                            .child(if category == "index" {
-                                gpui_component::Icon::default().path("icons/index.svg")
-                            } else {
-                                gpui_component::Icon::new(IconName::GalleryVerticalEnd)
-                            })
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("table-name-scope-{key}")))
                                     .flex_1()
                                     .min_w_0()
-                                    .h_full()
-                                    .child(
-                                        div()
-                                            .h_full()
-                                            .w_full()
-                                            .overflow_hidden()
-                                            .text_ellipsis()
-                                            .whitespace_nowrap()
-                                            .child(name)
-                                            .map(|label| {
-                                                if category == "table" {
-                                                    crate::context_menu::scoped(
-                                                        SharedString::from(format!(
-                                                            "table-menu-{key}"
-                                                        )),
-                                                        label,
-                                                        move |mut menu, _, cx| {
-                                                            for (label, mode) in [
-                                    ("dbwork.data", crate::table_view::Mode::Grid),
-                                    ("dbwork.note", crate::table_view::Mode::Note),
-                                    ("dbwork.er", crate::table_view::Mode::Er),
-                                    ("dbwork.compare", crate::table_view::Mode::Compare),
-                                ] {
-                                    let v = view.clone();
-                                    let o = menu_object.clone();
-                                    menu = menu.item(
-                                        PopupMenuItem::new(t(cx, label)).disabled(!table).on_click(
-                                            move |_, _, cx| {
-                                                let _ = v.update(cx, |this, cx| {
-                                                    this.open_table(o.clone(), mode, cx)
-                                                });
-                                            },
-                                        ),
-                                    );
-                                }
-                                                            for (label, action) in [
-                                                                ("dbwork.structure", "structure"),
-                                                                ("dbwork.rename", "rename"),
-                                                                ("dbwork.copy.name", "name"),
-                                                                ("dbwork.copy.ddl", "ddl"),
-                                                                ("dbwork.delete", "delete"),
-                                                                ("dbwork.import", "import"),
-                                                                ("dbwork.export", "export"),
-                                                            ] {
-                                                                let v = view.clone();
-                                                                let o = menu_object.clone();
-                                                                menu = menu.item(
-                                        PopupMenuItem::new(t(cx, label))
-                                            .disabled(
-                                                (!table || busy) && action != "name"
-                                                    || !writable
-                                                        && matches!(
-                                                            action,
-                                                            "rename" | "delete" | "import"
-                                                        ),
-                                            )
-                                            .on_click(move |_, window, cx| {
-                                                let _ = v.update(cx, |this, cx| {
-                                                    this.object_action(
-                                                        o.clone(),
-                                                        action,
-                                                        window,
-                                                        cx,
-                                                    )
-                                                });
-                                            }),
-                                    );
-                                                            }
-                                                            menu
-                                                        },
-                                                    )
-                                                    .into_any_element()
-                                                } else {
-                                                    label.into_any_element()
-                                                }
-                                            }),
-                                    ),
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .child(format!("{} ({})", column.name, column.data_type)),
                             )
-                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                                if event.click_count() == 2 && table {
-                                    this.open_table(
-                                        open.clone(),
-                                        crate::table_view::Mode::Grid,
+                            .child(
+                                div()
+                                    .max_w(px(110.))
+                                    .overflow_hidden()
+                                    .text_ellipsis()
+                                    .whitespace_nowrap()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(column.comment.clone()),
+                            )
+                            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                                if event.click_count() == 2 && writable {
+                                    this.edit_column(
+                                        o.clone(),
+                                        col.clone(),
+                                        sql.clone(),
+                                        window,
                                         cx,
                                     );
                                 }
                             })),
                     );
-                    if expanded && let Some(schema) = self.schemas.get(&key) {
-                        let column_key = format!("{key}:columns-folded");
-                        let columns_folded = self.expanded_objects.contains(&column_key);
-                        root = root.child(self.object_section_toggle(
-                            column_key,
-                            t(cx, "dbwork.columns").to_string(),
-                            schema.columns.len(),
-                            columns_folded,
-                            cx,
-                        ));
-                        if !columns_folded {
-                            for (index, column) in schema.columns.iter().enumerate() {
-                                let o = object.clone();
-                                let col = column.clone();
-                                let sql = schema.ddl.clone();
-                                root = root.child(
+                }
+            }
+            for (label, rows) in [
+                ("dbwork.index", &schema.indexes),
+                ("dbwork.foreign", &schema.foreign_keys),
+                ("dbwork.trigger", &schema.triggers),
+            ] {
+                let section_key = format!("{key}:{label}");
+                let folded = !self.expanded_objects.contains(&section_key);
+                root = root.child(self.object_section_toggle(
+                    section_key,
+                    t(cx, label).to_string(),
+                    rows.values.len(),
+                    folded,
+                    cx,
+                ));
+                if !folded
+                    && self.browser.supported
+                    && !self.browser.sections.contains(&format!("{key}:{label}"))
+                {
+                    root = root.child(self.browser_state_row(
+                        Action::BrowseSection {
+                            object: object.clone(),
+                            section: label.into(),
+                        },
+                        cx,
+                    ));
+                } else if !folded {
+                    let detail_icon = if label == "dbwork.index" {
+                        gpui_component::Icon::default().path("icons/index.svg")
+                    } else if label == "dbwork.foreign" {
+                        gpui_component::Icon::new(IconName::ExternalLink)
+                    } else {
+                        gpui_component::Icon::new(IconName::Redo)
+                    };
+                    for (index, row) in rows.values.iter().enumerate() {
+                        let label = row.first().cloned().flatten().unwrap_or_default();
+                        let detail = row
+                            .iter()
+                            .filter_map(|v| v.as_deref())
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        root = root.child(
+                            div()
+                                .id(SharedString::from(format!("detail-{key}-{label}-{index}")))
+                                .h_flex()
+                                .gap_1()
+                                .pl(px(60.))
+                                .h(px(28.))
+                                .child(detail_icon.clone())
+                                .child(
                                     div()
-                                        .id(SharedString::from(format!("column-{key}-{index}")))
-                                        .h_flex()
-                                        .pl(px(60.))
-                                        .gap_1()
-                                        .h(px(28.))
-                                        .text_sm()
-                                        .cursor_pointer()
-                                        .child(
-                                            div()
-                                                .w(px(28.))
-                                                .text_xs()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(crate::table_view::column_icon(
-                                                    Some(column),
-                                                    cx,
-                                                )),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .child(format!(
-                                                    "{} ({})",
-                                                    column.name, column.data_type
-                                                )),
-                                        )
-                                        .child(
-                                            div()
-                                                .max_w(px(110.))
-                                                .overflow_hidden()
-                                                .text_ellipsis()
-                                                .whitespace_nowrap()
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(column.comment.clone()),
-                                        )
-                                        .on_click(cx.listener(
-                                            move |this, event: &ClickEvent, window, cx| {
-                                                if event.click_count() == 2 {
-                                                    this.edit_column(
-                                                        o.clone(),
-                                                        col.clone(),
-                                                        sql.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
-                                                }
-                                            },
-                                        )),
-                                );
-                            }
-                        }
-                        for (label, rows) in [
-                            ("dbwork.index", &schema.indexes),
-                            ("dbwork.foreign", &schema.foreign_keys),
-                            ("dbwork.trigger", &schema.triggers),
-                        ] {
-                            let section_key = format!("{key}:{label}");
-                            let folded = !self.expanded_objects.contains(&section_key);
-                            root = root.child(self.object_section_toggle(
-                                section_key,
-                                t(cx, label).to_string(),
-                                rows.values.len(),
-                                folded,
-                                cx,
-                            ));
-                            if !folded {
-                                let detail_icon = if label == "dbwork.index" {
-                                    gpui_component::Icon::default().path("icons/index.svg")
-                                } else if label == "dbwork.foreign" {
-                                    gpui_component::Icon::new(IconName::ExternalLink)
-                                } else {
-                                    gpui_component::Icon::new(IconName::Redo)
-                                };
-                                for (index, row) in rows.values.iter().enumerate() {
-                                    let label = row.first().cloned().flatten().unwrap_or_default();
-                                    let detail = row
-                                        .iter()
-                                        .filter_map(|v| v.as_deref())
-                                        .collect::<Vec<_>>()
-                                        .join(" · ");
-                                    root = root.child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "detail-{key}-{label}-{index}"
-                                            )))
-                                            .h_flex()
-                                            .gap_1()
-                                            .pl(px(60.))
-                                            .h(px(28.))
-                                            .child(detail_icon.clone())
-                                            .child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_w_0()
-                                                    .overflow_hidden()
-                                                    .text_ellipsis()
-                                                    .whitespace_nowrap()
-                                                    .child(label),
-                                            )
-                                            .tooltip(move |window, cx| {
-                                                gpui_component::tooltip::Tooltip::new(
-                                                    detail.clone(),
-                                                )
-                                                .build(window, cx)
-                                            }),
-                                    );
-                                }
-                            }
-                        }
+                                        .flex_1()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_ellipsis()
+                                        .whitespace_nowrap()
+                                        .child(label),
+                                )
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(detail.clone())
+                                        .build(window, cx)
+                                }),
+                        );
                     }
                 }
             }
-            roots.push(root);
         }
-        body.child(
-            div()
-                .id("object-tree-scroll")
-                .flex_1()
-                .min_h_0()
-                .overflow_y_scroll()
-                .children(roots),
-        )
-        .when(
-            selected.is_none()
-                || (!self.object_notice.is_empty()
-                    && self.object_notice != format!("{} 个对象", self.catalog_objects.len())),
-            |body| {
-                body.child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(if selected.is_none() {
-                            t(cx, "dbwork.select").to_string()
-                        } else {
-                            self.object_notice.clone()
-                        }),
-                )
-            },
-        )
-        .into_any_element()
+
+        if expanded && !self.browser.columns.contains(&key) && self.browser.supported {
+            root = root.child(self.browser_state_row(Action::BrowseColumns(object.clone()), cx));
+        }
+        root.into_any_element()
     }
     fn object_section_toggle(
         &self,
@@ -785,6 +817,14 @@ impl DatabaseView {
         folded: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
+        let loaded = !self.browser.supported
+            || key.ends_with(":columns-folded")
+            || self.browser.sections.contains(&key);
+        let count_label = if loaded {
+            count.to_string()
+        } else {
+            t(cx, "browser.not_loaded").to_string()
+        };
         let icon = if key.ends_with(":columns-folded") {
             gpui_component::Icon::new(IconName::GalleryVerticalEnd)
         } else if key.ends_with("dbwork.index") {
@@ -805,20 +845,36 @@ impl DatabaseView {
                         IconName::ChevronDown
                     })
                     .child(icon)
-                    .child(format!("{label} ({count})"))
+                    .child(format!("{label} ({count_label})"))
                     .justify_start()
                     .w_full()
                     .h(px(28.))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if !this.expanded_objects.remove(&key) {
                             this.expanded_objects.insert(key.clone());
+                            if this.browser.supported {
+                                for section in ["dbwork.index", "dbwork.foreign", "dbwork.trigger"]
+                                {
+                                    if let Some(object_key) =
+                                        key.strip_suffix(&format!(":{section}"))
+                                        && let Some(object) = this
+                                            .catalog_objects
+                                            .iter()
+                                            .find(|o| Self::object_key(o) == object_key)
+                                            .cloned()
+                                    {
+                                        this.browser_section(object, section.into(), cx);
+                                        break;
+                                    }
+                                }
+                            }
                         }
                         cx.notify();
                     })),
             )
             .into_any_element()
     }
-    fn object_action(
+    pub(super) fn object_action(
         &mut self,
         object: Object,
         action: &str,
@@ -841,6 +897,8 @@ impl DatabaseView {
         if action == "structure" {
             feedback::ddl_context(
                 feedback::DdlContext {
+                    note: None,
+                    candidates: vec![],
                     origin: None,
                     scope: self.selected_database.clone(),
                     object: Some(object),
@@ -851,6 +909,11 @@ impl DatabaseView {
             return;
         }
         let key = Self::object_key(&object);
+        if !self.browser.full.contains(&key) {
+            self.pending_object_action = Some((object.clone(), action.into()));
+            self.browser_full(object, cx);
+            return;
+        }
         let Some(schema) = self.schemas.get(&key).cloned() else {
             self.pending_object_action = Some((object.clone(), action.into()));
             self.describe_object(object, cx);
@@ -942,13 +1005,18 @@ impl DatabaseView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if ddl.is_empty() && self.browser.supported {
+            self.browser.pending_edit = Some((object.clone(), column));
+            self.browser_full(object, cx);
+            return;
+        }
         let Some((id, db)) = self.selected_database.clone() else {
             return;
         };
         let Some(p) = self.profiles.iter().find(|p| p.id == id) else {
             return;
         };
-        if p.kind == DatabaseKind::Sqlite && p.sqlite_read_only {
+        if !p.supports_mutation() {
             self.object_notice = t(cx, "dbwork.readonly").to_string();
             cx.notify();
             return;

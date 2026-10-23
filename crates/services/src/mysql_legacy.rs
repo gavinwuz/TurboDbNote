@@ -131,6 +131,7 @@ async fn run_process(
     let mut input = child.stdin.take().ok_or("兼容进程 stdin 不可用")?;
     let output = child.stdout.take().ok_or("兼容进程 stdout 不可用")?;
     let (handshake_done, mut handshake) = tokio::sync::oneshot::channel();
+    let raw_gbk = profile.mysql_raw_gbk;
     let result = async {
         let mut data =
             serde_json::to_vec(&Request { profile, password }).map_err(|e| e.to_string())?;
@@ -157,6 +158,9 @@ async fn run_process(
             .map_err(|_| "兼容驱动异常退出或返回无效响应（检查 DLL 位数和运行库）")?;
         if let Some(error) = value["error"].as_str() {
             return Err(error.chars().take(1500).collect());
+        }
+        if raw_gbk && value["raw_gbk"].as_bool() != Some(true) {
+            return Err("mysql.gbk.worker_outdated".into());
         }
         let info: ServerInfo =
             serde_json::from_value(value["info"].clone()).map_err(|_| "兼容驱动响应格式错误")?;
@@ -481,18 +485,11 @@ pub fn worker_main() -> Result<(), String> {
                 if symbol!("mysql_num_fields", Number)(rows) != 1 {
                     return Err("数据库列表列数错误".into());
                 }
-                let mut seen = 0;
                 loop {
                     let row = fetch(rows);
                     if row.is_null() {
                         break;
                     }
-                    if seen == 512 {
-                        database_list_error =
-                            Some("数据库超过 512 个，请直接输入库名缩小范围".into());
-                        break;
-                    }
-                    seen += 1;
                     if !(*row).is_null() {
                         match decode_name(
                             CStr::from_ptr(*row).to_bytes(),
@@ -535,7 +532,10 @@ pub fn worker_main() -> Result<(), String> {
             tls_cipher: String::new(),
             elapsed_ms: begin.elapsed().as_millis(),
         };
-        println!("{}", serde_json::json!({"info":info}));
+        println!(
+            "{}",
+            serde_json::json!({"info":info,"raw_gbk":request.profile.mysql_raw_gbk})
+        );
         std::io::stdout().flush().map_err(|_| "发送连接结果失败")?;
         let ping = symbol!("mysql_ping", Ping);
         loop {
@@ -593,6 +593,7 @@ unsafe fn legacy_rows(
         let query = *library
             .get::<Query>(b"mysql_query ")
             .map_err(|_| "缺少查询接口")?;
+        let complete_directory = sql == "SHOW DATABASES";
         let sql = CString::new(encode_name(sql, charset)?).map_err(|_| "对象名称无效")?;
         if query(raw, sql.as_ptr()) != 0 {
             let errno = *library
@@ -623,7 +624,7 @@ unsafe fn legacy_rows(
             .get::<Fetch>(b"mysql_fetch_row ")
             .map_err(|_| "缺少行接口")?;
         let mut rows = Vec::new();
-        while rows.len() < 513 {
+        while complete_directory || rows.len() < 513 {
             let row = fetch(result);
             if row.is_null() {
                 break;
@@ -653,6 +654,7 @@ unsafe fn legacy_operation(
     charset: &str,
     op: &Operation,
 ) -> Result<OperationResult, String> {
+    crate::driver_catalog::check_operation(p, op)?;
     unsafe {
         let unicode = !version.starts_with("4.0.");
         let set = *library
@@ -676,6 +678,7 @@ unsafe fn legacy_operation(
                         raw,
                         library,
                         charset: encoding,
+                        raw_gbk: false,
                     };
                     crate::database::copy::mysql(
                         &mut access,
@@ -693,6 +696,7 @@ unsafe fn legacy_operation(
                         raw,
                         library,
                         charset: encoding,
+                        raw_gbk: p.mysql_raw_gbk,
                     };
                     crate::database::workbench::run(&mut access, p.kind, version, r)
                         .now_or_never()
@@ -703,7 +707,6 @@ unsafe fn legacy_operation(
                     if p.database.is_empty() || p.list_all_databases {
                         legacy_rows(raw, library, "SHOW DATABASES", encoding)?
                             .into_iter()
-                            .take(512)
                             .filter_map(|r| r.into_iter().next())
                             .collect()
                     } else {
@@ -849,24 +852,146 @@ struct LegacyAccess<'a> {
     raw: *mut c_void,
     library: &'a libloading::Library,
     charset: &'a str,
+    raw_gbk: bool,
 }
 impl crate::database::workbench::Access for LegacyAccess<'_> {
-    fn query<'a>(&'a mut self, sql: &'a str) -> crate::database::workbench::Query<'a> {
+    fn supports_keyset(&self) -> bool {
+        !self.raw_gbk
+    }
+    fn query_data<'a>(&'a mut self, sql: &'a str) -> crate::database::workbench::Query<'a> {
         Box::pin(async move {
-            unsafe { legacy_workbench_rows(self.raw, self.library, sql, self.charset) }
+            if !self.raw_gbk
+                || crate::database::notebook_query::command_required(
+                    crate::DatabaseKind::MySql,
+                    sql,
+                )
+                .is_some_and(|key| key != "select")
+            {
+                return self.query(sql).await;
+            }
+            unsafe { legacy_workbench_rows(self.raw, self.library, sql, self.charset, true) }
         })
     }
+    fn query_data_counted<'a>(
+        &'a mut self,
+        sql: &'a str,
+    ) -> crate::database::workbench::CountedQuery<'a> {
+        Box::pin(async move { self.query_data(sql).await.map(|r| (r, None)) })
+    }
+
+    fn directory_page<'a>(
+        &'a mut self,
+        sql: &'a str,
+        offset: usize,
+        limit: usize,
+    ) -> crate::database::workbench::Query<'a> {
+        Box::pin(async move {
+            unsafe {
+                legacy_directory_page(self.raw, self.library, sql, self.charset, offset, limit)
+            }
+        })
+    }
+    fn query<'a>(&'a mut self, sql: &'a str) -> crate::database::workbench::Query<'a> {
+        Box::pin(async move {
+            unsafe {
+                if self.raw_gbk {
+                    let query = *self
+                        .library
+                        .get::<Query>(b"mysql_query\0")
+                        .map_err(|_| "mysql.gbk.session_failed")?;
+                    if query(self.raw, c("SET character_set_results = utf8")?.as_ptr()) != 0 {
+                        return Err("mysql.gbk.session_failed".into());
+                    }
+                }
+                legacy_workbench_rows(self.raw, self.library, sql, self.charset, false)
+            }
+        })
+    }
+}
+#[repr(C)]
+struct MysqlField {
+    name: *const c_char,
+    org_name: *const c_char,
+    table: *const c_char,
+    org_table: *const c_char,
+    db: *const c_char,
+    catalog: *const c_char,
+    default_value: *const c_char,
+    length: c_ulong,
+    max_length: c_ulong,
+    name_length: c_uint,
+    org_name_length: c_uint,
+    table_length: c_uint,
+    org_table_length: c_uint,
+    db_length: c_uint,
+    catalog_length: c_uint,
+    default_length: c_uint,
+    flags: c_uint,
+    decimals: c_uint,
+    charsetnr: c_uint,
+    field_type: c_uint,
+    extension: *const c_void,
+}
+fn decode_raw_gbk(bytes: &[u8], charset: u32, field_type: u32) -> Result<String, String> {
+    if charset == 63 && matches!(field_type, 15 | 16 | 249..=255) {
+        return Ok(format!(
+            "0x{}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+    }
+    if charset == 63 {
+        return String::from_utf8(bytes.to_vec()).map_err(|_| "mysql.gbk.decode_failed".into());
+    }
+    if field_type == 245 || matches!(charset, 33 | 45 | 46 | 83 | 192..=247 | 255) {
+        return String::from_utf8(bytes.to_vec()).map_err(|_| "mysql.gbk.decode_failed".into());
+    }
+    if !matches!(
+        charset,
+        5 | 8 | 15 | 24 | 28 | 31 | 47 | 48 | 49 | 86 | 87 | 94
+    ) {
+        return Err("mysql.gbk.unsupported_charset".into());
+    }
+    let (value, _, errors) = encoding_rs::GBK.decode(bytes);
+    if errors {
+        Err("mysql.gbk.decode_failed".into())
+    } else {
+        Ok(value.into_owned())
+    }
+}
+unsafe fn legacy_directory_page(
+    raw: *mut c_void,
+    library: &libloading::Library,
+    sql: &str,
+    charset: &str,
+    offset: usize,
+    limit: usize,
+) -> Result<crate::database::workbench::Rows, String> {
+    unsafe { legacy_workbench_rows_page(raw, library, sql, charset, false, Some((offset, limit))) }
 }
 unsafe fn legacy_workbench_rows(
     raw: *mut c_void,
     library: &libloading::Library,
     sql: &str,
     charset: &str,
+    raw_gbk: bool,
+) -> Result<crate::database::workbench::Rows, String> {
+    unsafe { legacy_workbench_rows_page(raw, library, sql, charset, raw_gbk, None) }
+}
+unsafe fn legacy_workbench_rows_page(
+    raw: *mut c_void,
+    library: &libloading::Library,
+    sql: &str,
+    charset: &str,
+    raw_gbk: bool,
+    directory: Option<(usize, usize)>,
 ) -> Result<crate::database::workbench::Rows, String> {
     unsafe {
         let query = *library
             .get::<Query>(b"mysql_query\0")
             .map_err(|_| "缺少查询接口")?;
+        if raw_gbk && query(raw, c("SET character_set_results = NULL")?.as_ptr()) != 0 {
+            return Err("mysql.gbk.session_failed".into());
+        }
         let sql = CString::new(encode_name(sql, charset)?).map_err(|_| "SQL 包含空字符")?;
         if query(raw, sql.as_ptr()) != 0 {
             let errno = *library
@@ -901,11 +1026,36 @@ unsafe fn legacy_workbench_rows(
         let lengths = *library
             .get::<Lengths>(b"mysql_fetch_lengths\0")
             .map_err(|_| "缺少长度接口")?;
+        type Fields = unsafe extern "C" fn(*mut c_void) -> *const MysqlField;
+        let fields = if raw_gbk {
+            let fields = (*library
+                .get::<Fields>(b"mysql_fetch_fields\0")
+                .map_err(|_| "mysql.gbk.metadata_failed")?)(result);
+            if fields.is_null() {
+                return Err("mysql.gbk.metadata_failed".into());
+            }
+            for i in 0..count {
+                out.columns.push(decode_name(
+                    CStr::from_ptr((*fields.add(i)).name).to_bytes(),
+                    "utf8",
+                )?);
+            }
+            Some(fields)
+        } else {
+            None
+        };
         let mut bytes = 0;
+        let mut seen = 0;
         loop {
             let row = fetch(result);
             if row.is_null() {
                 break;
+            }
+            if let Some((offset, limit)) = directory {
+                seen += 1;
+                if seen <= offset || out.values.len() > limit {
+                    continue;
+                }
             }
             let lens = lengths(result);
             if lens.is_null() {
@@ -918,12 +1068,17 @@ unsafe fn legacy_workbench_rows(
                     None
                 } else {
                     let b = std::slice::from_raw_parts(v as *const u8, *lens.add(i) as usize);
-                    Some(decode_name(b, charset).unwrap_or_else(|_| {
-                        format!(
-                            "0x{}",
-                            b.iter().map(|v| format!("{v:02x}")).collect::<String>()
-                        )
-                    }))
+                    Some(if let Some(fields) = fields {
+                        let field = &*fields.add(i);
+                        decode_raw_gbk(b, field.charsetnr, field.field_type)?
+                    } else {
+                        decode_name(b, charset).unwrap_or_else(|_| {
+                            format!(
+                                "0x{}",
+                                b.iter().map(|v| format!("{v:02x}")).collect::<String>()
+                            )
+                        })
+                    })
                 };
                 bytes += value.as_ref().map_or(0, |s| s.len());
                 values.push(value);
@@ -940,6 +1095,67 @@ unsafe fn legacy_workbench_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn raw_gbk_preserves_binary_and_decodes_latin1_bin_without_guessing() {
+        let bytes = [0xb6, 0xf1, 0xb6, 0xbe, 0xc8, 0xfd, 0xbd, 0xc7];
+        assert_eq!(decode_raw_gbk(&bytes, 47, 253).unwrap(), "恶毒三角");
+        assert_eq!(decode_raw_gbk(&bytes, 8, 253).unwrap(), "恶毒三角");
+        assert_eq!(
+            decode_raw_gbk(&bytes, 63, 253).unwrap(),
+            "0xb6f1b6bec8fdbdc7"
+        );
+        assert_eq!(
+            decode_raw_gbk("正常中文".as_bytes(), 33, 253).unwrap(),
+            "正常中文"
+        );
+        assert!(decode_raw_gbk(&[0x81], 8, 253).is_err());
+        assert!(decode_raw_gbk(&[0xff], 12, 253).is_err());
+        assert!(decode_raw_gbk(b"\0A", 35, 253).is_err());
+    }
+    #[test]
+    fn compatibility_scope_is_explicit_read_only_and_defaults_off() {
+        let old: Profile = serde_json::from_str("{}").unwrap();
+        assert!(!old.mysql_raw_gbk);
+        let p = Profile {
+            mysql_raw_gbk: true,
+            charset: "gbk".into(),
+            ..Default::default()
+        };
+        assert!(crate::mysql::uses_legacy(&p));
+        let resolved = crate::mysql::detected_profile(p.clone(), "5.6.21");
+        assert_eq!(resolved.driver, crate::mysql::Driver::Legacy);
+        assert_eq!(resolved.target_version, "5.6.21");
+
+        assert!(!p.supports_mutation());
+        let op = |action| Operation {
+            kind: OperationKind::Workbench(Box::new(crate::database::workbench::Request {
+                database: "fixture".into(),
+                action,
+            })),
+            id: 1,
+        };
+        assert!(
+            crate::driver_catalog::check_operation(
+                &p,
+                &Operation {
+                    id: 1,
+                    kind: OperationKind::Databases
+                }
+            )
+            .is_ok()
+        );
+        assert!(
+            crate::driver_catalog::check_operation(
+                &p,
+                &op(crate::database::workbench::Action::Execute {
+                    sql: "DELETE FROM fixture".into(),
+                    guard: None
+                })
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn sql_syntax_and_missing_table_have_shared_sanitized_categories() {
         assert_eq!(database_error(1064), crate::mysql::SQL_SYNTAX_ERROR);

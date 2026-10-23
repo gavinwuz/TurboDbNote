@@ -77,6 +77,7 @@ fn mysql_column_edit_preserves_constraints_and_default() {
         data_type: "varchar(80)".into(),
         comment: "old".into(),
         primary: false,
+        ..Default::default()
     };
     let ddl = "CREATE TABLE `order``details` (\n  `label` varchar(80) NOT NULL DEFAULT 'COMMENT unchanged' COMMENT 'old',\n  PRIMARY KEY (`label`)\n) ENGINE=InnoDB";
     let sql = change_column(
@@ -140,6 +141,7 @@ async fn csv_round_trip_handles_null_empty_quotes_newlines_and_slashes() {
         data_type: "TEXT".into(),
         comment: String::new(),
         primary: false,
+        ..Default::default()
     }];
     let sql = import_csv(DatabaseKind::Sqlite, "", &object, &columns, &csv).unwrap();
     c.query(&sql).await.unwrap();
@@ -728,6 +730,7 @@ fn copied_cell_where_quotes_identifiers_values_and_null() {
         data_type: "TEXT".into(),
         comment: String::new(),
         primary: false,
+        ..Default::default()
     };
     assert_eq!(
         cell_where(DatabaseKind::Sqlite, &column, Some("O'Reilly")).unwrap(),
@@ -784,4 +787,128 @@ fn copied_cell_where_quotes_identifiers_values_and_null() {
         ..column
     };
     assert!(cell_where(DatabaseKind::Sqlite, &binary, Some("preview")).is_err());
+}
+
+#[tokio::test]
+async fn sqlite_definition_retains_nullability_defaults_and_generated_columns() {
+    let mut c = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+    sqlx::raw_sql("CREATE TABLE definition_fixture(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL DEFAULT 'sample', derived TEXT GENERATED ALWAYS AS (name) VIRTUAL)").execute(&mut c).await.unwrap();
+    let object = Object {
+        schema: String::new(),
+        name: "definition_fixture".into(),
+        kind: "table".into(),
+        comment: String::new(),
+        parent: String::new(),
+    };
+    let schema = schema(&mut c, DatabaseKind::Sqlite, "main", &object, true)
+        .await
+        .unwrap();
+    assert!(schema.columns[0].primary);
+    assert_eq!(schema.columns[0].auto_increment, Some(true));
+    assert_eq!(schema.columns[1].not_null, Some(true));
+    assert!(schema.columns[1].extra.contains("DEFAULT 'sample'"));
+    assert!(schema.columns[2].extra.contains("GENERATED"));
+    let old: Column =
+        serde_json::from_str(r#"{"name":"old","data_type":"TEXT","comment":"","primary":false}"#)
+            .unwrap();
+    assert_eq!(old.not_null, None);
+    assert_eq!(old.auto_increment, None);
+}
+
+#[tokio::test]
+async fn account_directories_are_read_only_paged_and_driver_scoped() {
+    struct Fixture {
+        queries: Vec<String>,
+        fail: bool,
+    }
+    impl Access for Fixture {
+        fn query<'a>(&'a mut self, sql: &'a str) -> Query<'a> {
+            self.queries.push(sql.to_owned());
+            Box::pin(async move {
+                if self.fail {
+                    return Err("permission denied".into());
+                }
+                Ok(Rows {
+                    columns: vec![],
+                    values: vec![
+                        vec![Some("reader".into()), Some("localhost".into())],
+                        vec![Some("next".into()), Some("%".into())],
+                    ],
+                })
+            })
+        }
+    }
+    let mut fixture = Fixture {
+        queries: vec![],
+        fail: false,
+    };
+    for (kind, expected) in [
+        (DatabaseKind::MySql, "reader@localhost"),
+        (DatabaseKind::PostgreSql, "reader"),
+        (DatabaseKind::ClickHouse, "reader"),
+    ] {
+        let reply = run(
+            &mut fixture,
+            kind,
+            "",
+            &Request {
+                database: "ignored".into(),
+                action: Action::Accounts {
+                    offset: 200,
+                    limit: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+        let Reply::CatalogPage { objects, more } = reply else {
+            panic!("wrong reply")
+        };
+        assert!(more);
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].name, expected);
+        assert_eq!(objects[0].kind, "user");
+        let query = fixture.queries.last().unwrap();
+        assert!(query.starts_with("SELECT "));
+        assert!(query.ends_with("LIMIT 2 OFFSET 200"));
+        assert!(!query.contains("password") && !query.contains("auth"));
+    }
+    let count = fixture.queries.len();
+    for (kind, limit) in [
+        (DatabaseKind::Sqlite, 1),
+        (DatabaseKind::MySql, 0),
+        (DatabaseKind::MySql, 201),
+    ] {
+        assert!(
+            run(
+                &mut fixture,
+                kind,
+                "",
+                &Request {
+                    database: String::new(),
+                    action: Action::Accounts { offset: 0, limit }
+                }
+            )
+            .await
+            .is_err()
+        );
+    }
+    assert_eq!(fixture.queries.len(), count);
+    fixture.fail = true;
+    assert!(
+        run(
+            &mut fixture,
+            DatabaseKind::MySql,
+            "",
+            &Request {
+                database: String::new(),
+                action: Action::Accounts {
+                    offset: 0,
+                    limit: 200
+                }
+            }
+        )
+        .await
+        .is_err()
+    );
 }

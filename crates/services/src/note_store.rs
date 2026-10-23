@@ -93,9 +93,12 @@ pub fn save(path: &Path, note: &Note, expected: Option<[u8; 32]>) -> Result<[u8;
     if note.cells.len() > MAX_CELLS {
         return Err("单份笔记最多支持 128 个子区域".into());
     }
-    let text = note
-        .to_json()
-        .map_err(|_| "笔记内容无法保存，请检查子区域标识及格式版本")?;
+    let text = note.to_json().map_err(|error| match error {
+        turbodbn_core::notebook::NoteError::ScriptTextTooLarge => {
+            "可编辑 SQL 脚本超过 1 MiB 上限，请拆分或导入为脚本附件"
+        }
+        _ => "笔记内容无法保存，请检查子区域标识及格式版本",
+    })?;
     if text.len() as u64 > MAX_NOTE_BYTES {
         return Err("笔记文件超过 16 MiB 上限".into());
     }
@@ -175,6 +178,48 @@ pub fn save_index(path: &Path, index: &Index) -> Result<(), String> {
     file.persist(path).map_err(io_error)?;
     Ok(())
 }
+/// Reserve a daily, human-readable filename without overwriting another document.
+pub fn create_dated(
+    directory: &Path,
+    date: &str,
+    mut note: Note,
+) -> Result<(PathBuf, Loaded), String> {
+    if date.len() != 6 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("Invalid note date".into());
+    }
+    fs::create_dir_all(directory).map_err(io_error)?;
+    let prefix = format!("note-{date}-");
+    let mut next = 1u64;
+    for item in fs::read_dir(directory).map_err(io_error)? {
+        let path = item.map_err(io_error)?.path();
+        if path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("note"))
+            && let Some(n) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.strip_prefix(&prefix))
+                .and_then(|s| s.parse::<u64>().ok())
+        {
+            next = next.max(n.saturating_add(1));
+        }
+    }
+    let generated = note.title.trim().is_empty();
+    for _ in 0..64 {
+        let name = format!("{prefix}{next}");
+        let path = directory.join(format!("{name}.note"));
+        if generated {
+            note.title = name;
+        }
+        match save(&path, &note, None) {
+            Ok(hash) => return Ok((path, Loaded { note, hash })),
+            Err(_) if path.exists() => next = next.saturating_add(1),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io_error("filename contention"))
+}
+
 pub fn discover(index: &mut Index, directory: &Path) -> Result<(), String> {
     if !directory.is_absolute() {
         return Err("临时笔记目录必须是绝对路径".into());
@@ -229,6 +274,40 @@ pub fn discover(index: &mut Index, directory: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn daily_names_are_monotonic_preserve_titles_and_never_overwrite() {
+        let root = tempfile::tempdir().unwrap();
+        let (first, loaded) = create_dated(root.path(), "261022", Note::new("")).unwrap();
+        assert_eq!(first.file_name().unwrap(), "note-261022-1.note");
+        assert_eq!(loaded.note.title, "note-261022-1");
+        let before = fs::read(&first).unwrap();
+        let (table, loaded) = create_dated(root.path(), "261022", Note::new("cq_user")).unwrap();
+        assert_eq!(table.file_name().unwrap(), "note-261022-2.note");
+        assert_eq!(loaded.note.title, "cq_user");
+        fs::remove_file(table).unwrap();
+        let (next, _) = create_dated(root.path(), "261023", Note::new("")).unwrap();
+        assert_eq!(next.file_name().unwrap(), "note-261023-1.note");
+        assert_eq!(fs::read(first).unwrap(), before);
+        assert!(create_dated(root.path(), "../bad", Note::new("")).is_err());
+    }
+    #[test]
+    fn simultaneous_daily_note_creation_uses_distinct_files() {
+        let root = tempfile::tempdir().unwrap();
+        let jobs = (0..4)
+            .map(|_| {
+                let path = root.path().to_owned();
+                std::thread::spawn(move || create_dated(&path, "261022", Note::new("")).unwrap().0)
+            })
+            .collect::<Vec<_>>();
+        let paths = jobs
+            .into_iter()
+            .map(|job| job.join().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(paths.len(), 4);
+        for path in paths {
+            assert!(load(&path).is_ok());
+        }
+    }
     #[test]
     fn archived_notes_are_recoverable_and_changed_files_are_preserved() {
         let root = tempfile::tempdir().unwrap();

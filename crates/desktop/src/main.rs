@@ -1,10 +1,24 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+#[cfg(test)]
+#[path = "../../../vendor/gpui-component/src/input/geometry_index.rs"]
+mod input_geometry_contracts;
+#[cfg(test)]
+#[path = "../../../vendor/gpui-component/src/input/highlight_map.rs"]
+mod input_highlight_contracts;
+
+mod ddl_picker;
+mod grid_metrics;
+mod object_browser;
+mod table_compare;
+mod table_designer;
+
 mod about;
 mod app_store;
 mod assets;
 mod auto_connect;
 mod catalog;
+mod catalog_cache;
 mod cell;
 mod chat;
 mod chat_history;
@@ -81,7 +95,7 @@ fn main() {
             px(preferences.general.font_size.clamp(12., 24.));
         cx.set_global(locale::Locale::load(preferences.general.language.clone()));
         let events = cx.new(|_| tabs::TabEvents);
-        cx.set_global(tabs::TabRouter(events));
+        cx.set_global(tabs::TabRouter(events, 1, vec![]));
         let _ =
             turbodbn_services::timeout_policy::configure(preferences.database.timeout_defaults());
         cx.set_global(preferences);
@@ -172,6 +186,8 @@ fn main() {
 unsafe extern "C" {
     fn tree_sitter_mysql_comments() -> *const ();
 }
+pub(crate) const SQL_LIGHT_LANGUAGE: &str = "sql-light";
+
 fn register_sql_highlighting() {
     use gpui_component::highlighter::{LanguageConfig, LanguageRegistry};
     LanguageRegistry::singleton().register(
@@ -187,6 +203,12 @@ fn register_sql_highlighting() {
     );
     let language =
         unsafe { tree_sitter_language::LanguageFn::from_raw(tree_sitter_mysql_comments) };
+    // Reuse the flat comment-wrapper grammar with no injections or style queries.
+    // Component's built-in `text` language still runs a JSON parser on every edit.
+    LanguageRegistry::singleton().register(
+        SQL_LIGHT_LANGUAGE,
+        &LanguageConfig::new(SQL_LIGHT_LANGUAGE, language.into(), vec![], "", "", ""),
+    );
     LanguageRegistry::singleton().register(
         "mysql",
         &LanguageConfig::new(
@@ -202,6 +224,32 @@ fn register_sql_highlighting() {
 
 #[cfg(test)]
 mod sql_highlighting_tests {
+    #[test]
+    fn light_sql_has_no_per_token_style_runs_and_preserves_the_document() {
+        use gpui_component::{
+            Rope,
+            highlighter::{HighlightTheme, SyntaxHighlighter},
+        };
+        super::register_sql_highlighting();
+        let sql = format!(
+            "SELECT id FROM t WHERE id IN ({}); -- comment\nSELECT '#text';",
+            (0..5000)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let rope = Rope::from(sql.as_str());
+        let mut highlighter = SyntaxHighlighter::new(super::SQL_LIGHT_LANGUAGE);
+        highlighter.update(None, &rope);
+        assert!(
+            highlighter
+                .styles(&(0..sql.len()), &HighlightTheme::default_dark())
+                .len()
+                <= 1
+        );
+        assert_eq!(rope.to_string(), sql);
+    }
+
     #[test]
     fn mysql_hash_comments_match_dash_without_recoloring_strings() {
         use gpui_component::{

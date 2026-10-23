@@ -12,7 +12,7 @@ use std::{collections::BTreeSet, ops::ControlFlow, time::Instant};
 
 #[path = "notebook_grid.rs"]
 mod result_grid;
-pub use result_grid::{GridAction, GridSource, grid_request};
+pub use result_grid::{GridAction, GridSource, grid_request, query_table_name};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScriptDiagnostics {
@@ -381,6 +381,13 @@ pub fn validate_script_statement(kind: DatabaseKind, sql: &str) -> Result<bool, 
     let statement = parse_for(kind, sql, true)?;
     inspect(&statement, kind).map(|inspection| !inspection.writes)
 }
+/// Explicit table-view entry may refresh a plain read, never a changed write,
+/// locking read, multi-statement script or unreviewed function call.
+pub fn automatic_table_read(kind: DatabaseKind, sql: &str) -> bool {
+    command_required(kind, sql) == Some("select")
+        && script_requires_confirmation(kind, sql, true) == Ok(false)
+}
+
 pub fn script_requires_confirmation(
     kind: DatabaseKind,
     sql: &str,
@@ -1373,7 +1380,11 @@ async fn execute_inner(
         })
         .await?;
     }
-    let result = c.query_counted(&sql).await;
+    let result = if plan.read_only {
+        c.query_data_counted(&sql).await
+    } else {
+        c.query_counted(&sql).await
+    };
     if plan.read_only && !legacy && (!script || kind != DatabaseKind::MySql) {
         let _ = c
             .query(if kind == DatabaseKind::Sqlite {
@@ -2783,5 +2794,39 @@ mod command_policy_tests {
                 ]
                 .contains(key)
         }));
+    }
+}
+
+#[cfg(test)]
+mod table_entry_tests {
+    use super::*;
+    #[test]
+    fn table_entry_auto_runs_only_unambiguous_reads() {
+        for kind in [
+            DatabaseKind::MySql,
+            DatabaseKind::PostgreSql,
+            DatabaseKind::Sqlite,
+        ] {
+            assert!(automatic_table_read(
+                kind,
+                "SELECT * FROM items WHERE price > 1"
+            ));
+            for sql in [
+                "DELETE FROM items",
+                "UPDATE items SET price=1",
+                "SELECT * FROM items; DELETE FROM items",
+                "SELECT dangerous_function()",
+            ] {
+                assert!(!automatic_table_read(kind, sql));
+            }
+        }
+        assert!(!automatic_table_read(
+            DatabaseKind::MySql,
+            "SELECT * FROM items FOR UPDATE"
+        ));
+        assert!(!automatic_table_read(
+            DatabaseKind::MySql,
+            "SELECT price INTO @p FROM items"
+        ));
     }
 }

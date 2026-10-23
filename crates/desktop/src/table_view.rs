@@ -31,16 +31,31 @@ pub(crate) use grid_ui::column_icon;
 use std::{collections::BTreeMap, rc::Rc};
 use turbodbn_services::database::workbench::{self, Action, Reply, Request, Rows, Schema};
 use workbench::{Change, Filter, FilterJoin, FilterSet, PageOptions};
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
     Grid,
+    Design,
+    StructureCompare,
     Note,
     Er,
     Compare,
     Import,
     Export,
 }
+pub struct TableDraftChanged;
+pub(crate) struct ClearNoteResults;
+impl EventEmitter<ClearNoteResults> for TableView {}
+impl EventEmitter<TableDraftChanged> for TableView {}
+pub struct FilterSqlReady(pub String);
+impl EventEmitter<FilterSqlReady> for TableView {}
 pub struct TableView {
+    _pane_focus: Subscription,
+    compare_subscription: Option<Subscription>,
+    restored: bool,
+    restored_comparison: Option<[OpenTable; 2]>,
+    compare_view: Option<Entity<crate::table_compare::Comparison>>,
+    filter_only: bool,
+    designer: Option<Entity<crate::table_designer::Designer>>,
     mongo_dirty: bool,
     mongo_preview: Option<turbodbn_core::mongo::Mutation>,
     mongo: Option<std::sync::Arc<turbodbn_core::mongo::Projection>>,
@@ -49,6 +64,7 @@ pub struct TableView {
     mongo_inspect: bool,
     mongo_epoch: u64,
     widths: width_ui::Layout,
+    auto_widths: BTreeMap<String, f32>,
     widths_writable: bool,
     width_revision: u64,
     width_sender: Option<async_channel::Sender<width_ui::Layout>>,
@@ -73,9 +89,6 @@ pub struct TableView {
     counting: bool,
     notice: String,
     sql: String,
-    note: Entity<InputState>,
-    comparison: Entity<InputState>,
-    _note: Subscription,
     grid_state: Entity<TableState<grid_ui::GridDelegate>>,
     options: PageOptions,
     filter_draft: Option<filter_ui::Draft>,
@@ -85,6 +98,7 @@ pub struct TableView {
     page_number_input: Entity<InputState>,
     sync_pager_inputs: bool,
     _pager_subscriptions: Vec<Subscription>,
+    er_scroll: ScrollHandle,
     elapsed_ms: u64,
     total: Option<u64>,
     keyset: bool,
@@ -96,9 +110,121 @@ pub struct TableView {
     changes: BTreeMap<usize, Change>,
     insert_count: usize,
     committing: bool,
-    baseline: Option<Rows>,
 }
 impl TableView {
+    pub(crate) fn note_scroll_handles(&self, cx: &App) -> Vec<ScrollHandle> {
+        let grid = self.grid_state.read(cx);
+        let mut handles = vec![
+            grid.vertical_scroll_handle.0.borrow().base_handle.clone(),
+            grid.horizontal_scroll_handle.base_handle().clone(),
+        ];
+        if let Some(document) = &self.document {
+            handles.extend(document.read(cx).note_scroll_handles());
+        }
+        handles
+    }
+    pub(crate) fn restoration(&self, cx: &App) -> (OpenTable, Option<[OpenTable; 2]>) {
+        (
+            self.target.clone(),
+            self.compare_view
+                .as_ref()
+                .map(|view| view.read(cx).snapshot(cx))
+                .or_else(|| self.restored_comparison.clone()),
+        )
+    }
+    pub(crate) fn matches_target(&self, target: &OpenTable) -> bool {
+        self.target.connection == target.connection
+            && self.target.database == target.database
+            && self.target.object.schema == target.object.schema
+            && self.target.object.name == target.object.name
+            && self.target.mode == target.mode
+            && (self.restored || self.target.generation == target.generation)
+    }
+    pub(crate) fn restored(
+        key: String,
+        source: WeakEntity<DatabaseView>,
+        target: OpenTable,
+        comparison: Option<[OpenTable; 2]>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut this = Self::create(key, source, target, false, window, cx);
+        this.restored = true;
+        this.restored_comparison = comparison;
+        this
+    }
+    pub(crate) fn resume_restored(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.restored {
+            return;
+        }
+        let Some(source) = self.source.upgrade() else {
+            return;
+        };
+        let database = source.read(cx);
+        let Some(profile) = database.note_profile(self.target.connection).cloned() else {
+            crate::feedback::error(t(cx, "tabs.restore_missing"), cx);
+            return;
+        };
+        if database.note_connection_state(profile.id) != Some(true) {
+            crate::feedback::error(t(cx, "compare.connect_first"), cx);
+            return;
+        }
+        if profile.kind != self.target.kind
+            || profile.kind == turbodbn_services::DatabaseKind::PostgreSql
+                && profile.database != self.target.database
+        {
+            crate::feedback::error(t(cx, "tabs.restore_changed"), cx);
+            return;
+        }
+        self.target.generation = database.note_generation(profile.id);
+        self.target.writable = profile.supports_mutation();
+        self.target.mysql_raw_gbk = profile.mysql_raw_gbk;
+        self.restored = false;
+        if matches!(self.target.mode, Mode::Compare | Mode::StructureCompare) {
+            let source = self.source.clone();
+            let target = self.target.clone();
+            let restored = self.restored_comparison.take();
+            self.compare_view = Some(cx.new(|cx| {
+                let mut view = crate::table_compare::Comparison::new(source, target, window, cx);
+                if let Some(targets) = restored {
+                    view.restore_sources(targets, window, cx);
+                }
+                view
+            }));
+        } else if self.target.mode != Mode::Design {
+            self.load(cx);
+        }
+        cx.notify();
+    }
+    pub(crate) fn staged(&self) -> bool {
+        !self.changes.is_empty()
+    }
+    pub(crate) fn writing(&self) -> bool {
+        self.committing
+    }
+    pub(crate) fn discard_staged(&mut self, cx: &mut Context<Self>) {
+        if !self.committing {
+            self.changes.clear();
+            self.insert_count = 0;
+            self.selected = None;
+            self.sync_grid(cx);
+        }
+    }
+
+    pub fn filter_builder(
+        source: WeakEntity<DatabaseView>,
+        target: OpenTable,
+        schema: Schema,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::create("query-filter".into(), source, target, false, window, cx);
+        view.filter_only = true;
+        view.rows.columns = schema.columns.iter().map(|c| c.name.clone()).collect();
+        view.schema = Some(schema);
+        view
+    }
+
     pub(crate) fn mongo_unsaved(&self) -> bool {
         self.mongo_dirty || (self.mongo.is_some() && self.committing)
     }
@@ -137,16 +263,14 @@ impl TableView {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.defer_in(window, |this, _, cx| this.init_widths(cx));
-        let note = cx.new(|cx| {
-            InputState::new(window, cx)
-                .multi_line(true)
-                .placeholder(t(cx, "dbwork.note.placeholder"))
-        });
-        let comparison =
-            cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "dbwork.compare.target")));
         if autoload {
             cx.defer_in(window, |this, _, cx| {
-                this.load(cx);
+                if !matches!(
+                    this.target.mode,
+                    Mode::Design | Mode::Compare | Mode::StructureCompare
+                ) {
+                    this.load(cx);
+                }
             });
         }
         let page_size = cx
@@ -191,7 +315,17 @@ impl TableView {
                 this.highlight = true;
                 this.sync_selection(cx);
             });
+        let focus = cx.focus_handle();
+        let pane_focus = cx.on_focus_in(&focus, window, |this, _, cx| {
+            crate::tabs::layout(crate::tabs::LayoutAction::Activate(this.key.clone()), cx)
+        });
         Self {
+            compare_subscription: None,
+            restored: false,
+            restored_comparison: None,
+            compare_view: None,
+            filter_only: false,
+            designer: None,
             mongo_dirty: false,
             mongo_preview: None,
             mongo: None,
@@ -200,6 +334,7 @@ impl TableView {
             mongo_inspect: false,
             mongo_epoch: 0,
             widths: Default::default(),
+            auto_widths: BTreeMap::new(),
             widths_writable: true,
             width_revision: 0,
             width_sender: None,
@@ -224,6 +359,7 @@ impl TableView {
             page_number_input,
             sync_pager_inputs: false,
             _pager_subscriptions: pager_subscriptions,
+            er_scroll: ScrollHandle::new(),
             elapsed_ms: 0,
             total: None,
             keyset: false,
@@ -238,7 +374,8 @@ impl TableView {
             key,
             source,
             target,
-            focus: cx.focus_handle(),
+            focus,
+            _pane_focus: pane_focus,
             rows: Rows::default(),
             schema: None,
             offset: 0,
@@ -247,10 +384,6 @@ impl TableView {
             counting: false,
             notice: String::new(),
             sql: String::new(),
-            _note: cx.observe(&note, |_, _, cx| cx.notify()),
-            note,
-            comparison,
-            baseline: None,
         }
     }
     fn request(&mut self, action: Action, cx: &mut Context<Self>) {
@@ -468,7 +601,6 @@ impl TableView {
                 self.sync_pager_inputs = true;
                 self.options = self.last_options.clone();
                 self.offset = self.options.offset;
-                self.baseline = None;
                 self.committing = false;
                 crate::feedback::error(e.clone(), cx);
                 self.notice = crate::locale::message(cx, &e).to_string();
@@ -479,34 +611,11 @@ impl TableView {
                 more,
                 sql,
             }) => {
-                if let Some(baseline) = self.baseline.take() {
-                    if baseline.columns != rows.columns {
-                        self.notice = t(cx, "dbwork.compare.columns").to_string();
-                    } else {
-                        let mut counts = std::collections::HashMap::<String, i64>::new();
-                        for row in &baseline.values {
-                            *counts
-                                .entry(serde_json::to_string(row).unwrap_or_default())
-                                .or_default() += 1;
-                        }
-                        for row in &rows.values {
-                            *counts
-                                .entry(serde_json::to_string(row).unwrap_or_default())
-                                .or_default() -= 1;
-                        }
-                        let left: i64 = counts.values().filter(|v| **v > 0).sum();
-                        let right: i64 = counts.values().filter(|v| **v < 0).map(|v| -v).sum();
-                        self.notice = format!(
-                            "当前页比较：左侧独有 {left} 行，右侧独有 {right} 行；不是全表比较"
-                        );
-                    }
-                } else {
-                    self.rows = rows;
-                    self.offset = offset;
-                    self.more = more;
-                    self.sql = sql;
-                    self.notice = t(cx, "dbwork.page.notice").to_string();
-                }
+                self.rows = rows;
+                self.offset = offset;
+                self.more = more;
+                self.sql = sql;
+                self.notice = t(cx, "dbwork.page.notice").to_string();
             }
             Ok(Reply::Schema(schema)) => {
                 self.schema = Some(schema);
@@ -544,26 +653,6 @@ impl TableView {
             _ => self.notice = t(cx, "dbwork.unexpected").to_string(),
         }
         cx.notify();
-    }
-    fn compare(&mut self, cx: &mut Context<Self>) {
-        let name = self.comparison.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-        let mut object = self.target.object.clone();
-        object.name = name;
-        self.baseline = Some(self.rows.clone());
-        self.request(
-            Action::Page {
-                object,
-                offset: self.offset,
-                page_size: self.options.page_size,
-            },
-            cx,
-        );
-        if !self.busy {
-            self.baseline = None;
-        }
     }
     fn export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mongo_rows = self.mongo.as_ref().map(|data| Rows {
@@ -826,6 +915,20 @@ impl TableView {
         }
     }
     fn sync_grid(&mut self, cx: &mut Context<Self>) {
+        if !self.rows.columns.is_empty()
+            && self.target.kind != turbodbn_services::DatabaseKind::Redis
+        {
+            let widths = crate::grid_metrics::data_widths(
+                &self.rows,
+                cx.global::<crate::preferences::Preferences>()
+                    .general
+                    .font_size,
+            );
+            for (name, width) in self.rows.columns.iter().zip(widths) {
+                self.auto_widths.entry(name.clone()).or_insert(width);
+            }
+        }
+
         if let Some(document) = &self.document {
             let rows = self.display_rows();
             document.update(cx, |document, cx| document.set_rows(rows, cx));
@@ -973,6 +1076,9 @@ impl TableView {
             .and_then(|s| s.columns.iter().find(|c| c.name == name))
             .cloned()
             .unwrap_or(workbench::Column {
+                not_null: None,
+                auto_increment: None,
+                extra: String::new(),
                 name: name.clone(),
                 data_type: String::new(),
                 comment: String::new(),
@@ -1289,6 +1395,11 @@ impl TableView {
         );
     }
     fn copy(&self, row: usize, col: usize, format: &str, cx: &mut App) {
+        if matches!(format, "sql" | "insert" | "update") && self.target.mysql_raw_gbk {
+            crate::feedback::error(t(cx, "mysql.gbk.copy_sql_disabled"), cx);
+            return;
+        }
+
         if let Some(data) = &self.mongo {
             if let Some(doc) = data.documents.get(row) {
                 let value = if format == "cell" {
@@ -1405,7 +1516,25 @@ impl TableView {
         self.options.after = None;
         self.anchors.clear();
         self.total = None;
-        self.load(cx);
+        if self.filter_only {
+            if let Some(schema) = &self.schema {
+                match workbench::filter_select(
+                    self.target.kind,
+                    &self.target.database,
+                    &self.target.object,
+                    schema,
+                    self.options.filter.as_ref(),
+                ) {
+                    Ok(sql) => {
+                        self.last_options = self.options.clone();
+                        cx.emit(FilterSqlReady(sql));
+                    }
+                    Err(e) => crate::feedback::error(e, cx),
+                }
+            }
+        } else {
+            self.load(cx);
+        }
     }
     fn show_details(&self, row: Option<usize>, refresh: bool, cx: &mut App) {
         if let (Some(row), Some(data)) = (row, self.mongo.as_ref()) {
@@ -1496,58 +1625,103 @@ impl TableView {
         };
         div()
             .id("er-diagram")
-            .size_full()
-            .overflow_scroll()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
             .v_flex()
             .gap_4()
             .p_4()
             .child(
                 div()
-                    .w(px(340.))
+                    .w_full()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
                     .border_1()
                     .border_color(cx.theme().border)
                     .rounded_lg()
                     .p_3()
                     .v_flex()
                     .gap_2()
-                    .child(div().text_lg().child(self.target.object.name.clone()))
-                    .children(schema.columns.iter().map(|c| {
+                    .child(
                         div()
-                            .h_flex()
-                            .gap_2()
-                            .child(if c.primary {
-                                gpui_component::Icon::default()
-                                    .path("icons/key.svg")
-                                    .into_any_element()
-                            } else {
-                                div().child("·").into_any_element()
-                            })
-                            .child(c.name.clone())
+                            .flex_shrink_0()
+                            .text_lg()
+                            .child(self.target.object.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .flex_1()
+                            .min_h_0()
                             .child(
                                 div()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(c.data_type.clone()),
+                                    .id("er-fields")
+                                    .track_scroll(&self.er_scroll)
+                                    .size_full()
+                                    .pr_4()
+                                    .overflow_y_scroll()
+                                    .v_flex()
+                                    .children(schema.columns.iter().map(|c| {
+                                        div()
+                                            .h_flex()
+                                            .gap_2()
+                                            .child(if c.primary {
+                                                gpui_component::Icon::default()
+                                                    .path("icons/key.svg")
+                                                    .into_any_element()
+                                            } else {
+                                                div().child("·").into_any_element()
+                                            })
+                                            .child(c.name.clone())
+                                            .child(
+                                                div()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(c.data_type.clone()),
+                                            )
+                                            .when(!c.comment.is_empty(), |el| {
+                                                el.child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .whitespace_normal()
+                                                        .text_color(cx.theme().muted_foreground)
+                                                        .child(c.comment.clone()),
+                                                )
+                                            })
+                                    }))
+                                    .children(schema.foreign_keys.values.iter().map(|r| {
+                                        div().py_2().whitespace_normal().child(format!(
+                                            "→ {}",
+                                            r.iter()
+                                                .filter_map(|v| v.as_deref())
+                                                .collect::<Vec<_>>()
+                                                .join(" · ")
+                                        ))
+                                    }))
+                                    .when(schema.foreign_keys.values.is_empty(), |el| {
+                                        el.child(t(cx, "dbwork.er.empty"))
+                                    }),
                             )
-                    })),
+                            .child(
+                                div()
+                                    .absolute()
+                                    .right_0()
+                                    .top_0()
+                                    .bottom_0()
+                                    .w(px(16.))
+                                    .child(
+                                        gpui_component::scroll::Scrollbar::vertical(
+                                            &self.er_scroll,
+                                        )
+                                        .scrollbar_show(
+                                            gpui_component::scroll::ScrollbarShow::Always,
+                                        ),
+                                    ),
+                            ),
+                    ),
             )
-            .children(schema.foreign_keys.values.iter().map(|r| {
-                div().h_flex().gap_3().child("└──→").child(
-                    div()
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .rounded_lg()
-                        .p_3()
-                        .child(
-                            r.iter()
-                                .filter_map(|v| v.as_deref())
-                                .collect::<Vec<_>>()
-                                .join(" · "),
-                        ),
-                )
-            }))
-            .when(schema.foreign_keys.values.is_empty(), |el| {
-                el.child(t(cx, "dbwork.er.empty"))
-            })
             .into_any_element()
     }
 }
@@ -1558,6 +1732,14 @@ impl Focusable for TableView {
     }
 }
 impl Panel for TableView {
+    fn toolbar_buttons(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<gpui_component::button::Button>> {
+        Some(crate::tabs::new_note_button(self.key.clone(), cx))
+    }
+
     fn panel_name(&self) -> &'static str {
         "table-workspace"
     }
@@ -1572,6 +1754,8 @@ impl Panel for TableView {
                     cx,
                     match self.target.mode {
                         Mode::Grid => "dbwork.data",
+                        Mode::Design => "designer.title",
+                        Mode::StructureCompare => "compare.structure",
                         Mode::Note => "dbwork.note",
                         Mode::Er => "dbwork.er",
                         Mode::Compare => "dbwork.compare",
@@ -1590,8 +1774,83 @@ impl Panel for TableView {
         None
     }
 }
-impl Render for TableView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl TableView {
+    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.restored {
+            let profile = self
+                .source
+                .upgrade()
+                .and_then(|s| s.read(cx).note_profile(self.target.connection).cloned());
+            return div()
+                .v_flex()
+                .size_full()
+                .p_3()
+                .gap_3()
+                .when_some(profile, |body, profile| {
+                    body.child(crate::connection_choice::identity(&profile))
+                })
+                .child(format!(
+                    "{} / {}",
+                    self.target.database, self.target.object.name
+                ))
+                .child(t(cx, "tabs.restore_hint"))
+                .child(
+                    Button::new("resume-restored-table")
+                        .icon(crate::assets::refresh_icon())
+                        .label(t(cx, "tabs.restore_load"))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.resume_restored(window, cx)),
+                        ),
+                )
+                .into_any_element();
+        }
+        if matches!(self.target.mode, Mode::Compare | Mode::StructureCompare) {
+            let compare = self
+                .compare_view
+                .get_or_insert_with(|| {
+                    cx.new(|cx| {
+                        crate::table_compare::Comparison::new(
+                            self.source.clone(),
+                            self.target.clone(),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .clone();
+            if self.compare_subscription.is_none() {
+                self.compare_subscription =
+                    Some(cx.subscribe(&compare, |_, _, _: &TableDraftChanged, cx| {
+                        cx.emit(TableDraftChanged)
+                    }));
+            }
+            return div().size_full().child(compare).into_any_element();
+        }
+        if self.filter_only {
+            return div()
+                .p_3()
+                .v_flex()
+                .gap_2()
+                .child(t(cx, "query_note.filter_hint"))
+                .child(self.filter_bar(cx))
+                .into_any_element();
+        }
+        if self.target.mode == Mode::Design {
+            let designer = self
+                .designer
+                .get_or_insert_with(|| {
+                    cx.new(|cx| {
+                        crate::table_designer::Designer::new(
+                            self.source.clone(),
+                            self.target.clone(),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .clone();
+            return div().size_full().child(designer).into_any_element();
+        }
         if let Some(change) = self.mongo_preview.take() {
             cx.defer_in(window, move |this, window, cx| {
                 this.preview_mongo(change, window, cx)
@@ -1674,7 +1933,6 @@ impl TableView {
                 .min_h_0()
                 .gap_2()
                 .p_2()
-                .track_focus(&self.focus)
                 .on_key_down(cx.listener(Self::grid_key))
                 .child(
                     div()
@@ -1756,28 +2014,11 @@ impl TableView {
             .min_h_0()
             .p_2()
             .gap_2()
-            .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::grid_key));
         if self.query_controls() {
             body = body.child(self.filter_bar(cx));
         }
-        if let Some(note) = &self.notebook {
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(
-                        cx,
-                        if note.stale {
-                            "notes.results_stale"
-                        } else if self.target.writable {
-                            "notes.result_editable"
-                        } else {
-                            "notes.result_readonly"
-                        },
-                    )),
-            );
-        }
+        body = body.children(self.render_note_status(cx));
         body.child(div().flex_1().min_h_0().child(self.result_content(cx)))
             .child(self.data_toolbar(cx))
             .into_any_element()
@@ -1790,7 +2031,6 @@ impl TableView {
             .min_h_0()
             .p_3()
             .gap_2()
-            .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::grid_key))
             .when(mode != Mode::Grid, |body| {
                 body.child(
@@ -1833,57 +2073,7 @@ impl TableView {
         if !matches!(mode, Mode::Er | Mode::Import) && self.query_controls() {
             body = body.child(self.filter_bar(cx));
         }
-        if let Some(note) = &self.notebook {
-            body = body.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(
-                        cx,
-                        if note.stale {
-                            "notes.results_stale"
-                        } else if self.target.writable {
-                            "notes.result_editable"
-                        } else {
-                            "notes.result_readonly"
-                        },
-                    )),
-            );
-        }
-        if mode == Mode::Note {
-            body = body
-                .child(div().text_sm().child(self.sql.clone()))
-                .child(crate::feedback::editable_multiline(&self.note, false, cx).h(px(140.)))
-                .child(
-                    Button::new("save-table-note")
-                        .ghost()
-                        .icon(gpui_component::Icon::default().path("icons/export.svg"))
-                        .label(t(cx, "dbwork.note.save"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let text = format!(
-                                "# {}\n\n```sql\n{}\n```\n\n{}",
-                                this.target.object.name,
-                                this.sql,
-                                this.note.read(cx).value()
-                            );
-                            save_text(text, "table-note.md", window, cx);
-                        })),
-                );
-        }
-        if mode == Mode::Compare {
-            body = body.child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .child(Input::new(&self.comparison).cleanable(true).flex_1())
-                    .child(
-                        Button::new("compare-page")
-                            .label(t(cx, "dbwork.compare.page"))
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, _, cx| this.compare(cx))),
-                    ),
-            );
-        }
+        body = body.children(self.render_note_status(cx));
         if mode == Mode::Er {
             body = body.child(self.er(cx));
         } else if mode == Mode::Import {
@@ -1911,6 +2101,25 @@ impl TableView {
             )
         })
         .into_any_element()
+    }
+}
+
+impl Render for TableView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let body = self.render_body(window, cx);
+        div()
+            .id(SharedString::from(format!("workbench-pane-{}", self.key)))
+            .size_full()
+            .min_w_0()
+            .min_h_0()
+            .track_focus(&self.focus)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    crate::tabs::layout(crate::tabs::LayoutAction::Activate(this.key.clone()), cx)
+                }),
+            )
+            .child(body)
     }
 }
 
@@ -1994,6 +2203,17 @@ impl TableView {
                     .child(self.toolbar_pager(cx))
                     .child(self.toolbar_highlight(cx)),
             )
+            .when(self.notebook.is_some(), |el| {
+                el.child(
+                    Button::new("clear-note-results")
+                        .small()
+                        .ghost()
+                        .icon(IconName::Close)
+                        .tooltip(t(cx, "notes.clear_results_help"))
+                        .disabled(self.busy)
+                        .on_click(cx.listener(|_, _, _, cx| cx.emit(ClearNoteResults))),
+                )
+            })
             .child(self.toolbar_statistics(cx))
             .into_any_element()
     }

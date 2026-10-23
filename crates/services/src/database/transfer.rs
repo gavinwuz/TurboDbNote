@@ -106,6 +106,9 @@ fn quote(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 fn supported(p: &Profile) -> Result<(), String> {
+    if p.mysql_raw_gbk {
+        return Err("mysql.gbk.transfer_disabled".into());
+    }
     if p.driver_id == "doris" {
         return Err("drivers.operation_unsupported".into());
     }
@@ -143,6 +146,9 @@ pub fn preflight(
     c: &Control,
 ) -> Result<String, String> {
     c.check()?;
+    if source.profile.mysql_raw_gbk || target.is_some_and(|t| t.profile.mysql_raw_gbk) {
+        return Err("mysql.gbk.transfer_disabled".into());
+    }
     let legacy = crate::mysql::uses_legacy(&source.profile);
     let charset = if mode == Mode::ImportFile {
         String::new()

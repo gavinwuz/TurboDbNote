@@ -32,6 +32,8 @@ rusqlite = { version = "0.32", features = ["bundled", "backup", "hooks"] }
 redis = { version = "=0.32.7", default-features = false, features = ["tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "=1.48.0", features = ["rt", "process", "io-util", "time", "sync", "macros"] }
+tar = { version = "0.4", default-features = false }
+flate2 = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_System_JobObjects", "Win32_System_Threading"] }

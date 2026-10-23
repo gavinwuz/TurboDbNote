@@ -1,13 +1,20 @@
+#[path = "database_browser.rs"]
+mod browser_ui;
 #[path = "database_ddl.rs"]
 mod ddl_ui;
 #[path = "database_import.rs"]
 mod import_ui;
+#[path = "database_metadata.rs"]
+mod metadata_ui;
 #[path = "database_navigation.rs"]
 mod navigation;
 #[path = "database_objects.rs"]
 mod objects_ui;
 #[path = "database_transfer.rs"]
 mod transfer_ui;
+#[path = "database_tree.rs"]
+mod tree_ui;
+pub(crate) use tree_ui::account_admin_ui::{OpenPrivileges, PermissionBookmark, Privileges};
 #[path = "database_url.rs"]
 mod url_ui;
 pub(crate) use transfer_ui::Connection as SavedConnection;
@@ -60,14 +67,31 @@ impl SelectItem for DatabaseChoice {
 
 pub struct OpenDatabase;
 pub struct OpenObjects;
-pub(crate) struct NoteColumnsReady(pub Uuid);
+pub(crate) struct NoteColumnsReady(pub Uuid, pub Option<EntityId>);
+pub(crate) struct NoteCatalogReady(pub Uuid, pub String, pub u64, pub bool);
+struct WorkbenchJob {
+    id: Uuid,
+    generation: u64,
+    database: String,
+    action: Action,
+    sender: async_channel::Sender<Result<Reply, String>>,
+}
+impl EventEmitter<crate::settings::SettingsRequest> for DatabaseView {}
 pub struct DatabaseView {
+    tree: tree_ui::Tree,
+    tree_filter: Entity<InputState>,
+    _tree_filter: Subscription,
+    profiles_ready: bool,
+    mcp_queue: std::collections::VecDeque<WorkbenchJob>,
+    browser: crate::object_browser::Browser,
     ddl: ddl_ui::DdlState,
     mcp_target: Option<async_channel::Sender<Result<Reply, String>>>,
     pub(crate) output: Option<Entity<crate::chat::AiLog>>,
     operation_started: HashMap<Uuid, std::time::Instant>,
     focus: FocusHandle,
     sidebar_split: Entity<gpui_component::resizable::ResizableState>,
+    connections_scroll: ScrollHandle,
+    active_sidebar_layout: crate::preferences::SidebarLayout,
     object_database_picker: Option<Entity<SelectState<SearchableVec<String>>>>,
     object_database_context: Option<(Uuid, String, Vec<String>)>,
     object_database_subscription: Option<Subscription>,
@@ -125,6 +149,7 @@ pub struct DatabaseView {
     history: HashMap<Uuid, connection_store::History>,
     tasks: HashMap<Uuid, Task<()>>,
     sessions: HashMap<Uuid, Session>,
+    connected_profiles: HashMap<Uuid, Profile>,
     states: HashMap<Uuid, String>,
     info: HashMap<Uuid, ServerInfo>,
     catalog_source: HashMap<Uuid, Profile>,
@@ -162,6 +187,9 @@ const FIELDS: [(&str, &str); 21] = [
 impl DatabaseView {
     /// Connect saved Note scopes without touching the connection editor or sidebar selection.
     /// An explicit field-read may retry; automatic scope activation only attempts each profile once.
+    pub(crate) fn profiles_status(&self) -> Option<bool> {
+        self.profiles_ready.then_some(!self.storage_error)
+    }
     pub(crate) fn mcp_request(
         &mut self,
         id: Uuid,
@@ -171,21 +199,86 @@ impl DatabaseView {
         cx: &mut Context<Self>,
     ) -> async_channel::Receiver<Result<Reply, String>> {
         let (sender, receiver) = async_channel::bounded(1);
-        if self.note_generation(id) != generation
-            || self.note_connection_state(id) != Some(true)
-            || self.active_operation.is_some()
-        {
-            let _ = sender.try_send(Err("mcp.stale".into()));
-        } else if self.request_operation(
-            id,
-            OperationKind::Workbench(Box::new(workbench::Request { database, action })),
-            cx,
-        ) {
-            self.mcp_target = Some(sender);
-        } else {
-            let _ = sender.try_send(Err("mcp.failed".into()));
+        // PostgreSQL sessions stay bound to the saved database; a UI scope must never retarget writes.
+        if self.note_profile(id).is_some_and(|profile| {
+            profile.kind == DatabaseKind::PostgreSql && profile.database != database
+        }) {
+            let _ = sender.try_send(Err("compare.postgres_database".into()));
+            return receiver;
         }
+
+        if self.note_generation(id) != generation || self.note_connection_state(id) != Some(true) {
+            let _ = sender.try_send(Err("mcp.stale".into()));
+            return receiver;
+        }
+        if self.mcp_queue.len() >= 16 {
+            let _ = sender.try_send(Err("dbwork.queue.full".into()));
+            return receiver;
+        }
+        self.retire_browser(cx);
+        self.mcp_queue.push_back(WorkbenchJob {
+            id,
+            generation,
+            database,
+            action,
+            sender,
+        });
+        self.pump_mcp(cx);
         receiver
+    }
+    pub(super) fn retire_browser(&mut self, cx: &mut Context<Self>) {
+        if self.mcp_target.is_some() || self.workbench_target.is_some() {
+            return;
+        }
+        if let Some((id, _, kind)) = self.active_operation.clone()
+            && browser_ui::is_request(&kind)
+        {
+            self.operation_log(
+                id,
+                crate::operation_log::Kind::Metadata,
+                crate::operation_log::Phase::Cancelled,
+                None,
+                cx,
+            );
+            if let Some(action) = self.browser.pending.take() {
+                self.browser.queue.push_front(action);
+            }
+            self.active_operation = None;
+        }
+    }
+    pub(super) fn defer_mcp(&self, cx: &mut Context<Self>) {
+        let view = cx.entity().downgrade();
+        cx.defer(move |cx| {
+            let _ = view.update(cx, |this, cx| this.pump_mcp(cx));
+        });
+    }
+    pub(super) fn pump_mcp(&mut self, cx: &mut Context<Self>) {
+        if self.active_operation.is_some() {
+            return;
+        }
+        while let Some(job) = self.mcp_queue.pop_front() {
+            if job.sender.is_closed() {
+                continue;
+            }
+            if self.note_generation(job.id) != job.generation
+                || self.note_connection_state(job.id) != Some(true)
+            {
+                let _ = job.sender.try_send(Err("mcp.stale".into()));
+                continue;
+            }
+            if self.request_operation(
+                job.id,
+                OperationKind::Workbench(Box::new(workbench::Request {
+                    database: job.database,
+                    action: job.action,
+                })),
+                cx,
+            ) {
+                self.mcp_target = Some(job.sender);
+                break;
+            }
+            let _ = job.sender.try_send(Err("mcp.failed".into()));
+        }
     }
     pub(crate) fn ensure_note_connection(&mut self, id: Uuid, retry: bool, cx: &mut Context<Self>) {
         if self.sessions.contains_key(&id)
@@ -270,8 +363,13 @@ impl DatabaseView {
             .as_ref()
             .is_some_and(|(selected, db)| *selected == id && db == database)
             && let Some(schema) = self.schemas.get(&Self::object_key(object))
+            && (self.browser.columns.contains(&Self::object_key(object))
+                || !schema.columns.is_empty())
         {
             return Some(schema.columns.clone());
+        }
+        if let Some(columns) = self.tree_cached_note_columns(id, database, object) {
+            return Some(columns);
         }
         self.note_columns
             .get(&(
@@ -282,25 +380,6 @@ impl DatabaseView {
             ))
             .cloned()
     }
-    pub(crate) fn request_note_columns(
-        &mut self,
-        id: Uuid,
-        database: String,
-        object: Object,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.active_operation.is_some() {
-            return false;
-        }
-        self.request_operation(
-            id,
-            OperationKind::Workbench(Box::new(workbench::Request {
-                database,
-                action: Action::NoteColumns(object),
-            })),
-            cx,
-        )
-    }
     pub(crate) fn remember_note_columns(
         &mut self,
         id: Uuid,
@@ -308,8 +387,10 @@ impl DatabaseView {
         object: &Object,
         columns: &[workbench::Column],
     ) {
-        if self.note_columns.len() >= 32 {
-            self.note_columns.clear();
+        if self.note_columns.len() >= 32
+            && let Some(key) = self.note_columns.keys().next().cloned()
+        {
+            self.note_columns.remove(&key);
         }
         self.note_columns.insert(
             (
@@ -321,32 +402,75 @@ impl DatabaseView {
             columns.iter().take(1024).cloned().collect(),
         );
     }
-    pub(crate) fn note_tables(
+    pub(crate) fn note_completion_cache(
         &self,
         id: Uuid,
         database: &str,
-    ) -> Vec<turbodbn_services::database::sql_assist::TableName> {
-        if !self.sessions.contains_key(&id)
-            || self.states.get(&id).is_none_or(|s| s != "已连接")
+    ) -> Option<crate::catalog_cache::Cache> {
+        // Note assistance may read a target-matched local snapshot while offline.
+        // Sidebar object filtering still excludes disconnected connections.
+        if !self.note_database_visible(id, database) {
+            return None;
+        }
+        Some(crate::catalog_cache::Cache::new(
+            &self.file,
+            self.note_profile(id)?,
+            database,
+            "relations",
+        ))
+    }
+    pub(crate) fn note_completion_revision(&self) -> (u64, u64) {
+        (self.tree.catalog_revision, self.browser.revision)
+    }
+    pub(crate) fn note_table_prefix(&self, id: Uuid, database: &str, prefix: &str) -> Vec<Object> {
+        if self.note_connection_state(id) != Some(true)
+            || !self.note_database_visible(id, database)
             || self
                 .selected_database
                 .as_ref()
-                .is_none_or(|(selected, db)| *selected != id || db != database)
-            || !self.object_catalog_loaded
+                .is_none_or(|(source, db)| *source != id || db != database)
         {
             return vec![];
         }
-        self.catalog_objects
+        let eligible = |object: &&Object| {
+            matches!(object.kind.as_str(), "table" | "view")
+                && object.name.to_lowercase().starts_with(prefix)
+        };
+        let exact = self
+            .catalog_objects
             .iter()
-            .filter(|o| matches!(o.kind.as_str(), "table" | "view"))
-            .take(2000)
-            .map(|o| turbodbn_services::database::sql_assist::TableName {
-                schema: o.schema.clone(),
-                name: o.name.clone(),
+            .filter(eligible)
+            .filter(|object| object.name.to_lowercase() == prefix);
+        let other = self
+            .catalog_objects
+            .iter()
+            .filter(eligible)
+            .filter(|object| object.name.to_lowercase() != prefix);
+        exact
+            .chain(other)
+            .take(8)
+            .map(|object| Object {
+                schema: object.schema.clone(),
+                name: object.name.clone(),
+                comment: object.comment.chars().take(2048).collect(),
+                kind: object.kind.clone(),
+                parent: String::new(),
             })
             .collect()
     }
+    pub(crate) fn note_database_visible(&self, id: Uuid, name: &str) -> bool {
+        self.navigation
+            .database_rules
+            .get(&id)
+            .is_none_or(|rule| rule.matches(name))
+    }
     pub(crate) fn note_databases(&self, id: Uuid) -> Vec<String> {
+        self.directory_databases(id)
+            .into_iter()
+            .filter(|name| self.note_database_visible(id, name))
+            .collect()
+    }
+    fn directory_databases(&self, id: Uuid) -> Vec<String> {
         self.profiles
             .iter()
             .find(|p| p.id == id)
@@ -525,9 +649,20 @@ impl DatabaseView {
         let object_filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::locale::t(cx, "dbwork.objects.filter"))
         });
+        let tree_filter = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::locale::t(cx, "database.tree.filter"))
+        });
         let mut this = Self {
+            _tree_filter: cx.observe(&tree_filter, |_, _, cx| cx.notify()),
+            tree_filter,
+            browser: Default::default(),
+            tree: tree_ui::Tree::default(),
+            connections_scroll: ScrollHandle::new(),
+            active_sidebar_layout: crate::preferences::SidebarLayout::Split,
             sidebar_split: cx.new(|_| gpui_component::resizable::ResizableState::default()),
-            _object_filter: cx.observe(&object_filter, |_, _, cx| cx.notify()),
+            _object_filter: cx.observe(&object_filter, |this, _, cx| {
+                this.browser_filter_changed(cx)
+            }),
             object_filter,
             output: None,
             operation_started: HashMap::new(),
@@ -541,6 +676,7 @@ impl DatabaseView {
             expanded_objects: std::collections::HashSet::new(),
             workbench_target: None,
             ddl: Default::default(),
+            mcp_queue: Default::default(),
             mcp_target: None,
             pending_object_action: None,
             focus: cx.focus_handle(),
@@ -596,6 +732,7 @@ impl DatabaseView {
             history: HashMap::new(),
             tasks: HashMap::new(),
             sessions: HashMap::new(),
+            connected_profiles: HashMap::new(),
             states: HashMap::new(),
             info: HashMap::new(),
             catalog_source: HashMap::new(),
@@ -603,6 +740,7 @@ impl DatabaseView {
             save_task: None,
             file,
             temporary_passwords: HashMap::new(),
+            profiles_ready: false,
             storage_error: false,
             _search: cx.observe(&search, |_, _, cx| cx.notify()),
             _inputs: inputs,
@@ -618,6 +756,7 @@ impl DatabaseView {
             let result = loading.await;
             let _ = view.update(cx, |this, cx| {
                 this.saving = false;
+                this.profiles_ready = true;
                 match result {
                     Ok((snapshot, cleanup_warning)) => {
                         if let Some(warning) = cleanup_warning {
@@ -931,6 +1070,7 @@ impl DatabaseView {
             .retain(|(connection, _, _, _), _| *connection != id);
         self.tasks.remove(&id);
         self.sessions.remove(&id);
+        self.connected_profiles.remove(&id);
         if self
             .active_operation
             .as_ref()
@@ -1199,6 +1339,7 @@ impl DatabaseView {
                     }
                 };
                 let cached = connection_secret::Cached::new(&snapshot, password.clone());
+                let connected_profile = profile.clone();
                 let (session, events) = Session::start(profile, password, test);
                 let accepted = view
                     .update(cx, |this, _| {
@@ -1221,6 +1362,8 @@ impl DatabaseView {
                             let previous_status = this.status.clone();
                             match event {
                                 Event::Connected(info) => {
+                                    this.connected_profiles
+                                        .insert(id, connected_profile.clone());
                                     this.operation_log(
                                         id,
                                         crate::operation_log::Kind::Connection,
@@ -1251,6 +1394,7 @@ impl DatabaseView {
                                     feedback::success(this.status.clone(), cx);
                                     this.states.insert(id, "已连接".into());
                                     this.info.insert(id, info);
+                                    this.tree_sync_databases(id, cx);
                                     if this
                                         .selected_database
                                         .as_ref()
@@ -1342,6 +1486,14 @@ impl DatabaseView {
                                     }
                                 }
                                 Event::Failed(error) => {
+                                    this.connected_profiles.remove(&id);
+                                    if this
+                                        .selected_database
+                                        .as_ref()
+                                        .is_some_and(|(current, _)| *current == id)
+                                    {
+                                        this.metadata_failed("browser.connection_failed", cx);
+                                    }
                                     let error = crate::locale::message(cx, &error).to_string();
                                     this.operation_log(
                                         id,
@@ -1382,6 +1534,14 @@ impl DatabaseView {
                                     result,
                                 } => this.operation_result(id, request, result, cx),
                                 Event::Disconnected => {
+                                    this.connected_profiles.remove(&id);
+                                    if this
+                                        .selected_database
+                                        .as_ref()
+                                        .is_some_and(|(current, _)| *current == id)
+                                    {
+                                        this.metadata_failed("browser.connection_failed", cx);
+                                    }
                                     if this
                                         .active_operation
                                         .as_ref()
@@ -1567,6 +1727,7 @@ impl DatabaseView {
                             this.navigation.recent.retain(|i| *i != id);
                             this.navigation.created.remove(&id);
                             this.navigation.databases.remove(&id);
+                            this.navigation.database_rules.remove(&id);
                             this.persist_navigation();
                             if this
                                 .selected_database
@@ -1574,8 +1735,7 @@ impl DatabaseView {
                                 .is_some_and(|(current, _)| *current == id)
                             {
                                 this.selected_database = None;
-                                this.catalog_objects.clear();
-                                this.schemas.clear();
+                                this.clear_object_view();
                             }
                             this.status =
                                 crate::locale::t(cx, "feedback.connection.deleted").to_string();
@@ -1762,6 +1922,30 @@ impl DatabaseView {
                         });
                     }),
             );
+        }
+        if self.active_sidebar_layout == crate::preferences::SidebarLayout::Tree && saved {
+            let configure = cx.entity().downgrade();
+            let toggle = configure.clone();
+            let rule = self.navigation.database_rules.get(&id);
+            let enabled = rule.is_some_and(|rule| rule.enabled);
+            menu = menu
+                .separator()
+                .item(
+                    PopupMenuItem::new(crate::locale::t(cx, "database.rule.title"))
+                        .icon(IconName::Settings2)
+                        .on_click(move |_, window, cx| {
+                            let _ = configure
+                                .update(cx, |this, cx| this.database_rule_dialog(id, window, cx));
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new(crate::locale::t(cx, "database.rule.enabled"))
+                        .checked(enabled)
+                        .disabled(rule.is_none_or(|r| r.include.is_empty() && r.exclude.is_empty()))
+                        .on_click(move |_, _, cx| {
+                            let _ = toggle.update(cx, |this, cx| this.toggle_database_rule(id, cx));
+                        }),
+                );
         }
         menu
     }
@@ -2258,6 +2442,14 @@ impl Focusable for DatabaseView {
     }
 }
 impl Panel for DatabaseView {
+    fn toolbar_buttons(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<gpui_component::button::Button>> {
+        Some(crate::tabs::new_note_button("database-manager", cx))
+    }
+
     fn panel_name(&self) -> &'static str {
         "database-manager"
     }
@@ -2477,6 +2669,17 @@ impl Render for DatabaseView {
                     this.fields["execution_timeout"].update(cx,|field,cx|field.set_value(effective.execution_timeout_seconds.to_string(),window,cx));cx.notify();
                 })))
             .child(div().text_sm().text_color(cx.theme().muted_foreground).child(crate::locale::t(cx,if self.editing.inherit_timeouts {"database.timeout.from_global"}else{"database.timeout.custom"})))
+            .when(self.editing.kind==DatabaseKind::MySql,|el|el
+                .child(Switch::new("mysql-raw-gbk").label(crate::locale::t(cx,"mysql.gbk.option")).checked(self.editing.mysql_raw_gbk).disabled(self.saving)
+                    .on_click(cx.listener(|this,value,window,cx| {
+                        this.editing.mysql_raw_gbk = *value;
+                        if *value {
+                            this.editing.charset="gbk".into();
+                            this.fields["charset"].update(cx,|input,cx|input.set_value("gbk",window,cx));
+                        }
+                        cx.notify();
+                    })))
+                .when(self.editing.mysql_raw_gbk,|el|el.child(div().text_sm().whitespace_normal().child(crate::locale::t(cx,"mysql.gbk.hint")))))
             .child(self.field("timeout", crate::locale::t(cx,"database.timeout.connect")))
             .child(self.field("execution_timeout", crate::locale::t(cx,"database.timeout.execute")))
             .child(div().text_sm().whitespace_normal().child(crate::locale::t(cx,"database.timeout.hint")))
@@ -2703,3 +2906,5 @@ mod new_connection_defaults_tests {
         assert_eq!(existing.group, "Existing project");
     }
 }
+
+impl EventEmitter<NoteCatalogReady> for DatabaseView {}

@@ -109,7 +109,7 @@ try {
     $sourceFiles = & git ls-files --cached --others --exclude-standard
     if ($LASTEXITCODE -ne 0) { throw 'Unable to enumerate release source' }
     foreach ($sourceFile in ($sourceFiles | Sort-Object -Unique)) {
-        if ($sourceFile -notmatch '^(crates/|drivers/|scripts/|installer/|Cargo\.(toml|lock)$|LICENSE$|README|CHANGELOG)' -or -not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) { continue }
+        if ($sourceFile -notmatch '^(crates/|drivers/|scripts/|installer/|vendor/gpui-component/|Cargo\.(toml|lock)$|LICENSE$|README|CHANGELOG)' -or -not (Test-Path -LiteralPath $sourceFile -PathType Leaf)) { continue }
         $destination = Join-Path $sourceStage $sourceFile
         New-Item -ItemType Directory -Path (Split-Path $destination -Parent) -Force | Out-Null
         Copy-Item -LiteralPath $sourceFile -Destination $destination

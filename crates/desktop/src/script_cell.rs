@@ -107,11 +107,22 @@ pub struct ScriptView {
     expected_guards: std::collections::HashMap<(String, String), [u8; 32]>,
     server_legacy: bool,
     authorization_summary: Option<sql_script::AuthorizationSummary>,
+    compact: bool,
+    preview_expanded: bool,
     results: Entity<crate::script_results::ScriptResults>,
     _connections_observe: Subscription,
 }
 impl EventEmitter<ScriptEvent> for ScriptView {}
 impl ScriptView {
+    pub fn note_scroll_handles(&self, cx: &App) -> Vec<ScrollHandle> {
+        self.results.read(cx).note_scroll_handles(cx)
+    }
+
+    pub fn compact_results(&mut self) {
+        self.compact = true;
+        self.indexing = false;
+    }
+
     pub fn set_access_mode(
         &mut self,
         mode: turbodbn_services::access_mode::AccessMode,
@@ -127,10 +138,11 @@ impl ScriptView {
         }
         self.binding = None;
         self.failed_location = None;
-        self.results.update(cx, |results, cx| results.clear(cx));
+        self.results
+            .update(cx, |results, cx| results.stale_scope(cx));
         // File indexing is independent of the effective connection and must survive defaults.
-        if !self.indexing {
-            self.status = "".into();
+        if !self.indexing && self.results.read(cx).has_report() {
+            self.status = t(cx, "notes.results_stale");
         }
         cx.notify();
     }
@@ -172,7 +184,11 @@ impl ScriptView {
                 this.fail("notes.preview_changed".into(), cx);
             }
         });
-        cx.defer_in(window, |this, _, cx| this.refresh_index(cx));
+        cx.defer_in(window, |this, _, cx| {
+            if !this.compact {
+                this.refresh_index(cx);
+            }
+        });
         Self {
             path,
             script,
@@ -230,6 +246,8 @@ impl ScriptView {
             server_legacy: false,
             authorization_summary: None,
             results,
+            compact: false,
+            preview_expanded: false,
             _connections_observe: observed,
         }
     }
@@ -885,7 +903,7 @@ impl ScriptView {
                                         let refresh =
                                             this.last_progress.elapsed().as_millis() >= 250;
                                         this.results.update(cx, |results, cx| {
-                                            results.push(result, this.next, line, refresh, cx)
+                                            results.push(result, this.next, line, refresh, window, cx)
                                         });
                                         this.executing = false;
                                         if this.last_progress.elapsed().as_millis() >= 250 {
@@ -1120,6 +1138,15 @@ impl ScriptView {
         let Some(summary) = self.authorization_summary.clone() else {
             return;
         };
+        if !summary.requires_authorization() {
+            if !self.current(self.run_id, cx) {
+                self.fail("notes.preview_changed".into(), cx);
+                return;
+            }
+            self.authorized = true;
+            cx.defer_in(window, |this, window, cx| this.load_next(window, cx));
+            return;
+        }
         let Some((saved, database)) = &self.binding else {
             return;
         };
@@ -1465,6 +1492,102 @@ impl ScriptView {
         cx.notify();
     }
 }
+impl ScriptView {
+    fn result_status(&self, cx: &Context<Self>) -> AnyElement {
+        if self.status.is_empty() {
+            return div().into_any_element();
+        }
+        let results = self.results.clone();
+        let open = results.read(cx).details_open();
+        let label = results.read(cx).status_text(self.status.clone(), cx);
+        let scope = self.binding.as_ref().map(|(saved, database)| {
+            tr(
+                cx,
+                "notes.multi.scope",
+                &[
+                    ("connection", &saved.profile.name),
+                    ("database", database),
+                    ("environment", &saved.profile.environment),
+                ],
+            )
+        });
+        let tooltip = self.status.clone();
+        div()
+            .id("sql-result-status")
+            .h_flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .text_sm()
+            .child(gpui_component::Icon::new(
+                if self.failed_location.is_some() || self.index_error {
+                    IconName::TriangleAlert
+                } else if !self.active && self.completed > 0 && self.completed == self.end {
+                    IconName::Check
+                } else {
+                    IconName::Info
+                },
+            ))
+            .child(
+                div()
+                    .id("sql-result-message")
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(label)
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tooltip.clone()).build(window, cx)
+                    }),
+            )
+            .children(scope.map(|scope| {
+                div()
+                    .id("sql-result-scope")
+                    .max_w(px(240.))
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(scope.clone())
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(scope.clone()).build(window, cx)
+                    })
+            }))
+            .child(
+                Button::new("sql-result-readonly")
+                    .ghost()
+                    .small()
+                    .icon(gpui_component::Icon::default().path("icons/ai-permissions.svg"))
+                    .tooltip(t(cx, "notes.multi.readonly")),
+            )
+            .child(
+                Button::new("sql-result-details")
+                    .ghost()
+                    .small()
+                    .icon(if open {
+                        IconName::ChevronUp
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .label(t(cx, "notes.results.details"))
+                    .on_click(move |_, _, cx| {
+                        results.update(cx, |results, cx| results.toggle_details(cx))
+                    }),
+            )
+            .child(
+                Button::new("sql-result-clear")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Close)
+                    .tooltip(t(cx, "notes.results.clear"))
+                    .disabled(self.active)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.results.update(cx, |results, cx| results.clear(cx));
+                        this.status = "".into();
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+}
 impl Drop for ScriptView {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
@@ -1472,6 +1595,15 @@ impl Drop for ScriptView {
 }
 impl Render for ScriptView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.compact {
+            return div()
+                .v_flex()
+                .min_w_0()
+                .gap_1()
+                .child(self.result_status(cx))
+                .child(self.results.clone())
+                .into_any_element();
+        }
         let active = self.active;
         let disabled = active || self.locked || self.indexing;
         let run_tip = if active {
@@ -1494,51 +1626,67 @@ impl Render for ScriptView {
             .iter()
             .find(|entry| entry.number == self.selected)
             .is_some_and(|entry| entry.supported);
-        let mut body = div()
-            .v_flex()
-            .gap_2()
-            .min_w_0()
-            .child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .id("script-run-all-tooltip")
-                            .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(run_tip.clone())
-                                    .build(window, cx)
-                            })
-                            .child(
-                                Button::new("script-run-all")
-                                    .icon(IconName::ArrowRight)
-                                    .label(t(cx, "script.run_all"))
-                                    .disabled(disabled || self.script.unsupported > 0)
-                                    .on_click(
-                                        cx.listener(|_, _, _, cx| cx.emit(ScriptEvent::Run(false))),
-                                    ),
-                            ),
-                    )
-                    .child(
+        let mut body = div().v_flex().gap_2().min_w_0().child(
+            div()
+                .h_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .id("script-run-all-tooltip")
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(run_tip.clone()).build(window, cx)
+                        })
+                        .child(
+                            Button::new("script-run-all")
+                                .icon(IconName::ArrowRight)
+                                .label(t(cx, "script.run_all"))
+                                .disabled(disabled || self.script.unsupported > 0)
+                                .on_click(
+                                    cx.listener(|_, _, _, cx| cx.emit(ScriptEvent::Run(false))),
+                                ),
+                        ),
+                )
+                .child(
+                    Button::new("sql-file-preview")
+                        .ghost()
+                        .small()
+                        .icon(if self.preview_expanded {
+                            IconName::ChevronUp
+                        } else {
+                            IconName::ChevronDown
+                        })
+                        .label(t(cx, "notes.file.preview"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.preview_expanded = !this.preview_expanded;
+                            cx.notify();
+                        })),
+                )
+                .when(self.preview_expanded, |row| {
+                    row.child(
                         Button::new("script-run-selected")
+                            .ghost()
+                            .small()
                             .icon(IconName::ArrowRight)
                             .label(t(cx, "script.run_selected"))
                             .disabled(disabled || !supported)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(ScriptEvent::Run(true)))),
                     )
-                    .child(
+                })
+                .when(active, |row| {
+                    row.child(
                         Button::new("script-stop")
                             .icon(IconName::Close)
                             .label(t(cx, "script.stop"))
-                            .disabled(!active)
                             .on_click(cx.listener(|this, _, _, cx| this.stop(cx))),
                     )
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .h_flex()
-                            .gap_2()
-                            .child(
+                })
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .h_flex()
+                        .gap_2()
+                        .when(self.script.unsupported > 0, |row| {
+                            row.child(
                                 Button::new("script-issue-filter")
                                     .small()
                                     .ghost()
@@ -1553,45 +1701,43 @@ impl Render for ScriptView {
                                     .tooltip(t(cx, "script.issue_filter_hint"))
                                     .on_click(cx.listener(|this, _, _, cx| this.toggle_issues(cx))),
                             )
-                            .when(self.issues_only, |el| {
-                                el.child(
-                                    Button::new("script-clear-issues")
-                                        .small()
-                                        .ghost()
-                                        .icon(IconName::Close)
-                                        .tooltip(t(cx, "script.clear_filter"))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.toggle_issues(cx)),
-                                        ),
-                                )
-                            })
-                            .when(self.issues_only, |el| {
-                                el.child(
-                                    Button::new("script-prev-issue")
-                                        .small()
-                                        .ghost()
-                                        .icon(IconName::ChevronLeft)
-                                        .tooltip(t(cx, "script.previous_issue"))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.step_issue(false, cx)
-                                            }),
-                                        ),
-                                )
-                                .child(
-                                    Button::new("script-next-issue")
-                                        .small()
-                                        .ghost()
-                                        .icon(IconName::ChevronRight)
-                                        .tooltip(t(cx, "script.next_issue"))
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| this.step_issue(true, cx)),
-                                        ),
-                                )
-                            }),
-                    ),
-            )
-            .child(tr(
+                        })
+                        .when(self.issues_only, |el| {
+                            el.child(
+                                Button::new("script-clear-issues")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::Close)
+                                    .tooltip(t(cx, "script.clear_filter"))
+                                    .on_click(cx.listener(|this, _, _, cx| this.toggle_issues(cx))),
+                            )
+                        })
+                        .when(self.issues_only, |el| {
+                            el.child(
+                                Button::new("script-prev-issue")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::ChevronLeft)
+                                    .tooltip(t(cx, "script.previous_issue"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.step_issue(false, cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("script-next-issue")
+                                    .small()
+                                    .ghost()
+                                    .icon(IconName::ChevronRight)
+                                    .tooltip(t(cx, "script.next_issue"))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.step_issue(true, cx)),
+                                    ),
+                            )
+                        }),
+                ),
+        );
+        if self.preview_expanded {
+            body = body.child(tr(
                 cx,
                 "script.summary",
                 &[
@@ -1609,250 +1755,254 @@ impl Render for ScriptView {
                     ),
                 ],
             ));
-        if self.index_error {
+            if self.index_error {
+                body = body.child(
+                    Button::new("script-retry-index")
+                        .icon(gpui_component::Icon::default().path("icons/refresh.svg"))
+                        .label(t(cx, "script.retry_index"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cancel = Arc::new(AtomicBool::new(false));
+                            this.refresh_index(cx);
+                        })),
+                );
+            }
             body = body.child(
-                Button::new("script-retry-index")
-                    .icon(gpui_component::Icon::default().path("icons/refresh.svg"))
-                    .label(t(cx, "script.retry_index"))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.cancel = Arc::new(AtomicBool::new(false));
-                        this.refresh_index(cx);
-                    })),
-            );
-        }
-        body = body.child(
-            div()
-                .relative()
-                .h(px(180.))
-                .w_full()
-                .child(
-                    uniform_list(
-                        "script-rows",
-                        self.rows.len(),
-                        cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
-                            range
-                                .map(|index| {
-                                    let row = &this.rows[index];
-                                    let number = row.number;
-                                    div()
-                                        .id(SharedString::from(format!("script-row-{number}")))
-                                        .h_flex()
-                                        .h(px(30.))
-                                        .gap_2()
-                                        .px_2()
-                                        .items_center()
-                                        .bg(if this.selected == number {
-                                            cx.theme().muted
-                                        } else {
-                                            transparent_black()
-                                        })
-                                        .child(div().w(px(48.)).child((number + 1).to_string()))
-                                        .child(
-                                            div()
-                                                .w(px(64.))
-                                                .text_color(cx.theme().muted_foreground)
-                                                .child(format!("L{}", row.line)),
-                                        )
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .child(row.preview.clone()),
-                                        )
-                                        .when(row.has_comments, |el| {
-                                            el.child(
-                                                Button::new(SharedString::from(format!(
-                                                    "script-comments-{number}"
-                                                )))
-                                                .ghost()
-                                                .small()
-                                                .icon(IconName::Info)
-                                                .tooltip(t(cx, "script.comments_hint"))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.select(number, cx);
-                                                    this.show_comments = true;
-                                                })),
-                                            )
-                                        })
-                                        .when(!row.supported, |el| {
-                                            let reason = crate::locale::message(cx, &row.reason);
-                                            el.child(
+                div()
+                    .relative()
+                    .h(px(180.))
+                    .w_full()
+                    .child(
+                        uniform_list(
+                            "script-rows",
+                            self.rows.len(),
+                            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                range
+                                    .map(|index| {
+                                        let row = &this.rows[index];
+                                        let number = row.number;
+                                        div()
+                                            .id(SharedString::from(format!("script-row-{number}")))
+                                            .h_flex()
+                                            .h(px(30.))
+                                            .gap_2()
+                                            .px_2()
+                                            .items_center()
+                                            .bg(if this.selected == number {
+                                                cx.theme().muted
+                                            } else {
+                                                transparent_black()
+                                            })
+                                            .child(div().w(px(48.)).child((number + 1).to_string()))
+                                            .child(
                                                 div()
-                                                    .id(SharedString::from(format!(
-                                                        "script-error-{number}"
-                                                    )))
-                                                    .tooltip(move |window, cx| {
-                                                        gpui_component::tooltip::Tooltip::new(
-                                                            reason.clone(),
-                                                        )
-                                                        .build(window, cx)
-                                                    })
-                                                    .child(gpui_component::Icon::new(
-                                                        IconName::TriangleAlert,
-                                                    )),
+                                                    .w(px(64.))
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(format!("L{}", row.line)),
                                             )
-                                        })
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.select(number, cx)
-                                        }))
-                                })
-                                .collect()
-                        }),
-                    )
-                    .track_scroll(self.list_scroll.clone())
-                    .h_full()
-                    .w_full(),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(14.))
-                        .child(
-                            Scrollbar::vertical(&self.list_scroll)
-                                .scrollbar_show(ScrollbarShow::Always),
-                        ),
-                )
-                .w_full(),
-        );
-        body = body.child(
-            div()
-                .h_flex()
-                .gap_3()
-                .justify_end()
-                .child(
-                    Button::new("script-page-prev")
-                        .ghost()
-                        .icon(IconName::ChevronLeft)
-                        .tooltip(t(cx, "script.previous"))
-                        .disabled(self.page == 0)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.load_page(this.page.saturating_sub(sql_script::PAGE_SIZE), cx)
-                        })),
-                )
-                .child(format!(
-                    "{}–{} / {}",
-                    self.page + 1,
-                    (self.page + sql_script::PAGE_SIZE).min(if self.issues_only {
-                        self.script.unsupported
-                    } else {
-                        self.script.statements
-                    }),
-                    if self.issues_only {
-                        self.script.unsupported
-                    } else {
-                        self.script.statements
-                    }
-                ))
-                .child(
-                    Button::new("script-page-next")
-                        .ghost()
-                        .icon(IconName::ChevronRight)
-                        .tooltip(t(cx, "script.next"))
-                        .disabled(
-                            self.page + sql_script::PAGE_SIZE
-                                >= if self.issues_only {
-                                    self.script.unsupported
-                                } else {
-                                    self.script.statements
-                                },
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .child(row.preview.clone()),
+                                            )
+                                            .when(row.has_comments, |el| {
+                                                el.child(
+                                                    Button::new(SharedString::from(format!(
+                                                        "script-comments-{number}"
+                                                    )))
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(IconName::Info)
+                                                    .tooltip(t(cx, "script.comments_hint"))
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.select(number, cx);
+                                                        this.show_comments = true;
+                                                    })),
+                                                )
+                                            })
+                                            .when(!row.supported, |el| {
+                                                let reason =
+                                                    crate::locale::message(cx, &row.reason);
+                                                el.child(
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "script-error-{number}"
+                                                        )))
+                                                        .tooltip(move |window, cx| {
+                                                            gpui_component::tooltip::Tooltip::new(
+                                                                reason.clone(),
+                                                            )
+                                                            .build(window, cx)
+                                                        })
+                                                        .child(gpui_component::Icon::new(
+                                                            IconName::TriangleAlert,
+                                                        )),
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.select(number, cx)
+                                            }))
+                                    })
+                                    .collect()
+                            }),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.load_page(this.page + sql_script::PAGE_SIZE, cx)
-                        })),
-                ),
-        );
-        if !self.preview_markdown.is_empty() {
+                        .track_scroll(self.list_scroll.clone())
+                        .h_full()
+                        .w_full(),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .bottom_0()
+                            .w(px(14.))
+                            .child(
+                                Scrollbar::vertical(&self.list_scroll)
+                                    .scrollbar_show(ScrollbarShow::Always),
+                            ),
+                    )
+                    .w_full(),
+            );
             body = body.child(
                 div()
                     .h_flex()
-                    .items_center()
-                    .gap_2()
+                    .gap_3()
+                    .justify_end()
                     .child(
-                        div()
-                            .flex_1()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(self.preview_range.clone()),
-                    )
-                    .when(!self.preview_comments.is_empty(), |el| {
-                        el.child(
-                            Button::new("script-show-comments")
-                                .ghost()
-                                .small()
-                                .icon(IconName::Info)
-                                .label(t(cx, "script.comments"))
-                                .selected(self.show_comments)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.show_comments = !this.show_comments;
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .child(
-                        Button::new("script-copy-sql")
+                        Button::new("script-page-prev")
                             .ghost()
-                            .small()
-                            .icon(IconName::Copy)
-                            .label(t(cx, "script.copy_sql"))
-                            .tooltip(t(cx, "script.copy_sql_hint"))
+                            .icon(IconName::ChevronLeft)
+                            .tooltip(t(cx, "script.previous"))
+                            .disabled(self.page == 0)
                             .on_click(cx.listener(|this, _, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    this.preview_sql.to_string(),
-                                ));
-                                feedback::success(t(cx, "feedback.copied"), cx);
+                                this.load_page(this.page.saturating_sub(sql_script::PAGE_SIZE), cx)
+                            })),
+                    )
+                    .child(format!(
+                        "{}–{} / {}",
+                        self.page + 1,
+                        (self.page + sql_script::PAGE_SIZE).min(if self.issues_only {
+                            self.script.unsupported
+                        } else {
+                            self.script.statements
+                        }),
+                        if self.issues_only {
+                            self.script.unsupported
+                        } else {
+                            self.script.statements
+                        }
+                    ))
+                    .child(
+                        Button::new("script-page-next")
+                            .ghost()
+                            .icon(IconName::ChevronRight)
+                            .tooltip(t(cx, "script.next"))
+                            .disabled(
+                                self.page + sql_script::PAGE_SIZE
+                                    >= if self.issues_only {
+                                        self.script.unsupported
+                                    } else {
+                                        self.script.statements
+                                    },
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.load_page(this.page + sql_script::PAGE_SIZE, cx)
                             })),
                     ),
             );
-            if self.show_comments {
+            if !self.preview_markdown.is_empty() {
                 body = body.child(
                     div()
-                        .id("script-leading-comments")
-                        .max_h(px(140.))
-                        .overflow_y_scroll()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .whitespace_normal()
-                        .child(self.preview_comments.clone()),
-                );
-            }
-
-            body = body.child(
-                div()
-                    .id("script-preview")
-                    .relative()
-                    .max_h(px(220.))
-                    .overflow_y_scroll()
-                    .child(
-                        TextView::markdown(
-                            "script-current-source",
-                            self.preview_markdown.clone(),
-                            window,
-                            cx,
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(self.preview_range.clone()),
                         )
-                        .selectable(true),
-                    )
-                    .child(
-                        div().absolute().right(px(6.)).top(px(6.)).child(
-                            Button::new("script-copy-preview")
+                        .when(!self.preview_comments.is_empty(), |el| {
+                            el.child(
+                                Button::new("script-show-comments")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::Info)
+                                    .label(t(cx, "script.comments"))
+                                    .selected(self.show_comments)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.show_comments = !this.show_comments;
+                                        cx.notify();
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("script-copy-sql")
                                 .ghost()
+                                .small()
                                 .icon(IconName::Copy)
-                                .tooltip(t(cx, "script.copy_source"))
+                                .label(t(cx, "script.copy_sql"))
+                                .tooltip(t(cx, "script.copy_sql_hint"))
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
-                                        this.preview.to_string(),
+                                        this.preview_sql.to_string(),
                                     ));
                                     feedback::success(t(cx, "feedback.copied"), cx);
                                 })),
                         ),
-                    ),
-            );
+                );
+                if self.show_comments {
+                    body = body.child(
+                        div()
+                            .id("script-leading-comments")
+                            .max_h(px(140.))
+                            .overflow_y_scroll()
+                            .text_sm()
+                            .text_color(cx.theme().muted_foreground)
+                            .whitespace_normal()
+                            .child(self.preview_comments.clone()),
+                    );
+                }
+
+                body = body.child(
+                    div()
+                        .id("script-preview")
+                        .relative()
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
+                        .child(
+                            TextView::markdown(
+                                "script-current-source",
+                                self.preview_markdown.clone(),
+                                window,
+                                cx,
+                            )
+                            .selectable(true),
+                        )
+                        .child(
+                            div().absolute().right(px(6.)).top(px(6.)).child(
+                                Button::new("script-copy-preview")
+                                    .ghost()
+                                    .icon(IconName::Copy)
+                                    .tooltip(t(cx, "script.copy_source"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.write_to_clipboard(ClipboardItem::new_string(
+                                            this.preview.to_string(),
+                                        ));
+                                        feedback::success(t(cx, "feedback.copied"), cx);
+                                    })),
+                            ),
+                        ),
+                );
+            }
         }
-        body = body.child(self.results.clone());
+        body = body
+            .child(self.result_status(cx))
+            .child(self.results.clone());
         if self.failed_location.is_some()
             && self.binding.as_ref().is_some_and(|(saved, _)| {
                 saved.profile.kind == turbodbn_services::DatabaseKind::MySql
@@ -1916,10 +2066,6 @@ impl Render for ScriptView {
                     })),
             );
         }
-        body.child(
-            div()
-                .text_color(cx.theme().muted_foreground)
-                .child(self.status.clone()),
-        )
+        body.into_any_element()
     }
 }

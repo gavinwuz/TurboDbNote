@@ -184,6 +184,37 @@ impl TableView {
             return;
         };
         self.options.filter = draft.filter(cx);
+        if self.filter_only {
+            if self.target.mysql_raw_gbk
+                && self
+                    .options
+                    .filter
+                    .as_ref()
+                    .is_some_and(|g| g.conditions().iter().any(|f| !f.value.is_ascii()))
+            {
+                crate::feedback::error(t(cx, "query_note.gbk_filter"), cx);
+                return;
+            }
+            let Some(schema) = &self.schema else {
+                return;
+            };
+            match workbench::filter_select(
+                self.target.kind,
+                &self.target.database,
+                &self.target.object,
+                schema,
+                self.options.filter.as_ref(),
+            ) {
+                Ok(sql) => {
+                    self.last_options = self.options.clone();
+                    cx.emit(FilterSqlReady(sql));
+                    cx.notify();
+                }
+                Err(error) => crate::feedback::error(crate::locale::message(cx, &error), cx),
+            }
+            return;
+        }
+
         self.change_query(cx);
     }
     pub(super) fn filter_bar(&self, cx: &Context<Self>) -> AnyElement {

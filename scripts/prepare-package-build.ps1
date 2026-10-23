@@ -13,7 +13,7 @@ function New-PackageBuildWorkspace {
         if ((Test-Path -LiteralPath $ancestor) -and ((Get-Item -LiteralPath $ancestor).Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Refusing linked build workspace' }
     }
     # Caller holds the package lock for the complete build; replace only generated source.
-    foreach ($name in @('crates', 'scripts', 'upstream')) {
+    foreach ($name in @('crates', 'scripts', 'upstream', 'vendor')) {
         $generated = Join-Path $workspace $name
         if (Test-Path -LiteralPath $generated) {
             if ((Get-Item -LiteralPath $generated).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Refusing linked build source' }
@@ -24,6 +24,8 @@ function New-PackageBuildWorkspace {
     New-Item -ItemType Directory -Path $workspace -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $Root 'Cargo.toml'), (Join-Path $Root 'Cargo.lock') -Destination $workspace
     Copy-Item -LiteralPath (Join-Path $Root 'crates') -Destination $workspace -Recurse
+    New-Item -ItemType Directory -Path (Join-Path $workspace 'vendor') -Force | Out-Null
+    Copy-Item -LiteralPath (Join-Path $Root 'vendor/gpui-component') -Destination (Join-Path $workspace 'vendor/gpui-component') -Recurse
     New-Item -ItemType Directory -Path (Join-Path $workspace 'scripts') -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $Root 'scripts/dev-tools') -Destination (Join-Path $workspace 'scripts') -Recurse
     $source = Join-Path $workspace 'upstream/gpui'
@@ -45,7 +47,7 @@ function New-PackageBuildWorkspace {
 '@
     [IO.File]::WriteAllText($buildFile, $build.Substring(0, $start) + $replacement + $build.Substring($end))
     [IO.File]::WriteAllText((Join-Path $source 'package-fxc-path.txt'), $FxcPath)
-    Add-Content -LiteralPath (Join-Path $workspace 'Cargo.toml') -Value "`n[patch.crates-io]`ngpui = { path = 'upstream/gpui' }"
+    Add-Content -LiteralPath (Join-Path $workspace 'Cargo.toml') -Value "`ngpui = { path = 'upstream/gpui' }"
     Push-Location $workspace
     try {
         # Re-resolve only the source override using the copied lock; all versions must remain pinned.

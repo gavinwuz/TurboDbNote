@@ -185,6 +185,18 @@ pub struct AuthorizationSummary {
     pub relaxed_checks: u64,
     pub risky: u64,
 }
+impl AuthorizationSummary {
+    pub fn requires_authorization(&self) -> bool {
+        self.writes > 0
+            || self.ddl > 0
+            || self.session > 0
+            || self.locks > 0
+            || self.transactions > 0
+            || self.destructive > 0
+            || self.relaxed_checks > 0
+            || self.risky > 0
+    }
+}
 impl Reader {
     pub fn database_kind(&self) -> DatabaseKind {
         kind(self.script.dialect)
@@ -286,28 +298,11 @@ pub fn permission_block(
 }
 pub struct Prepared {
     directory: tempfile::TempDir,
-    split_safe: bool,
     pub script: SqlScript,
 }
 impl Prepared {
     pub fn page(&self) -> Result<Vec<Entry>, String> {
         Reader::from_root(self.directory.path(), &self.script)?.page(0)
-    }
-    pub fn split_allowed(&self) -> bool {
-        self.script.bytes <= 1024 * 1024
-            && self.script.statements <= 50
-            && self.script.unsupported == 0
-            && self.script.statements > 0
-            && self.split_safe
-    }
-    pub fn split(&self) -> Result<Vec<String>, String> {
-        if !self.split_allowed() {
-            return Err("script.error.split_limit".into());
-        }
-        let mut reader = Reader::from_root(self.directory.path(), &self.script)?;
-        (0..self.script.statements)
-            .map(|n| reader.statement(n))
-            .collect()
     }
     pub fn publish(&self, note: &Path, cancel: &AtomicBool) -> Result<(), String> {
         let root = folder(note)?;
@@ -395,6 +390,24 @@ pub fn copy_resources(from: &Path, to: &Path, note: &turbodbn_core::Note) -> Res
     Ok(())
 }
 
+/// Prepare an editor buffer through the same immutable attachment path as file imports.
+pub fn prepare_text(
+    source: &str,
+    dialect: SqlDialect,
+    cancel: &AtomicBool,
+) -> Result<Prepared, String> {
+    let mut temp = tempfile::Builder::new()
+        .suffix(".sql")
+        .tempfile()
+        .map_err(disk)?;
+    temp.write_all(source.as_bytes()).map_err(disk)?;
+    temp.flush().map_err(disk)?;
+    // Close the writable handle before open_read applies its Windows sharing contract.
+    let path = temp.into_temp_path();
+    let mut prepared = prepare(&path, dialect, cancel, |_, _| {})?;
+    prepared.script.name = "Note SQL.sql".into();
+    Ok(prepared)
+}
 pub fn prepare(
     path: &Path,
     dialect: SqlDialect,
@@ -537,12 +550,104 @@ pub fn prepare(
     if !script.valid() {
         return Err("script.error.resource".into());
     }
-    Ok(Prepared {
-        directory,
-        script,
-        split_safe: scan.split_safe,
-    })
+    Ok(Prepared { directory, script })
 }
+/// Bounded editor segmentation reuses the script lexer and its byte-exact records.
+pub fn editor_ranges(
+    source: &str,
+    dialect: SqlDialect,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
+    if source.len() > MAX_SQL_BYTES || source.contains('\0') {
+        return Err("notes.sql_range_invalid".into());
+    }
+    let mut scanner = Scanner::new(dialect, 0);
+    let mut records = Vec::new();
+    for byte in source.bytes() {
+        scanner.push(byte, &mut records)?;
+    }
+    if !scanner.finished() {
+        return Err("script.error.unterminated".into());
+    }
+    scanner.emit(&mut records)?;
+    let mut ranges = records
+        .chunks_exact(RECORD as usize)
+        .map(|record| {
+            let start = u64::from_le_bytes(record[0..8].try_into().unwrap()) as usize;
+            let length = u64::from_le_bytes(record[8..16].try_into().unwrap()) as usize;
+            start..start + length
+        })
+        .collect::<Vec<_>>();
+    if let Some(last) = ranges.last_mut() {
+        last.end = source.len();
+    }
+    Ok(ranges)
+}
+/// SQL query units execute a complete selection, or all statements when no selection exists.
+/// Execution plans keep the current-statement behavior when nothing is selected.
+pub fn editor_query_target(
+    source: &str,
+    dialect: SqlDialect,
+    selection: std::ops::Range<usize>,
+    cursor: usize,
+    explain: bool,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
+    let selection = if !explain && selection.is_empty() {
+        0..source.len()
+    } else {
+        selection
+    };
+    editor_target(source, dialect, selection, cursor).map(|(ranges, _)| ranges)
+}
+/// A selection must contain complete statement code. Leading/trailing whitespace may be omitted.
+pub fn editor_target(
+    source: &str,
+    dialect: SqlDialect,
+    selection: std::ops::Range<usize>,
+    cursor: usize,
+) -> Result<(Vec<std::ops::Range<usize>>, usize), String> {
+    let ranges = editor_ranges(source, dialect)?;
+    if ranges.is_empty() {
+        return Err("script.error.empty".into());
+    }
+    if selection.start > selection.end
+        || selection.end > source.len()
+        || !source.is_char_boundary(selection.start)
+        || !source.is_char_boundary(selection.end)
+    {
+        return Err("notes.sql_range_invalid".into());
+    }
+    let current = ranges
+        .iter()
+        .position(|range| cursor >= range.start && cursor < range.end)
+        .unwrap_or(ranges.len() - 1);
+    if selection.is_empty() {
+        return Ok((vec![ranges[current].clone()], current));
+    }
+    let chosen = ranges
+        .iter()
+        .filter(|range| {
+            range.start < selection.end
+                && range.end > selection.start
+                && !source[range.start.max(selection.start)..range.end.min(selection.end)]
+                    .trim()
+                    .is_empty()
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let no_code = |text: &str| {
+        let text = text.trim().trim_start_matches(';');
+        leading_code_offset(text, dialect) >= text.len()
+    };
+    if chosen.iter().any(|range| {
+        !no_code(&source[range.start..range.start.max(selection.start)])
+            || !no_code(&source[range.end.min(selection.end)..range.end])
+    }) || chosen.is_empty()
+    {
+        return Err("notes.sql_selection_incomplete".into());
+    }
+    Ok((chosen, current))
+}
+
 fn check_byte(
     scan: &mut Scanner,
     byte: u8,
@@ -564,7 +669,6 @@ enum Mode {
     Dollar { tag: Vec<u8>, matched: usize },
 }
 struct Scanner {
-    split_safe: bool,
     dialect: SqlDialect,
     mode: Mode,
     offset: u64,
@@ -582,7 +686,6 @@ struct Scanner {
 impl Scanner {
     fn new(dialect: SqlDialect, start: u64) -> Self {
         Self {
-            split_safe: true,
             dialect,
             mode: Mode::Code,
             offset: start,
@@ -783,10 +886,6 @@ impl Scanner {
                 None
             };
             let supported = classification.is_some();
-            self.split_safe &= self.body.len() <= 60_000
-                && std::str::from_utf8(&self.body).ok().is_some_and(|sql| {
-                    notebook_query::command_required(kind(self.dialect), sql).is_some()
-                });
             let write = classification == Some(false);
             for value in [self.start, self.offset - self.start, self.first_line] {
                 out.write_all(&value.to_le_bytes()).map_err(disk)?;
@@ -1022,6 +1121,54 @@ pub fn freeze(note: &Path, script: &SqlScript, cancel: &AtomicBool) -> Result<Re
 mod tests {
     use super::*;
     #[test]
+    fn only_read_only_batches_bypass_authorization() {
+        for dialect in [
+            SqlDialect::MySql,
+            SqlDialect::PostgreSql,
+            SqlDialect::Sqlite,
+        ] {
+            for (source, required) in [
+                (
+                    "-- first query\nSELECT * FROM items;\nSELECT id FROM other_items;",
+                    false,
+                ),
+                ("SELECT * FROM items;\nDELETE FROM items WHERE id=1;", true),
+            ] {
+                let (dir, imported) = prepared(source, dialect);
+                let note = dir.path().join("authorization.note");
+                let cancel = AtomicBool::new(false);
+                imported.publish(&note, &cancel).unwrap();
+                let mut reader = freeze(&note, &imported.script, &cancel).unwrap();
+                let summary = reader.authorization_summary(0, 2, false, &cancel).unwrap();
+                assert_eq!(summary.requires_authorization(), required);
+            }
+        }
+        for summary in [
+            AuthorizationSummary {
+                session: 1,
+                ..Default::default()
+            },
+            AuthorizationSummary {
+                locks: 1,
+                ..Default::default()
+            },
+            AuthorizationSummary {
+                transactions: 1,
+                ..Default::default()
+            },
+            AuthorizationSummary {
+                risky: 1,
+                ..Default::default()
+            },
+            AuthorizationSummary {
+                ddl: 1,
+                ..Default::default()
+            },
+        ] {
+            assert!(summary.requires_authorization());
+        }
+    }
+    #[test]
     fn leading_comments_do_not_hide_sql_or_change_the_frozen_source() {
         let source = "-- 说明; not a statement\r\n# more comment\r\n/* ordinary */\r\nDROP TRIGGER IF EXISTS `t`;";
         let (dir, imported) = prepared(source, SqlDialect::MySql);
@@ -1197,7 +1344,6 @@ mod tests {
         );
         assert_eq!(imported.script.statements, 9);
         assert_eq!(imported.script.unsupported, 0);
-        assert!(!imported.split_allowed());
         assert!(imported.page().unwrap().iter().all(|row| row.supported));
     }
     #[test]
@@ -1270,7 +1416,11 @@ mod tests {
             let (_dir, prepared) = prepared(text, dialect);
             assert_eq!(prepared.script.statements, count);
             assert_eq!(prepared.script.unsupported, 0);
-            let statements = prepared.split().unwrap();
+            let mut reader =
+                Reader::from_root(prepared.directory.path(), &prepared.script).unwrap();
+            let statements = (0..prepared.script.statements)
+                .map(|number| reader.statement(number).unwrap())
+                .collect::<Vec<_>>();
             assert_eq!(statements.len(), count as usize);
             assert!(
                 statements
@@ -1291,7 +1441,6 @@ mod tests {
         ] {
             let (_dir, prepared) = prepared(text, SqlDialect::MySql);
             assert!(prepared.script.unsupported > 0);
-            assert!(!prepared.split_allowed());
         }
         let (_dir, prepared) = prepared(
             &format!("SELECT '{}'; SELECT 2;", "x".repeat(MAX_SQL_BYTES)),
@@ -1329,7 +1478,13 @@ mod tests {
             |_, _| {},
         )
         .unwrap();
-        assert_eq!(imported.split().unwrap(), vec!["SELECT 1;"]);
+        assert_eq!(
+            Reader::from_root(imported.directory.path(), &imported.script)
+                .unwrap()
+                .statement(0)
+                .unwrap(),
+            "SELECT 1;"
+        );
         assert!(prepare(&file, SqlDialect::Sqlite, &AtomicBool::new(true), |_, _| {}).is_err());
     }
     #[test]
@@ -1404,7 +1559,6 @@ mod tests {
         .unwrap();
         assert_eq!(imported.script.statements, 100_000);
         assert_eq!(imported.script.unsupported, 0);
-        assert!(!imported.split_allowed());
         let page = imported.page().unwrap();
         assert_eq!(page.len(), PAGE_SIZE as usize);
         assert!(page.iter().all(|entry| entry.preview.len() <= 512));
@@ -1419,5 +1573,108 @@ mod tests {
             .len(),
             HEADER + 100_000 * RECORD
         );
+    }
+}
+
+#[cfg(test)]
+mod editor_range_tests {
+    #[test]
+    fn query_units_run_whole_source_or_complete_selection_and_plan_current_statement() {
+        use super::{SqlDialect, editor_query_target};
+        for dialect in [
+            SqlDialect::MySql,
+            SqlDialect::PostgreSql,
+            SqlDialect::Sqlite,
+        ] {
+            let sql = "-- first; comment\nSELECT ';';\nSELECT 2;\nSELECT 3;";
+            let cursor = sql.find("SELECT 2").unwrap();
+            let all = editor_query_target(sql, dialect, cursor..cursor, cursor, false).unwrap();
+            assert_eq!(all.len(), 3);
+            let selected =
+                editor_query_target(sql, dialect, all[1].clone(), cursor, false).unwrap();
+            assert_eq!(selected, vec![all[1].clone()]);
+            let pair =
+                editor_query_target(sql, dialect, all[1].start..all[2].end, cursor, false).unwrap();
+            assert_eq!(pair.len(), 2);
+            let plan = editor_query_target(sql, dialect, cursor..cursor, cursor, true).unwrap();
+            assert_eq!(plan, vec![all[1].clone()]);
+            assert!(editor_query_target(sql, dialect, cursor..cursor + 3, cursor, false).is_err());
+        }
+    }
+    #[test]
+    fn unified_query_segmentation_preserves_session_commands_and_large_statements() {
+        use super::{SqlDialect, editor_query_target};
+        let sql = "USE app; SET NAMES utf8mb4; SELECT 1;";
+        assert_eq!(
+            editor_query_target(sql, SqlDialect::MySql, 0..0, 0, false)
+                .unwrap()
+                .len(),
+            3
+        );
+        let sql = format!("SELECT '{}'; SELECT 2;", "x".repeat(70_000));
+        let ranges = editor_query_target(&sql, SqlDialect::Sqlite, 0..0, 0, false).unwrap();
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(
+            ranges
+                .iter()
+                .map(|range| &sql[range.clone()])
+                .collect::<String>(),
+            sql
+        );
+    }
+    use super::*;
+    #[test]
+    fn statements_ignore_quoted_and_comment_semicolons_and_preserve_exact_source() {
+        let sql = "# SELECT * FROM `库`.`ignored`;\nSELECT ';' AS value;\n-- comment ;\nSELECT * FROM `库`.`cq_itemtype`;\nSELECT 3; -- trailing";
+        let ranges = editor_ranges(sql, SqlDialect::MySql).unwrap();
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(
+            ranges.iter().map(|r| &sql[r.clone()]).collect::<String>(),
+            sql
+        );
+        let cursor = sql.find("cq_itemtype").unwrap();
+        let (selected, _) = editor_target(sql, SqlDialect::MySql, cursor..cursor, cursor).unwrap();
+        assert!(sql[selected[0].clone()].contains("cq_itemtype"));
+        assert!(!sql[selected[0].clone()].contains("SELECT 3"));
+        assert_eq!(
+            editor_target(sql, SqlDialect::MySql, 0..sql.len(), sql.len())
+                .unwrap()
+                .0
+                .len(),
+            3
+        );
+        assert!(editor_target(sql, SqlDialect::MySql, cursor..cursor + 2, cursor).is_err());
+    }
+    #[test]
+    fn postgres_dollar_quotes_and_unterminated_input_are_not_naively_split() {
+        let sql = "SELECT $$a;b$$; /* x;y */ SELECT '中';";
+        assert_eq!(editor_ranges(sql, SqlDialect::PostgreSql).unwrap().len(), 2);
+        assert!(editor_ranges("SELECT 'unterminated", SqlDialect::MySql).is_err());
+        assert_eq!(
+            editor_ranges("SELECT ';'; SELECT 2;", SqlDialect::Sqlite)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+}
+
+#[cfg(test)]
+mod text_attachment_tests {
+    use super::*;
+    #[test]
+    fn editor_text_prepares_and_publishes_with_no_open_write_handle() {
+        let directory = tempfile::tempdir().unwrap();
+        let note = directory.path().join("source.note");
+        let source = "-- keep comment;\nSELECT ';';\nSELECT 2; -- trailing";
+        let cancel = AtomicBool::new(false);
+        let prepared = prepare_text(source, SqlDialect::Sqlite, &cancel).unwrap();
+        assert_eq!(prepared.script.statements, 2);
+        prepared.publish(&note, &cancel).unwrap();
+        let file = directory
+            .path()
+            .join(".turbodbnote-scripts")
+            .join(format!("{}.sql", prepared.script.source_hash));
+        assert_eq!(fs::read_to_string(file).unwrap(), source);
     }
 }

@@ -12,6 +12,9 @@ pub use grid::{
     MAX_GRID_PAGE_SIZE, PageOptions, cell_where, copy_row, copy_update, edit_preview,
 };
 
+#[path = "account_admin.rs"]
+pub mod account_admin;
+
 pub const PAGE_SIZE: usize = 100;
 fn legacy_page_size() -> usize {
     PAGE_SIZE
@@ -25,6 +28,29 @@ pub struct Rows {
 pub type Query<'a> = Pin<Box<dyn Future<Output = Result<Rows, String>> + 'a>>;
 pub type CountedQuery<'a> = Pin<Box<dyn Future<Output = Result<(Rows, Option<u64>), String>> + 'a>>;
 pub trait Access {
+    fn supports_keyset(&self) -> bool {
+        true
+    }
+    fn query_data<'a>(&'a mut self, sql: &'a str) -> Query<'a> {
+        self.query(sql)
+    }
+    fn query_data_counted<'a>(&'a mut self, sql: &'a str) -> CountedQuery<'a> {
+        self.query_counted(sql)
+    }
+
+    /// Bounded names from a SHOW directory on servers without information_schema.
+    fn directory_page<'a>(&'a mut self, sql: &'a str, offset: usize, limit: usize) -> Query<'a> {
+        Box::pin(async move {
+            let mut rows = self.query(sql).await?;
+            rows.values = rows
+                .values
+                .into_iter()
+                .skip(offset)
+                .take(limit + 1)
+                .collect();
+            Ok(rows)
+        })
+    }
     fn query<'a>(&'a mut self, sql: &'a str) -> Query<'a>;
     fn query_counted<'a>(&'a mut self, sql: &'a str) -> CountedQuery<'a> {
         Box::pin(async move { self.query(sql).await.map(|rows| (rows, None)) })
@@ -38,8 +64,14 @@ pub struct Object {
     pub comment: String,
     pub parent: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Column {
+    #[serde(default)]
+    pub not_null: Option<bool>,
+    #[serde(default)]
+    pub auto_increment: Option<bool>,
+    #[serde(default)]
+    pub extra: String,
     pub name: String,
     pub data_type: String,
     pub comment: String,
@@ -60,6 +92,43 @@ pub struct Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Action {
+    AccountGrants {
+        user: String,
+        host: String,
+    },
+    AccountApplyGrants {
+        plan: account_admin::GrantPlan,
+        confirmed: bool,
+    },
+    AccountMode,
+    AccountCreate {
+        draft: account_admin::Draft,
+        sql_mode: String,
+        confirmed: bool,
+    },
+    AccountPermissions {
+        user: String,
+        host: String,
+        search: String,
+        offset: usize,
+    },
+    Accounts {
+        offset: usize,
+        limit: usize,
+    },
+    BrowseCatalog {
+        category: String,
+        search: String,
+        offset: usize,
+        limit: usize,
+        #[serde(default)]
+        include_comments: bool,
+    },
+    BrowseColumns(Object),
+    BrowseSection {
+        object: Object,
+        section: String,
+    },
     MongoWrite(turbodbn_core::mongo::Mutation),
     RedisWrite(super::redis_value::Mutation),
     RedisScan {
@@ -127,6 +196,11 @@ pub enum Action {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    AccountGrants(Vec<account_admin::Grant>),
+    CatalogPage {
+        objects: Vec<Object>,
+        more: bool,
+    },
     MongoPage(turbodbn_core::mongo::Page),
     MongoWritten {
         inserted: bool,
@@ -292,6 +366,21 @@ pub(super) async fn schema(
                     name: value(&r, 0),
                     data_type: value(&r, 1),
                     primary: value(&r, key) == "PRI",
+                    not_null: Some(value(&r, if modern { 3 } else { 2 }) == "NO"),
+                    auto_increment: Some(
+                        value(&r, key + 2)
+                            .split_whitespace()
+                            .any(|v| v.eq_ignore_ascii_case("auto_increment")),
+                    ),
+                    extra: format!(
+                        "{}{}",
+                        r.get(key + 1)
+                            .and_then(|v| v.as_ref())
+                            .map(|v| format!("DEFAULT {v}; "))
+                            .unwrap_or_default(),
+                        value(&r, key + 2)
+                    ),
+
                     comment: if modern {
                         value(&r, 8)
                     } else if r.len() >= 8 {
@@ -334,7 +423,7 @@ pub(super) async fn schema(
         DatabaseKind::Sqlite => {
             for r in c
                 .query(&format!(
-                    "SELECT name,type,pk FROM pragma_table_xinfo({}) WHERE hidden<>1",
+                    "SELECT name,type,pk,\"notnull\",dflt_value,hidden FROM pragma_table_xinfo({}) WHERE hidden<>1",
                     literal_for(kind, &object.name)
                 ))
                 .await?
@@ -344,7 +433,10 @@ pub(super) async fn schema(
                     name: value(&r, 0),
                     data_type: value(&r, 1),
                     primary: value(&r, 2) != "0",
+                    not_null: Some(value(&r,3)=="1"),
+                    extra: format!("{}{}", r.get(4).and_then(|v|v.as_ref()).map(|v|format!("DEFAULT {v}; ")).unwrap_or_default(), if matches!(value(&r,5).as_str(),"2"|"3") {"GENERATED"} else {""}),
                     comment: String::new(),
+                    ..Default::default()
                 });
             }
             if !details {
@@ -378,10 +470,23 @@ pub(super) async fn schema(
                 .first()
                 .map(|r| value(r, 0))
                 .unwrap_or_default();
+            if let Ok(statements) =
+                sqlparser::parser::Parser::parse_sql(&sqlparser::dialect::SQLiteDialect {}, &s.ddl)
+                && let Some(sqlparser::ast::Statement::CreateTable(table)) = statements.first()
+            {
+                for column in &mut s.columns {
+                    if let Some(definition) =
+                        table.columns.iter().find(|c| c.name.value == column.name)
+                    {
+                        column.auto_increment = Some(definition.options.iter().any(|o| matches!(&o.option,
+                            sqlparser::ast::ColumnOption::DialectSpecific(tokens) if tokens.iter().any(|t| t.to_string().eq_ignore_ascii_case("AUTOINCREMENT")))));
+                    }
+                }
+            }
         }
         DatabaseKind::PostgreSql => {
             let relation = literal_for(kind, &name);
-            for r in c.query(&format!("SELECT a.attname,format_type(a.atttypid,a.atttypmod),COALESCE(col_description(a.attrelid,a.attnum),''),EXISTS(SELECT 1 FROM pg_index i WHERE i.indrelid=a.attrelid AND i.indisprimary AND a.attnum=ANY(i.indkey)) FROM pg_attribute a WHERE a.attrelid={relation}::regclass AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")).await?.values {s.columns.push(Column{name:value(&r,0),data_type:value(&r,1),comment:value(&r,2),primary:matches!(value(&r,3).as_str(),"t"|"true")});}
+            for r in c.query(&format!("SELECT a.attname,format_type(a.atttypid,a.atttypmod),COALESCE(col_description(a.attrelid,a.attnum),''),EXISTS(SELECT 1 FROM pg_index i WHERE i.indrelid=a.attrelid AND i.indisprimary AND a.attnum=ANY(i.indkey)),a.attnotnull,COALESCE((SELECT pg_get_expr(d.adbin,d.adrelid) FROM pg_attrdef d WHERE d.adrelid=a.attrelid AND d.adnum=a.attnum),''),a.attidentity FROM pg_attribute a WHERE a.attrelid={relation}::regclass AND a.attnum>0 AND NOT a.attisdropped ORDER BY a.attnum")).await?.values {s.columns.push(Column{name:value(&r,0),data_type:value(&r,1),comment:value(&r,2),primary:matches!(value(&r,3).as_str(),"t"|"true"),not_null:Some(matches!(value(&r,4).as_str(),"t"|"true")),extra:value(&r,5),auto_increment:Some(!value(&r,6).is_empty() || value(&r,5).starts_with("nextval(")) });}
             if !details {
                 return Ok(s);
             }
@@ -409,7 +514,7 @@ pub(super) async fn schema(
             }
         }
         DatabaseKind::ClickHouse => {
-            for r in c.query(&format!("SELECT name,type,comment,is_in_primary_key FROM system.columns WHERE database={} AND table={} ORDER BY position",literal_for(kind,db),literal_for(kind,&object.name))).await?.values{s.columns.push(Column{name:value(&r,0),data_type:value(&r,1),comment:value(&r,2),primary:value(&r,3)=="1"});}
+            for r in c.query(&format!("SELECT name,type,comment,is_in_primary_key FROM system.columns WHERE database={} AND table={} ORDER BY position",literal_for(kind,db),literal_for(kind,&object.name))).await?.values{s.columns.push(Column{name:value(&r,0),data_type:value(&r,1),comment:value(&r,2),primary:value(&r,3)=="1", ..Default::default() });}
             if !details {
                 return Ok(s);
             }
@@ -432,7 +537,93 @@ pub async fn run(
     version: &str,
     r: &Request,
 ) -> Result<Reply, String> {
+    // The saved target-version hint may be "Auto" or only a compatibility family.
+    // Account capabilities must use the connected server's actual version.
+    let account_version = if matches!(
+        r.action,
+        Action::AccountGrants { .. }
+            | Action::AccountApplyGrants { .. }
+            | Action::AccountMode
+            | Action::AccountCreate { .. }
+            | Action::AccountPermissions { .. }
+    ) {
+        if kind != DatabaseKind::MySql {
+            return Err("accounts.unsupported".into());
+        }
+        Some(
+            c.query("SELECT VERSION() AS version")
+                .await?
+                .values
+                .first()
+                .and_then(|row| row.first())
+                .and_then(Clone::clone)
+                .ok_or("accounts.prepare_failed")?,
+        )
+    } else {
+        None
+    };
+    let version = account_version.as_deref().unwrap_or(version);
     match &r.action {
+        Action::AccountGrants { user, host } => account_admin::grants(c, kind, version, user, host)
+            .await
+            .map(Reply::AccountGrants),
+        Action::AccountApplyGrants { plan, confirmed } => {
+            account_admin::apply_grants(c, kind, version, plan, *confirmed).await
+        }
+        Action::AccountMode => account_admin::mode(c, kind, version).await,
+        Action::AccountCreate {
+            draft,
+            sql_mode,
+            confirmed,
+        } => account_admin::create(c, kind, version, draft, sql_mode, *confirmed).await,
+        Action::AccountPermissions {
+            user,
+            host,
+            search,
+            offset,
+        } => account_admin::permissions(c, kind, version, user, host, search, *offset).await,
+
+        Action::Accounts { offset, limit } => {
+            if !(1..=200).contains(limit) || *offset > i64::MAX as usize {
+                return Err("browser.invalid".into());
+            }
+            let source = match kind {
+                DatabaseKind::MySql => "SELECT User,Host FROM mysql.user ORDER BY User,Host",
+                DatabaseKind::PostgreSql => {
+                    "SELECT rolname FROM pg_catalog.pg_roles ORDER BY rolname"
+                }
+                DatabaseKind::ClickHouse => "SELECT name FROM system.users ORDER BY name",
+                _ => return Err("browser.unsupported".into()),
+            };
+            let rows = c
+                .query(&format!("{source} LIMIT {} OFFSET {offset}", limit + 1))
+                .await?;
+            let more = rows.values.len() > *limit;
+            Ok(Reply::CatalogPage {
+                objects: rows
+                    .values
+                    .iter()
+                    .take(*limit)
+                    .map(|row| Object {
+                        name: if kind == DatabaseKind::MySql {
+                            format!("{}@{}", value(row, 0), value(row, 1))
+                        } else {
+                            value(row, 0)
+                        },
+                        kind: "user".into(),
+                        schema: value(row, 0),
+                        parent: if kind == DatabaseKind::MySql {
+                            value(row, 1)
+                        } else {
+                            String::new()
+                        },
+                        comment: String::new(),
+                    })
+                    .collect(),
+                more,
+            })
+        }
+
         Action::MongoWrite(_)
         | Action::RedisScan { .. }
         | Action::RedisValue { .. }
@@ -453,7 +644,7 @@ pub async fn run(
             )
             .await
         }
-        Action::NoteColumns(object) => {
+        Action::NoteColumns(object) | Action::BrowseColumns(object) => {
             let object = if kind == DatabaseKind::PostgreSql && object.schema.is_empty() {
                 super::notebook_query::resolved_object(
                     c,
@@ -517,6 +708,29 @@ pub async fn run(
             ddl,
             changes,
         } => grid::commit(c, kind, &r.database, object, ddl, changes).await,
+        Action::BrowseCatalog {
+            category,
+            search,
+            offset,
+            limit,
+            include_comments,
+        } => {
+            super::catalog_browser::browse_with_comments(
+                c,
+                kind,
+                version,
+                &r.database,
+                category,
+                search,
+                *offset,
+                *limit,
+                *include_comments,
+            )
+            .await
+        }
+        Action::BrowseSection { object, section } => {
+            super::catalog_browser::section(c, kind, &r.database, object, section).await
+        }
         Action::Catalog => catalog(c, kind, &r.database, version).await,
         Action::Ddl(o) => {
             if kind == DatabaseKind::MySql {
@@ -571,7 +785,7 @@ pub async fn run(
                 },
                 page_size + 1
             );
-            let mut rows = c.query(&sql).await?;
+            let mut rows = c.query_data(&sql).await?;
             if rows.columns.is_empty() {
                 rows.columns = s.columns.iter().map(|c| c.name.clone()).collect();
             }
@@ -609,6 +823,38 @@ macro_rules! text_access {
             fn query<'a>(&'a mut self, sql: &'a str) -> Query<'a> {
                 Box::pin(async move { self.query_counted(sql).await.map(|(rows, _)| rows) })
             }
+            fn directory_page<'a>(
+                &'a mut self,
+                sql: &'a str,
+                offset: usize,
+                limit: usize,
+            ) -> Query<'a> {
+                Box::pin(async move {
+                    use futures_util::TryStreamExt;
+                    use sqlx::Row;
+                    let mut stream = sqlx::query(sql).fetch(self);
+                    let mut result = Rows::default();
+                    let mut seen = 0;
+                    let mut bytes = 0;
+                    while let Some(row) = stream.try_next().await.map_err(super::db_error)? {
+                        if seen < offset {
+                            seen += 1;
+                            continue;
+                        }
+                        let name = row.try_get::<String, _>(0).map_err(super::db_error)?;
+                        bytes += name.len();
+                        if bytes > MAX_BYTES {
+                            return Err("browser.response_failed".into());
+                        }
+                        result.values.push(vec![Some(name)]);
+                        if result.values.len() > limit {
+                            break;
+                        }
+                    }
+                    Ok(result)
+                })
+            }
+
             fn query_counted<'a>(&'a mut self, sql: &'a str) -> CountedQuery<'a> {
                 Box::pin(async move {
                     use futures_util::TryStreamExt;
@@ -726,22 +972,35 @@ impl Access for sqlx::SqliteConnection {
         })
     }
 }
+fn mysql_literal_parts(value: &str) -> (String, &'static str) {
+    let hex = value
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let charset = if value.chars().any(|c| c as u32 > 0xffff) {
+        "utf8mb4"
+    } else {
+        "utf8"
+    };
+    (hex, charset)
+}
+/// A real constant string item lets MySQL 5.x prune information_schema by schema
+/// and table. Function expressions such as CONVERT can force full catalog opens.
+/// The introducer still avoids client-charset and NO_BACKSLASH_ESCAPES ambiguity.
+pub(super) fn metadata_literal(kind: DatabaseKind, value: &str) -> String {
+    if kind == DatabaseKind::MySql {
+        let (hex, charset) = mysql_literal_parts(value);
+        format!("_{charset} X'{hex}'")
+    } else {
+        literal_for(kind, value)
+    }
+}
 /// Hex string expressions avoid dependence on MySQL NO_BACKSLASH_ESCAPES.
 pub fn literal_for(kind: DatabaseKind, value: &str) -> String {
     if kind == DatabaseKind::MySql {
-        format!(
-            "CONVERT(X'{}' USING {})",
-            value
-                .as_bytes()
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>(),
-            if value.chars().any(|c| c as u32 > 0xffff) {
-                "utf8mb4"
-            } else {
-                "utf8"
-            }
-        )
+        let (hex, charset) = mysql_literal_parts(value);
+        format!("CONVERT(X'{hex}' USING {charset})")
     } else if kind == DatabaseKind::ClickHouse {
         format!(
             "unhex('{}')",
@@ -1022,7 +1281,7 @@ fn clickhouse_comment(value: &str) -> String {
             .replace('\0', "\\0")
     )
 }
-fn comment_clause(sql: &str) -> Result<Option<(usize, usize)>, String> {
+pub(super) fn comment_clause(sql: &str) -> Result<Option<(usize, usize)>, String> {
     let bytes = sql.as_bytes();
     let mut i = 0;
     let mut quote = None;
@@ -1082,6 +1341,26 @@ fn comment_clause(sql: &str) -> Result<Option<(usize, usize)>, String> {
         i += 1;
     }
     Ok(None)
+}
+
+/// Compile the same filter used by data pages without executing a query.
+pub fn filter_select(
+    kind: DatabaseKind,
+    db: &str,
+    object: &Object,
+    schema: &Schema,
+    filter: Option<&FilterSet>,
+) -> Result<String, String> {
+    let parts = grid::readable_conditions(kind, schema, filter)?;
+    Ok(format!(
+        "SELECT * FROM {}{};",
+        qualified(kind, db, object),
+        if parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", parts.join(" AND "))
+        }
+    ))
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use super::*;
 use gpui_component::WindowExt;
 impl DatabaseView {
     pub(super) fn clear_object_view(&mut self) {
-        self.note_columns.clear();
+        self.browser.reset();
         self.object_scroll = UniformListScrollHandle::new();
         self.selected_object = None;
         self.object_items.clear();
@@ -38,8 +38,9 @@ impl DatabaseView {
             }
             // Metadata requests are read-only. Retire the request ID without disconnecting;
             // its late result must not populate the newly selected connection's object tree.
-            self.active_operation = None;
-            self.ddl.pending = false;
+            if self.mcp_target.is_none() {
+                self.active_operation = None;
+            }
         }
         let names = self.catalog(&profile);
         let database = (!profile.database.is_empty())
@@ -78,6 +79,9 @@ impl DatabaseView {
         kind: OperationKind,
         cx: &mut Context<Self>,
     ) -> bool {
+        if !browser_ui::is_request(&kind) {
+            self.retire_browser(cx);
+        }
         if self.active_operation.is_some() {
             self.object_notice = "请等待当前操作完成；断开可取消".into();
             feedback::error(self.object_notice.clone(), cx);
@@ -122,8 +126,7 @@ impl DatabaseView {
                 object.kind.clone(),
             ));
         }
-        let columns_only = self.ddl.pending
-            || matches!(&kind, OperationKind::Workbench(request) if matches!(request.action, Action::NoteColumns(_) | Action::Ddl(_) | Action::NotePrepare { .. } | Action::NoteExecute { .. }));
+        let columns_only = matches!(&kind, OperationKind::Workbench(request) if matches!(request.action, Action::NoteColumns(_) | Action::Ddl(_) | Action::NotePrepare { .. } | Action::NoteExecute { .. }));
         self.active_operation = Some((id, request, kind));
         if !columns_only {
             self.object_notice = "正在读取 / 执行…".into();
@@ -132,6 +135,53 @@ impl DatabaseView {
         true
     }
     pub(super) fn select_database(&mut self, id: Uuid, database: String, cx: &mut Context<Self>) {
+        if let Some((old_id, _, kind)) = self.active_operation.clone() {
+            if !is_metadata_read(&kind) || self.workbench_target.is_some() {
+                feedback::error(crate::locale::t(cx, "dbwork.switch.busy"), cx);
+                return;
+            }
+            if self.mcp_target.is_none() {
+                self.operation_log(
+                    old_id,
+                    crate::operation_log::Kind::Metadata,
+                    crate::operation_log::Phase::Cancelled,
+                    None,
+                    cx,
+                );
+                self.active_operation = None;
+            }
+        }
+
+        let supported = self.profiles.iter().find(|p| p.id == id).is_some_and(|p| {
+            matches!(
+                p.kind,
+                DatabaseKind::MySql
+                    | DatabaseKind::PostgreSql
+                    | DatabaseKind::Sqlite
+                    | DatabaseKind::ClickHouse
+            )
+        }) && self
+            .info
+            .get(&id)
+            .is_none_or(|i| !i.version.starts_with("4."));
+        if supported {
+            self.clear_object_view();
+            self.browser.supported = true;
+            self.browser.query = self.object_filter.read(cx).value().trim().to_lowercase();
+            self.selected_database = Some((id, database.clone()));
+            self.navigation.databases.insert(id, database);
+            self.persist_navigation();
+            if self.browser.query.is_empty() {
+                self.browser.page("relations", "", false);
+            } else {
+                let categories = self.browser_search_categories(cx);
+                self.browser.search(self.browser.query.clone(), &categories);
+            }
+            self.pump_browser(cx);
+            cx.notify();
+            return;
+        }
+
         if self.request_operation(
             id,
             if self
@@ -171,6 +221,7 @@ impl DatabaseView {
             return;
         }
         self.active_operation = None;
+        self.defer_mcp(cx);
         let log_kind = match &kind {
             OperationKind::CreateDatabase { .. } => crate::operation_log::Kind::Create,
             OperationKind::CopyDatabase { .. } => crate::operation_log::Kind::Copy,
@@ -191,17 +242,41 @@ impl DatabaseView {
         if result.is_ok() {
             self.remember_connection(id, cx);
         }
+        if matches!(&result,Ok(OperationResult::Workbench(reply)) if matches!(**reply,Reply::Executed))
+            && let OperationKind::Workbench(request) = &kind
+            && let Action::Execute {
+                guard: Some((object, _)),
+                ..
+            } = &request.action
+        {
+            let key = Self::object_key(object);
+            if self.selected_database.as_ref() == Some(&(id, request.database.clone())) {
+                self.close_metadata();
+                self.browser.pending = None;
+                self.schemas.remove(&key);
+                self.browser.full.remove(&key);
+                self.browser.columns.remove(&key);
+                self.browser
+                    .sections
+                    .retain(|section| !section.starts_with(&format!("{key}:")));
+                self.browser.revision += 1;
+            }
+            self.note_columns
+                .retain(|(connection, _, database, object), _| {
+                    *connection != id || database != &request.database || object != &key
+                });
+        }
         if let Some(sender) = self.mcp_target.take() {
             let _ = sender.try_send(match result {
                 Ok(OperationResult::Workbench(reply)) => Ok(*reply),
+                Err(error) => Err(error),
                 _ => Err("mcp.failed".into()),
             });
             cx.notify();
             return;
         }
-        if self.ddl.pending {
-            self.ddl.pending = false;
-            self.receive_ddl(result, cx);
+        if self.receive_browser(id, &kind, &result, cx) {
+            cx.notify();
             return;
         }
         if let OperationKind::Workbench(request) = &kind
@@ -216,7 +291,7 @@ impl DatabaseView {
                 Err(error) => feedback::error(error, cx),
                 _ => {}
             }
-            cx.emit(NoteColumnsReady(id));
+            cx.emit(NoteColumnsReady(id, None));
             cx.notify();
             return;
         }
@@ -236,9 +311,16 @@ impl DatabaseView {
         }
         match result {
             Ok(OperationResult::Workbench(reply)) => match *reply {
+                Reply::AccountGrants(_) | Reply::CatalogPage { .. } => {}
                 Reply::Catalog { objects, notice } => {
+                    self.browser.unknown_limit = !notice.is_empty();
+                    for o in &objects {
+                        self.browser.cache_search(o);
+                    }
+
                     let notice = crate::locale::message(cx, &notice).to_string();
                     self.catalog_objects = objects;
+                    self.browser.revision += 1;
                     self.object_catalog_loaded = true;
                     self.object_notice = if notice.is_empty() {
                         format!("{} 个对象", self.catalog_objects.len())
@@ -247,6 +329,39 @@ impl DatabaseView {
                     };
                 }
                 Reply::Schema(mut schema) => {
+                    if let OperationKind::Workbench(request) = &kind
+                        && let Action::Describe(object) = &request.action
+                    {
+                        let key = Self::object_key(object);
+                        self.browser_trim_schema(&key);
+                        self.browser.full.insert(key.clone());
+                        self.browser.columns.insert(key.clone());
+                        self.browser.sections.insert(format!("{key}:dbwork.index"));
+                        self.browser
+                            .sections
+                            .insert(format!("{key}:dbwork.foreign"));
+                        if self
+                            .profiles
+                            .iter()
+                            .find(|p| p.id == id)
+                            .is_some_and(|p| p.kind != DatabaseKind::MySql)
+                        {
+                            self.browser
+                                .sections
+                                .insert(format!("{key}:dbwork.trigger"));
+                        }
+                        if let Some(old) = self.schemas.get(&key)
+                            && self
+                                .browser
+                                .sections
+                                .contains(&format!("{key}:dbwork.trigger"))
+                        {
+                            schema.triggers = old.triggers.clone();
+                        }
+                        self.remember_note_columns(id, &request.database, object, &schema.columns);
+                        self.browser.revision += 1;
+                    }
+
                     if let OperationKind::Workbench(request) = kind
                         && let Action::Describe(object) = request.action
                     {
@@ -276,6 +391,10 @@ impl DatabaseView {
                     self.object_notice = "SQL 已执行，请刷新对象列表".into();
                     feedback::success(crate::locale::t(cx, "dbwork.executed"), cx);
                     self.schemas.clear();
+                    self.browser.revision += 1;
+                    self.browser.columns.clear();
+                    self.browser.full.clear();
+                    self.browser.sections.clear();
                     self.note_columns
                         .retain(|(connection, _, _, _), _| *connection != id);
                 }
@@ -300,7 +419,9 @@ impl DatabaseView {
                 let count = names.len();
                 if let Some(info) = self.info.get_mut(&id) {
                     info.databases = names;
+                    info.database_list_error = None;
                 }
+                self.tree_sync_databases(id, cx);
                 self.object_notice = format!("已刷新 {count} 个数据库");
                 if let Some((selected, db)) = self.selected_database.clone()
                     && selected == id
@@ -902,6 +1023,7 @@ if show_collation {
                                                     generation: this.note_generation(id),
                                                     kind: DatabaseKind::Redis,
                                                     writable: false,
+                                                    mysql_raw_gbk: false,
                                                 });
                                             } else {
                                                 if !this.expanded_objects.remove(&key) {
@@ -949,14 +1071,21 @@ if show_collation {
     }
 }
 
-fn is_metadata_read(kind: &OperationKind) -> bool {
+pub(super) fn is_metadata_read(kind: &OperationKind) -> bool {
     match kind {
         OperationKind::Databases
         | OperationKind::Objects { .. }
         | OperationKind::Details { .. } => true,
         OperationKind::Workbench(request) => matches!(
             request.action,
-            Action::Catalog
+            Action::AccountGrants { .. }
+                | Action::AccountMode
+                | Action::AccountPermissions { .. }
+                | Action::Accounts { .. }
+                | Action::BrowseCatalog { .. }
+                | Action::BrowseColumns(_)
+                | Action::BrowseSection { .. }
+                | Action::Catalog
                 | Action::Describe(_)
                 | Action::Ddl(_)
                 | Action::NoteColumns(_)

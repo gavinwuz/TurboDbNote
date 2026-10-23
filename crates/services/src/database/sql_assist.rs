@@ -11,7 +11,10 @@ use std::ops::Range;
 
 mod catalog;
 mod columns;
-pub use columns::{ColumnRequest, column_request, column_suggestions};
+mod context;
+mod ddl;
+pub use columns::{ColumnRequest, column_request, column_sources, column_suggestions, ddl_tables};
+pub use ddl::{DdlTable, DdlTarget, ddl_target};
 pub const MAX_SOURCE: usize = 60_000;
 pub const MAX_SUGGESTIONS: usize = 60;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +76,235 @@ fn qualified(kind: Option<DatabaseKind>, table: &TableName) -> String {
             quote(kind, &table.schema),
             quote(kind, &table.name)
         )
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionWord {
+    pub range: Range<usize>,
+    pub prefix: String,
+    pub schema: Option<String>,
+}
+#[derive(Default)]
+pub struct WordMemo {
+    last: Option<(Option<DatabaseKind>, String, Option<Option<String>>)>,
+}
+impl WordMemo {
+    pub fn request(
+        &mut self,
+        kind: Option<DatabaseKind>,
+        source: &str,
+        offset: usize,
+    ) -> Option<CompletionWord> {
+        if source.len() > MAX_SOURCE || offset > source.len() || !source.is_char_boundary(offset) {
+            return None;
+        }
+        let start = source[..offset]
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !word(*c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let end = source[offset..]
+            .char_indices()
+            .find(|(_, c)| !word(*c))
+            .map_or(source.len(), |(i, _)| offset + i);
+        let head = &source[..start];
+        let schema = if let Some((old_kind, old_head, value)) = &self.last
+            && *old_kind == kind
+            && old_head == head
+        {
+            value.clone()
+        } else {
+            let value = (|| {
+                let tokens = Tokenizer::new(dialect(kind).as_ref(), head)
+                    .tokenize()
+                    .ok()?;
+                if tokens.last().is_some_and(|token|matches!(token,Token::Whitespace(Whitespace::SingleLineComment{comment,..}) if !comment.ends_with('\n'))){return None;}
+                let mut tokens = tokens
+                    .iter()
+                    .rev()
+                    .filter(|token| !matches!(token, Token::Whitespace(_)));
+                let schema = if matches!(tokens.next(), Some(Token::Period)) {
+                    if let Some(Token::Word(name)) = tokens.next() {
+                        Some(name.value.clone())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                Some(schema)
+            })();
+            self.last = Some((kind, head.into(), value.clone()));
+            value
+        }?;
+        Some(CompletionWord {
+            range: start..end,
+            prefix: source[start..offset].to_lowercase(),
+            schema,
+        })
+    }
+}
+pub fn completion_word(
+    kind: Option<DatabaseKind>,
+    source: &str,
+    offset: usize,
+) -> Option<CompletionWord> {
+    WordMemo::default().request(kind, source, offset)
+}
+/// SELECT insertion is limited to a new statement containing only this table prefix.
+/// A newline alone never terminates a statement; comments and quoted semicolons are lexical tokens.
+pub fn table_select_allowed(
+    kind: Option<DatabaseKind>,
+    source: &str,
+    word: &CompletionWord,
+) -> bool {
+    if source.len() > MAX_SOURCE
+        || word.schema.is_some()
+        || word.range.end > source.len()
+        || !source.is_char_boundary(word.range.start)
+        || !source.is_char_boundary(word.range.end)
+    {
+        return false;
+    }
+    let Ok(head) = Tokenizer::new(dialect(kind).as_ref(), &source[..word.range.start]).tokenize()
+    else {
+        return false;
+    };
+    let head = head
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    let mut depth = 0usize;
+    for token in &head {
+        match token {
+            Token::LParen => depth += 1,
+            Token::RParen if depth == 0 => return false,
+            Token::RParen => depth -= 1,
+            _ => {}
+        }
+    }
+    if depth != 0 {
+        return false;
+    }
+    if head.last().is_some_and(|t| !matches!(t, Token::SemiColon)) {
+        return false;
+    }
+    let Ok(tail) = Tokenizer::new(dialect(kind).as_ref(), &source[word.range.end..]).tokenize()
+    else {
+        return false;
+    };
+    let tail = tail
+        .iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    tail.is_empty() || matches!(tail.as_slice(), [Token::SemiColon])
+}
+
+pub fn table_select_text(
+    kind: Option<DatabaseKind>,
+    source: &str,
+    word: &CompletionWord,
+    table: &str,
+) -> Option<String> {
+    if !table_select_allowed(kind, source, word) {
+        return None;
+    }
+    let tail = Tokenizer::new(dialect(kind).as_ref(), &source[word.range.end..])
+        .tokenize()
+        .ok()?;
+    Some(format!(
+        "SELECT * FROM {table}{}",
+        if tail.iter().any(|t| matches!(t, Token::SemiColon)) {
+            ""
+        } else {
+            ";"
+        }
+    ))
+}
+
+pub fn table_suggestions(
+    kind: Option<DatabaseKind>,
+    word: &CompletionWord,
+    tables: &[TableName],
+    limit: usize,
+) -> Vec<Suggestion> {
+    let mut tables = tables
+        .iter()
+        .filter(|table| {
+            table.name.to_lowercase().starts_with(&word.prefix)
+                && word
+                    .schema
+                    .as_ref()
+                    .is_none_or(|schema| table.schema.eq_ignore_ascii_case(schema))
+        })
+        .collect::<Vec<_>>();
+    tables.sort_by_key(|table| {
+        (
+            table.name.to_lowercase() != word.prefix,
+            table.name.to_lowercase(),
+            table.schema.to_lowercase(),
+        )
+    });
+    tables.dedup_by(|a, b| a.schema == b.schema && a.name == b.name);
+    tables
+        .into_iter()
+        .take(limit.min(MAX_SUGGESTIONS))
+        .map(|table| Suggestion {
+            label: if table.schema.is_empty() {
+                table.name.clone()
+            } else {
+                format!("{}.{}", table.schema, table.name)
+            },
+            insert: if word.schema.is_some() {
+                quote(kind, &table.name)
+            } else {
+                qualified(kind, table)
+            },
+            signature: String::new(),
+            kind: SuggestionKind::Table,
+            range: word.range.clone(),
+        })
+        .collect()
+}
+/// Reuse a resolved alias only while text outside the active identifier is byte-for-byte unchanged.
+#[derive(Default)]
+pub struct ColumnMemo {
+    last: Option<(Option<DatabaseKind>, String, String, Option<ColumnRequest>)>,
+}
+impl ColumnMemo {
+    pub fn request(
+        &mut self,
+        kind: Option<DatabaseKind>,
+        source: &str,
+        offset: usize,
+    ) -> Option<ColumnRequest> {
+        let word = completion_word(kind, source, offset)?;
+        self.request_word(kind, source, offset, &word)
+    }
+    pub fn request_word(
+        &mut self,
+        kind: Option<DatabaseKind>,
+        source: &str,
+        offset: usize,
+        word: &CompletionWord,
+    ) -> Option<ColumnRequest> {
+        let head = &source[..word.range.start];
+        let tail = &source[word.range.end..];
+        if let Some((old_kind, old_head, old_tail, request)) = &self.last
+            && *old_kind == kind
+            && old_head == head
+            && old_tail == tail
+        {
+            return request.clone().map(|mut request| {
+                request.prefix = word.prefix.clone();
+                request.range = word.range.clone();
+                request
+            });
+        }
+        let request = column_request(kind, source, offset);
+        self.last = Some((kind, head.into(), tail.into(), request.clone()));
+        request
     }
 }
 
@@ -408,6 +640,52 @@ mod tests {
         }
     }
     #[test]
+    fn t_select_generation_respects_statements_comments_and_relation_positions() {
+        for (source, allowed) in [
+            ("", true),
+            ("ga", true),
+            ("SELECT 1;\nga", true),
+            ("-- previous;\nga", true),
+            ("SELECT 1\nga", false),
+            ("SELECT * FROM ga", false),
+            ("SELECT * FROM a JOIN ga", false),
+            ("UPDATE ga", false),
+            ("SELECT (1; ga", false),
+            ("INSERT INTO ga", false),
+            ("SELECT ';'\nga", false),
+            ("SELECT ';';\nga", true),
+            ("ga; SELECT 2", false),
+        ] {
+            let word = completion_word(
+                Some(DatabaseKind::MySql),
+                source,
+                if source == "ga; SELECT 2" {
+                    2
+                } else {
+                    source.len()
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                table_select_allowed(Some(DatabaseKind::MySql), source, &word),
+                allowed,
+                "{source}"
+            );
+        }
+        let source = "SELECT 1;\nga /* keep comment */;";
+        let word = completion_word(
+            Some(DatabaseKind::MySql),
+            source,
+            source.find("ga").unwrap() + 2,
+        )
+        .unwrap();
+        assert_eq!(
+            table_select_text(Some(DatabaseKind::MySql), source, &word, "`game_account`"),
+            Some("SELECT * FROM `game_account`".into())
+        );
+        assert_eq!(&source[word.range.clone()], "ga");
+    }
+    #[test]
     fn mysql_hash_and_dash_comments_survive_formatting_and_suppress_completion() {
         let sql = "-- 查询说明\n  # 不执行 DELETE FROM items;\nselect '#文字', '--文字' from items # 结尾注释";
         let result = format(Some(DatabaseKind::MySql), sql).unwrap();
@@ -631,6 +909,70 @@ mod tests {
         assert_eq!(
             format(None, &"a".repeat(MAX_SOURCE + 1)),
             Err(FormatError::TooLarge)
+        );
+    }
+}
+
+#[cfg(test)]
+mod cached_completion_tests {
+    use super::*;
+    #[test]
+    fn table_top_k_rechecks_the_full_prefix_and_only_replaces_the_identifier() {
+        let tables = (0..200)
+            .map(|n| TableName {
+                schema: String::new(),
+                name: format!("cq_{n:03}"),
+            })
+            .chain(std::iter::once(TableName {
+                schema: String::new(),
+                name: "cq_itemtype".into(),
+            }))
+            .collect::<Vec<_>>();
+        let first = completion_word(Some(DatabaseKind::MySql), "SELECT * FROM c", 15).unwrap();
+        assert_eq!(
+            table_suggestions(Some(DatabaseKind::MySql), &first, &tables, 8).len(),
+            8
+        );
+        let sql = "SELECT * FROM cq_it WHERE id=1";
+        let at = sql.find(" WHERE").unwrap();
+        let word = completion_word(Some(DatabaseKind::MySql), sql, at).unwrap();
+        let found = table_suggestions(Some(DatabaseKind::MySql), &word, &tables, 8);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].insert, "`cq_itemtype`");
+        assert_eq!(&sql[found[0].range.clone()], "cq_it");
+        assert!(completion_word(Some(DatabaseKind::MySql), "-- comment cq", 13).is_none());
+        assert!(completion_word(Some(DatabaseKind::MySql), "SELECT 'cq", 10).is_none());
+    }
+    #[test]
+    fn memo_reuses_alias_resolution_only_when_surrounding_sql_is_unchanged() {
+        let mut memo = ColumnMemo::default();
+        let source = "SELECT u. FROM users u";
+        let first = memo.request(Some(DatabaseKind::MySql), source, 9).unwrap();
+        assert_eq!(first.table.name, "users");
+        let source = "SELECT u.n FROM users u";
+        let next = memo.request(Some(DatabaseKind::MySql), source, 10).unwrap();
+        assert_eq!(next.table.name, "users");
+        assert_eq!(next.prefix, "n");
+        assert_eq!(next.range, 9..10);
+        let source = "SELECT u.n FROM accounts u";
+        assert_eq!(
+            memo.request(Some(DatabaseKind::MySql), source, 10)
+                .unwrap()
+                .table
+                .name,
+            "accounts"
+        );
+        let source = "WITH u AS (SELECT * FROM users) SELECT u.n FROM u";
+        assert_eq!(
+            memo.request(
+                Some(DatabaseKind::MySql),
+                source,
+                source.find(".n").unwrap() + 2
+            )
+            .unwrap()
+            .table
+            .name,
+            "users"
         );
     }
 }

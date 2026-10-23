@@ -101,6 +101,21 @@ pub(in crate::database) fn conditions(
     s: &Schema,
     filter: Option<&FilterSet>,
 ) -> Result<Vec<String>, String> {
+    compile_conditions(kind, s, filter, false)
+}
+pub(in crate::database) fn readable_conditions(
+    kind: DatabaseKind,
+    s: &Schema,
+    filter: Option<&FilterSet>,
+) -> Result<Vec<String>, String> {
+    compile_conditions(kind, s, filter, true)
+}
+fn compile_conditions(
+    kind: DatabaseKind,
+    s: &Schema,
+    filter: Option<&FilterSet>,
+    readable: bool,
+) -> Result<Vec<String>, String> {
     let Some(filter) = filter else {
         return Ok(Vec::new());
     };
@@ -110,21 +125,48 @@ pub(in crate::database) fn conditions(
     }
     let parts = rows
         .iter()
-        .map(|f| condition(kind, s, f))
+        .map(|f| condition(kind, s, f, readable))
         .collect::<Result<Vec<_>, _>>()?;
-    let group = format!("({})", parts.join(&format!(" {} ", filter.join().sql())));
+    let group = if readable && parts.len() == 1 {
+        parts[0].clone()
+    } else {
+        format!("({})", parts.join(&format!(" {} ", filter.join().sql())))
+    };
     if group.len() > 60_000 {
         return Err("筛选条件过长，请精简条件".into());
     }
     Ok(vec![group])
 }
-fn condition(kind: DatabaseKind, s: &Schema, f: &Filter) -> Result<String, String> {
+fn condition(kind: DatabaseKind, s: &Schema, f: &Filter, readable: bool) -> Result<String, String> {
     let c = column(s, &f.column)?;
     let name = quote(kind, &c.name);
     if f.value.len() > 4096 || f.value.contains('\0') {
         return Err("筛选值过长或包含非法字符".into());
     }
-    let value = literal_for(kind, &f.value);
+    let value = if readable && !matches!(f.operator.as_str(), "null" | "not_null" | "contains") {
+        if numeric_column(c) {
+            let value = f.value.trim();
+            if !valid_number(value) {
+                return Err("grid.filter.number_invalid".into());
+            }
+            value.to_string()
+        } else {
+            copy_literal(kind, &f.value)
+        }
+    } else {
+        literal_for(kind, &f.value)
+    };
+    if readable && matches!(f.operator.as_str(), "eq" | "ne" | "gt" | "ge" | "lt" | "le") {
+        let op = match f.operator.as_str() {
+            "eq" => "=",
+            "ne" => "<>",
+            "gt" => ">",
+            "ge" => ">=",
+            "lt" => "<",
+            _ => "<=",
+        };
+        return Ok(format!("{name} {op} {value}"));
+    }
     Ok(match f.operator.as_str() {
         "eq" => format!("{name}={value}"),
         "ne" => format!("{name}<>{value}"),
@@ -135,19 +177,24 @@ fn condition(kind: DatabaseKind, s: &Schema, f: &Filter) -> Result<String, Strin
         "null" => format!("{name} IS NULL"),
         "not_null" => format!("{name} IS NOT NULL"),
         "contains" => {
-            format!(
-                "{name} LIKE {}",
-                literal_for(
-                    kind,
-                    &format!(
-                        "%{}%",
-                        f.value
-                            .replace('!', "!!")
-                            .replace('%', "!%")
-                            .replace('_', "!_")
-                    )
-                )
-            ) + " ESCAPE '!'"
+            let pattern = format!(
+                "%{}%",
+                f.value
+                    .replace('!', "!!")
+                    .replace('%', "!%")
+                    .replace('_', "!_")
+            );
+            let value = if readable {
+                copy_literal(kind, &pattern)
+            } else {
+                literal_for(kind, &pattern)
+            };
+            let escape = if readable && !f.value.contains(['!', '%', '_', '\\']) {
+                ""
+            } else {
+                " ESCAPE '!'"
+            };
+            format!("{name} LIKE {value}{escape}")
         }
         _ => return Err("不支持的筛选操作".into()),
     })
@@ -175,7 +222,8 @@ pub(super) async fn page(
     }
     let schema = schema(c, kind, db, object, true).await?;
     let primary = keys(&schema);
-    let keyset = !(kind == DatabaseKind::MySql && version.starts_with("4.0"))
+    let keyset = c.supports_keyset()
+        && !(kind == DatabaseKind::MySql && version.starts_with("4.0"))
         && options.sort.is_none()
         && !primary.is_empty()
         && primary.iter().all(|c| key_supported(c))
@@ -246,7 +294,7 @@ pub(super) async fn page(
         }
     );
     let started = std::time::Instant::now();
-    let mut rows = c.query(&sql).await?;
+    let mut rows = c.query_data(&sql).await?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
     if rows.columns.is_empty() {
         rows.columns = schema.columns.iter().map(|c| c.name.clone()).collect();
@@ -516,6 +564,44 @@ pub(in crate::database) async fn commit_columns(
     }
     result
 }
+fn numeric_column(column: &Column) -> bool {
+    let data_type = column.data_type.to_ascii_lowercase();
+    let base = data_type
+        .strip_prefix("nullable(")
+        .unwrap_or(&data_type)
+        .split(['(', ' '])
+        .next()
+        .unwrap_or("");
+    matches!(
+        base,
+        "tinyint"
+            | "smallint"
+            | "mediumint"
+            | "bigint"
+            | "int"
+            | "integer"
+            | "decimal"
+            | "numeric"
+            | "float"
+            | "double"
+            | "real"
+            | "serial"
+            | "bigserial"
+            | "smallserial"
+            | "number"
+    ) || base
+        .strip_prefix("uint")
+        .or_else(|| base.strip_prefix("int"))
+        .or_else(|| base.strip_prefix("float"))
+        .is_some_and(|bits| matches!(bits, "8" | "16" | "32" | "64" | "128" | "256"))
+}
+fn valid_number(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b"+-.eE".contains(&b))
+        && value.parse::<f64>().is_ok_and(|n| n.is_finite())
+}
 /// Human-readable copy only; execution retains the mode-independent encoder.
 fn copy_literal(kind: DatabaseKind, value: &str) -> String {
     if kind == DatabaseKind::MySql && !value.chars().any(|c| c == '\\' || c.is_control()) {
@@ -691,41 +777,9 @@ pub fn cell_where(
     if value.len() > 30_000 || value.contains('\0') {
         return Err("值过长或含有零字符，请使用主键条件".into());
     }
-    let data_type = column.data_type.to_ascii_lowercase();
-    let base = data_type
-        .strip_prefix("nullable(")
-        .unwrap_or(&data_type)
-        .split(['(', ' '])
-        .next()
-        .unwrap_or("");
-    let numeric = matches!(
-        base,
-        "tinyint"
-            | "smallint"
-            | "mediumint"
-            | "bigint"
-            | "int"
-            | "integer"
-            | "decimal"
-            | "numeric"
-            | "float"
-            | "double"
-            | "real"
-            | "serial"
-            | "bigserial"
-            | "smallserial"
-            | "number"
-    ) || base
-        .strip_prefix("uint")
-        .or_else(|| base.strip_prefix("int"))
-        .or_else(|| base.strip_prefix("float"))
-        .is_some_and(|bits| matches!(bits, "8" | "16" | "32" | "64" | "128" | "256"));
+    let numeric = numeric_column(column);
     if numeric {
-        if value
-            .bytes()
-            .all(|b| b.is_ascii_digit() || b"+-.eE".contains(&b))
-            && value.parse::<f64>().is_ok_and(|n| n.is_finite())
-        {
+        if valid_number(value) {
             return Ok(format!("WHERE {name}= {value}"));
         }
         return Err("数值内容无效，无法生成 WHERE 条件".into());
@@ -757,12 +811,14 @@ mod copy_literal_tests {
                     data_type: "INTEGER".into(),
                     primary: true,
                     comment: String::new(),
+                    ..Default::default()
                 },
                 Column {
                     name: "name".into(),
                     data_type: "TEXT".into(),
                     primary: false,
                     comment: String::new(),
+                    ..Default::default()
                 },
             ],
             ..Default::default()
@@ -841,5 +897,86 @@ mod copy_literal_tests {
                 literal_for(DatabaseKind::MySql, value)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod readable_filter_tests {
+    use super::*;
+    #[test]
+    fn generated_filters_are_typed_readable_and_keep_literal_wildcards() {
+        let schema = Schema {
+            columns: vec![
+                Column {
+                    name: "price".into(),
+                    data_type: "decimal(10,2)".into(),
+                    ..Default::default()
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: "varchar(80)".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let condition = |column: &str, operator: &str, value: &str| Filter {
+            column: column.into(),
+            operator: operator.into(),
+            value: value.into(),
+        };
+        assert_eq!(
+            super::condition(
+                DatabaseKind::MySql,
+                &schema,
+                &condition("price", "gt", "1"),
+                true
+            )
+            .unwrap(),
+            "`price` > 1"
+        );
+        assert_eq!(
+            super::condition(
+                DatabaseKind::MySql,
+                &schema,
+                &condition("name", "contains", "S"),
+                true
+            )
+            .unwrap(),
+            "`name` LIKE '%S%'"
+        );
+        assert!(
+            super::condition(
+                DatabaseKind::MySql,
+                &schema,
+                &condition("price", "eq", "1 OR 1=1"),
+                true
+            )
+            .is_err()
+        );
+        let wildcard = super::condition(
+            DatabaseKind::MySql,
+            &schema,
+            &condition("name", "contains", "a%_!"),
+            true,
+        )
+        .unwrap();
+        assert!(wildcard.contains("'%a!%!_!!%' ESCAPE '!'"));
+        let special = super::condition(
+            DatabaseKind::MySql,
+            &schema,
+            &condition("name", "eq", "a\\b"),
+            true,
+        )
+        .unwrap();
+        assert!(special.contains("CONVERT("));
+        let ordinary = super::condition(
+            DatabaseKind::MySql,
+            &schema,
+            &condition("name", "eq", "O'Reilly"),
+            true,
+        )
+        .unwrap();
+        assert!(ordinary.contains("'O''Reilly'"));
     }
 }

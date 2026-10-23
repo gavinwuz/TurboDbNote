@@ -1,3 +1,5 @@
+#[path = "workspace_layout.rs"]
+mod layout_ui;
 use crate::chat::{AiLog, ChatView};
 use crate::database::{DatabaseView, OpenDatabase, OpenObjects};
 use crate::panels::WorkbenchPanel;
@@ -24,8 +26,23 @@ const REGIONS: [DockPlacement; 3] = [
 ];
 
 pub struct Workspace {
+    permission_panels: std::collections::HashMap<String, Entity<crate::database::Privileges>>,
+    _permission_subscription: Subscription,
+    pending_table_restore: Vec<layout_ui::SavedTab>,
+    table_drafts: std::collections::HashMap<String, Subscription>,
+    restored_center: Vec<Vec<String>>,
+    center_sizes: Vec<f32>,
+    layout_task: Option<Task<()>>,
+    layout_ready: bool,
+    layout_error: bool,
+    center_groups: Vec<Vec<String>>,
+    center_views: Vec<Entity<TabPanel>>,
+    active_center: usize,
+    _layout_subscription: Subscription,
     notes: Entity<crate::note_library::NoteLibrary>,
     note_panels: std::collections::HashMap<String, Entity<crate::notebook::NoteView>>,
+    note_views: std::collections::HashMap<String, Entity<crate::notebook::NotePane>>,
+    restored_note_views: Vec<(String, String)>,
     _notes_subscription: Subscription,
     _notes_observe: Subscription,
     pending_note_close: Option<Vec<String>>,
@@ -50,6 +67,7 @@ pub struct Workspace {
     right_order: Vec<String>,
     pending_close: Vec<String>,
     _tab_subscription: Subscription,
+    _new_note_subscription: Subscription,
     _feedback_subscription: Subscription,
     update_status: String,
     updates: Entity<crate::updates::UpdateView>,
@@ -87,6 +105,9 @@ fn icon_button(id: &'static str, icon: impl Into<Icon>, tooltip: &'static str, c
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        cx.defer_in(window, |this, window, cx| {
+            this.load_center_layout(window, cx)
+        });
         let events = cx.global::<crate::feedback::Hub>().0.clone();
         let feedback_subscription = cx.subscribe_in(
             &events,
@@ -250,8 +271,10 @@ impl Workspace {
             dock.set_locked(true, window, cx);
             dock.set_toggle_button_visible(false, cx);
         });
-        let subscription = cx.subscribe(&dock, |_, _, event, cx| {
+        let subscription = cx.subscribe(&dock, |this, source, event, cx| {
             if matches!(event, DockEvent::LayoutChanged) {
+                this.observe_center_sizes(&source, cx);
+                this.save_center_layout(cx);
                 cx.notify();
             }
         });
@@ -259,6 +282,10 @@ impl Workspace {
             &ai,
             window,
             |this, _, event: &SettingsRequest, window, cx| match event {
+                SettingsRequest::ToggleSidebarLayout => {
+                    this.settings
+                        .update(cx, |settings, cx| settings.toggle_sidebar_layout(cx));
+                }
                 SettingsRequest::ToggleAiZoom => {
                     this.leave_focus(window, cx);
                     let zoomed = !this.ai.read(cx).is_zoomed();
@@ -303,24 +330,20 @@ impl Workspace {
                 this.dock
                     .update(cx, |dock, cx| dock.set_zoomed_out(window, cx));
                 this.ai.update(cx, |ai, cx| ai.sync_zoom(false, cx));
-                let active = this
-                    .center_tabs
-                    .read(cx)
-                    .active_panel(cx)
-                    .is_some_and(|p| p.view().entity_id() == this.database.entity_id());
-                if !active {
-                    this.center_tabs.update(cx, |tabs, cx| {
-                        let panel = Arc::new(this.database.clone());
-                        if this.database_open {
-                            tabs.remove_panel(panel.clone(), window, cx);
-                        }
-                        tabs.add_panel(panel, window, cx);
-                    });
-                }
-                if !active {
-                    this.center_order.retain(|name| *name != "database-manager");
+                this.put_center_panel(
+                    "database-manager",
+                    Arc::new(this.database.clone()),
+                    window,
+                    cx,
+                );
+                if !this
+                    .center_order
+                    .iter()
+                    .any(|name| name == "database-manager")
+                {
                     this.center_order.push("database-manager".into());
                 }
+                this.record_center_open("database-manager", cx);
                 this.database_open = true;
                 cx.notify();
             },
@@ -349,6 +372,23 @@ impl Workspace {
                 }
                 cx.notify();
             });
+        cx.subscribe_in(
+            &database,
+            window,
+            |this, _, event: &SettingsRequest, window, cx| match event {
+                SettingsRequest::Open(category) => {
+                    this.open_settings(*category, window, cx);
+                    this.settings
+                        .update(cx, |settings, cx| settings.select_database_layout(cx));
+                }
+                SettingsRequest::ToggleSidebarLayout => {
+                    this.settings
+                        .update(cx, |settings, cx| settings.toggle_sidebar_layout(cx));
+                }
+                _ => {}
+            },
+        )
+        .detach();
         let sql_settings_subscription = cx.subscribe_in(
             &events,
             window,
@@ -437,15 +477,30 @@ impl Workspace {
             &database,
             window,
             |this, source, event: &crate::database::OpenTable, window, cx| {
-                let key = format!(
-                    "data:{}:{}:{}:{}:{:?}:{}",
+                if event.mode == crate::table_view::Mode::Note {
+                    this.notes.update(cx, |notes, cx| {
+                        notes.new_table_query(event.clone(), window, cx)
+                    });
+                    return;
+                }
+
+                let generated_key = serde_json::to_string(&(
+                    "data",
                     event.connection,
-                    event.database,
-                    event.object.schema,
-                    event.object.name,
-                    event.mode,
-                    event.generation
-                );
+                    &event.database,
+                    &event.object.schema,
+                    &event.object.name,
+                    format!("{:?}", event.mode),
+                    event.generation,
+                ))
+                .expect("tab identity");
+                let key = this
+                    .table_panels
+                    .iter()
+                    .find(|(_, panel)| panel.read(cx).matches_target(event))
+                    .map(|(key, _)| key.clone())
+                    .unwrap_or(generated_key);
+                this.activate_center(&key, cx);
                 let panel = this
                     .table_panels
                     .entry(key.clone())
@@ -461,14 +516,33 @@ impl Workspace {
                         })
                     })
                     .clone();
+                this.watch_table(&key, &panel, cx);
+                panel.update(cx, |panel, cx| panel.resume_restored(window, cx));
                 this.leave_focus(window, cx);
-                this.center_tabs.update(cx, |tabs, cx| {
-                    let panel = Arc::new(panel);
-                    tabs.remove_panel(panel.clone(), window, cx);
-                    tabs.add_panel(panel, window, cx);
-                });
+                this.put_center_panel(&key, Arc::new(panel), window, cx);
                 this.center_order.retain(|n| n != &key);
-                this.center_order.push(key);
+                this.center_order.push(key.clone());
+                this.record_center_open(&key, cx);
+                cx.notify();
+            },
+        );
+        let permission_subscription = cx.subscribe_in(
+            &database,
+            window,
+            |this, _, event: &crate::database::OpenPrivileges, window, cx| {
+                let key = event.0.read(cx).key().to_owned();
+                let panel = this
+                    .permission_panels
+                    .entry(key.clone())
+                    .or_insert_with(|| event.0.clone())
+                    .clone();
+                this.activate_center(&key, cx);
+                this.leave_focus(window, cx);
+                this.put_center_panel(&key, Arc::new(panel), window, cx);
+                if !this.center_order.contains(&key) {
+                    this.center_order.push(key.clone());
+                }
+                this.record_center_open(&key, cx);
                 cx.notify();
             },
         );
@@ -484,8 +558,16 @@ impl Workspace {
                     }
                     return;
                 }
+                if matches!(event.mode, CloseMode::Current)
+                    && this.close_note_view(&event.name, window, cx)
+                {
+                    return;
+                }
                 let order = if this.center_order.contains(&event.name) {
-                    &this.center_order
+                    this.center_groups
+                        .iter()
+                        .find(|group| group.contains(&event.name))
+                        .unwrap_or(&this.center_order)
                 } else {
                     &this.right_order
                 };
@@ -501,6 +583,28 @@ impl Workspace {
                     this.close_names(&names, window, cx);
                 }
             });
+        let layout_subscription = cx.subscribe_in(
+            &router,
+            window,
+            |this, _, event: &crate::tabs::LayoutAction, window, cx| {
+                let event = event.clone();
+                match event {
+                    crate::tabs::LayoutAction::Activate(name) => this.activate_center(&name, cx),
+                    event => cx.defer_in(window, move |this, window, cx| {
+                        this.change_center(event, window, cx)
+                    }),
+                }
+            },
+        );
+        let new_note_subscription = cx.subscribe_in(
+            &cx.global::<TabRouter>().0.clone(),
+            window,
+            |this, _, event: &crate::tabs::NewNote, window, cx| {
+                this.activate_center(&event.0, cx);
+                this.notes
+                    .update(cx, |notes, cx| notes.new_note(window, cx));
+            },
+        );
         let notes_subscription = cx.subscribe_in(
             &notes,
             window,
@@ -508,18 +612,25 @@ impl Workspace {
                 crate::note_library::LibraryEvent::Removed { key } => {
                     let key = key.clone();
                     cx.defer_in(window, move |this, window, cx| {
-                        this.close_names(&[key], window, cx)
+                        let mut names = vec![key.clone()];
+                        names.extend(
+                            this.note_views
+                                .iter()
+                                .filter(|(_, v)| v.read(cx).owner.read(cx).key == key)
+                                .map(|(alias, _)| alias.clone()),
+                        );
+                        this.close_names(&names, window, cx)
                     });
                 }
                 crate::note_library::LibraryEvent::Open { key, view } => {
+                    this.activate_center(key, cx);
                     let panel: Arc<dyn PanelView> = Arc::new(view.clone());
-                    this.center_tabs.update(cx, |tabs, cx| {
-                        tabs.remove_panel(panel.clone(), window, cx);
-                        tabs.add_panel(panel, window, cx);
-                    });
+                    this.put_center_panel(key, panel, window, cx);
                     this.note_panels.insert(key.clone(), view.clone());
                     this.center_order.retain(|name| name != key);
                     this.center_order.push(key.clone());
+                    this.restore_note_views(key, view, window, cx);
+                    this.record_center_open(key, cx);
                     cx.notify();
                 }
                 crate::note_library::LibraryEvent::Settled { key, success } => {
@@ -597,6 +708,8 @@ impl Workspace {
         Self {
             notes,
             note_panels: Default::default(),
+            note_views: Default::default(),
+            restored_note_views: vec![],
             _notes_subscription: notes_subscription,
             _notes_observe: notes_observe,
             pending_note_close: None,
@@ -620,9 +733,23 @@ impl Workspace {
             _database_subscription: db_subscription,
             _database_observe: db_observe,
             panels,
+            table_drafts: Default::default(),
+            permission_panels: Default::default(),
+            _permission_subscription: permission_subscription,
+            pending_table_restore: vec![],
+            restored_center: vec![],
+            center_sizes: vec![],
+            layout_task: None,
+            layout_ready: false,
+            layout_error: false,
+            center_groups: vec![vec!["notebook".into()]],
+            center_views: vec![center_tabs.clone()],
+            active_center: 0,
+            _layout_subscription: layout_subscription,
             center_order: vec!["notebook".into()],
             right_order: vec!["ai-chat".into(), "properties".into(), "schema".into()],
             pending_close: vec![],
+            _new_note_subscription: new_note_subscription,
             _tab_subscription: tab_subscription,
             _feedback_subscription: feedback_subscription,
             update_status: cx
@@ -637,7 +764,7 @@ impl Workspace {
             dock,
             ai,
             settings,
-            center_tabs,
+            center_tabs: center_tabs.clone(),
             right_tabs,
             settings_open: false,
             settings_layout: None,
@@ -668,24 +795,11 @@ impl Workspace {
         }
         self.settings
             .update(cx, |settings, cx| settings.select(category, cx));
-        let panel = Arc::new(self.settings.clone());
-        let active = self
-            .center_tabs
-            .read(cx)
-            .active_panel(cx)
-            .is_some_and(|p| p.view().entity_id() == self.settings.entity_id());
-        if !active {
-            self.center_tabs.update(cx, |tabs, cx| {
-                if self.settings_open {
-                    tabs.remove_panel(panel.clone(), window, cx);
-                }
-                tabs.add_panel(panel, window, cx);
-            });
-        }
-        if !active {
-            self.center_order.retain(|name| *name != "settings");
+        self.put_center_panel("settings", Arc::new(self.settings.clone()), window, cx);
+        if !self.center_order.iter().any(|name| name == "settings") {
             self.center_order.push("settings".into());
         }
+        self.record_center_open("settings", cx);
         self.settings_open = true;
         window.focus(&self.settings.read(cx).focus_handle(cx));
         cx.notify();
@@ -851,6 +965,43 @@ impl Workspace {
     }
 
     pub fn prepare_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self
+            .permission_panels
+            .values()
+            .any(|p| p.read(cx).running())
+        {
+            crate::feedback::error(t(cx, "accounts.workbench.busy"), cx);
+            return false;
+        }
+        let pending = self
+            .permission_panels
+            .values()
+            .filter(|p| p.read(cx).dirty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !pending.is_empty() {
+            let owner = cx.entity().downgrade();
+            crate::feedback::confirm_labels(
+                t(cx, "accounts.permissions"),
+                t(cx, "accounts.workbench.discard"),
+                t(cx, "dbwork.draft.keep"),
+                t(cx, "dbwork.draft.discard"),
+                window,
+                cx,
+                move |window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        for p in &pending {
+                            p.update(cx, |p, cx| p.discard(cx));
+                        }
+                        if this.prepare_close(window, cx) {
+                            this.finish_close(window, cx);
+                        }
+                    });
+                },
+            );
+            return false;
+        }
+
         if self.pending_install.is_some()
             && (self.database.read(cx).update_blocked(cx)
                 || self
@@ -1079,6 +1230,10 @@ impl Workspace {
         window.remove_window();
     }
     fn rebuild_tabs(&mut self, center: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if center {
+            self.rebuild_center(window, cx);
+            return;
+        }
         let order = if center {
             &self.center_order
         } else {
@@ -1133,6 +1288,89 @@ impl Workspace {
         });
     }
     fn close_names(&mut self, names: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        let requested = names.to_vec();
+        let mut normalized = vec![];
+        for name in &requested {
+            let owner = self
+                .note_panels
+                .get(name)
+                .cloned()
+                .or_else(|| self.note_views.get(name).map(|v| v.read(cx).owner.clone()));
+            if let Some(owner) = owner {
+                let source = owner.read(cx).key.clone();
+                let views = self
+                    .center_order
+                    .iter()
+                    .filter(|key| {
+                        *key == &source
+                            || self
+                                .note_views
+                                .get(*key)
+                                .is_some_and(|v| v.read(cx).owner == owner)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if views.iter().any(|key| !requested.contains(key))
+                    && self.close_note_view(name, window, cx)
+                {
+                    continue;
+                }
+                if !normalized.contains(&source) {
+                    normalized.push(source);
+                }
+                for alias in views {
+                    if !normalized.contains(&alias) {
+                        normalized.push(alias);
+                    }
+                }
+            } else if !normalized.contains(name) {
+                normalized.push(name.clone());
+            }
+        }
+        let names = normalized.as_slice();
+        if names.is_empty() {
+            return;
+        }
+
+        if names
+            .iter()
+            .filter_map(|n| self.table_panels.get(n))
+            .any(|table| table.read(cx).writing())
+        {
+            crate::feedback::error(t(cx, "tabs.wait_write"), cx);
+            return;
+        }
+        let staged = names
+            .iter()
+            .filter_map(|n| self.table_panels.get(n))
+            .filter(|t| t.read(cx).staged())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !staged.is_empty() {
+            let owner = cx.entity().downgrade();
+            let names = names.to_vec();
+            crate::feedback::confirm_labels(
+                t(cx, "notes.close_title"),
+                t(cx, "tabs.close_staged"),
+                t(cx, "dbwork.draft.keep"),
+                t(cx, "dbwork.draft.discard"),
+                window,
+                cx,
+                move |window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        if staged.iter().any(|table| table.read(cx).writing()) {
+                            return;
+                        }
+                        for table in &staged {
+                            table.update(cx, |table, cx| table.discard_staged(cx));
+                        }
+                        this.close_names(&names, window, cx);
+                    });
+                },
+            );
+            return;
+        }
+
         let pending = names
             .iter()
             .filter_map(|name| self.table_panels.get(name))
@@ -1156,6 +1394,40 @@ impl Workspace {
                         }
                         if pending.iter().any(|table| table.read(cx).mongo_unsaved()) {
                             return;
+                        }
+                        this.close_names(&names, window, cx);
+                    });
+                },
+            );
+            return;
+        }
+        if names
+            .iter()
+            .filter_map(|n| self.permission_panels.get(n))
+            .any(|p| p.read(cx).running())
+        {
+            return;
+        }
+        let pending_permissions = names
+            .iter()
+            .filter_map(|n| self.permission_panels.get(n))
+            .filter(|p| p.read(cx).dirty())
+            .cloned()
+            .collect::<Vec<_>>();
+        if !pending_permissions.is_empty() {
+            let owner = cx.entity().downgrade();
+            let names = names.to_vec();
+            crate::feedback::confirm_labels(
+                t(cx, "accounts.permissions"),
+                t(cx, "accounts.workbench.discard"),
+                t(cx, "dbwork.draft.keep"),
+                t(cx, "dbwork.draft.discard"),
+                window,
+                cx,
+                move |window, cx| {
+                    let _ = owner.update(cx, |this, cx| {
+                        for p in &pending_permissions {
+                            p.update(cx, |p, cx| p.discard(cx));
                         }
                         this.close_names(&names, window, cx);
                     });
@@ -1248,25 +1520,11 @@ impl Workspace {
             if crate::tabs::is_fixed(name) {
                 continue;
             }
-            let Some(panel) = self
-                .note_panels
-                .get(name)
-                .map(|p| Arc::new(p.clone()) as Arc<dyn PanelView>)
-                .or_else(|| {
-                    self.table_panels
-                        .get(name)
-                        .map(|p| Arc::new(p.clone()) as Arc<dyn PanelView>)
-                })
-                .or_else(|| {
-                    self.panels
-                        .iter()
-                        .find(|p| p.panel_name(cx) == name.as_str())
-                        .cloned()
-                })
-            else {
+            let Some(panel) = self.panel_for(name, cx) else {
                 continue;
             };
             if self.center_order.contains(name) {
+                self.activate_center(name, cx);
                 self.center_tabs
                     .update(cx, |tabs, cx| tabs.remove_panel(panel, window, cx));
             } else if self.right_order.contains(name) {
@@ -1275,6 +1533,17 @@ impl Workspace {
             }
         }
         for name in names {
+            if let Some(view) = self.note_views.remove(name) {
+                view.read(cx)
+                    .owner
+                    .clone()
+                    .update(cx, |note, cx| note.remove_view(name, cx));
+            }
+            self.restored_note_views
+                .retain(|(key, owner)| key != name && owner != name);
+            self.permission_panels.remove(name);
+            self.table_panels.remove(name);
+            self.table_drafts.remove(name);
             if self.note_panels.remove(name).is_some() {
                 self.notes.update(cx, |notes, cx| notes.close(name, cx));
             }
@@ -1289,9 +1558,12 @@ impl Workspace {
         {
             self.restore_visibility(states, window, cx);
         }
-        if self.center_order.is_empty() {
-            self.rebuild_tabs(true, window, cx);
-        }
+        self.center_groups
+            .iter_mut()
+            .for_each(|group| group.retain(|name| !names.contains(name)));
+        self.center_groups.retain(|group| !group.is_empty());
+        self.restored_center = self.center_groups.clone();
+        self.rebuild_tabs(true, window, cx);
         if self.right_order.is_empty() {
             self.rebuild_tabs(false, window, cx);
         }
@@ -1399,6 +1671,8 @@ impl Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.restore_pending_tables(window, cx);
+        self.sync_open_notes(cx);
         let dialogs = Root::render_dialog_layer(window, cx);
         let notifications = Root::render_notification_layer(window, cx);
         let [left, bottom, right] = self.visibility(cx);
@@ -1416,11 +1690,6 @@ impl Render for Workspace {
             .border_r_1()
             .border_color(cx.theme().border)
             .child(
-                icon_button("project", IconName::BookOpen, "notes.title", cx)
-                    .selected(left && !self.connections)
-                    .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
-            )
-            .child(
                 icon_button(
                     "connections",
                     Icon::default().path("icons/database.svg"),
@@ -1429,6 +1698,11 @@ impl Render for Workspace {
                 )
                 .selected(left && self.connections)
                 .on_click(cx.listener(|this, _, window, cx| this.navigate(true, window, cx))),
+            )
+            .child(
+                icon_button("project", IconName::BookOpen, "notes.title", cx)
+                    .selected(left && !self.connections)
+                    .on_click(cx.listener(|this, _, window, cx| this.navigate(false, window, cx))),
             )
             .child(div().flex_1())
             .child(

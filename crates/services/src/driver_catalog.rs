@@ -196,7 +196,8 @@ impl DriverSpec {
 }
 impl Profile {
     pub fn supports_mutation(&self) -> bool {
-        self.kind != DatabaseKind::External
+        !self.mysql_raw_gbk
+            && self.kind != DatabaseKind::External
             && self.driver_id != "doris"
             && (self.kind != DatabaseKind::Sqlite || !self.sqlite_read_only)
     }
@@ -223,6 +224,71 @@ pub(crate) fn check_operation(p: &Profile, op: &crate::database::Operation) -> R
         notebook_query::{GridAction, command_required},
         workbench::Action,
     };
+    if p.mysql_raw_gbk {
+        let read = match &op.kind {
+            OperationKind::Databases
+            | OperationKind::Objects { .. }
+            | OperationKind::Details { .. } => true,
+            OperationKind::Workbench(r) => match &r.action {
+                Action::AccountGrants { .. }
+                | Action::AccountMode
+                | Action::AccountPermissions { .. }
+                | Action::Accounts { .. }
+                | Action::BrowseCatalog { .. }
+                | Action::BrowseColumns(_)
+                | Action::BrowseSection { .. }
+                | Action::Catalog
+                | Action::Describe(_)
+                | Action::Ddl(_)
+                | Action::NoteColumns(_)
+                | Action::GridPage { .. }
+                | Action::Page { .. }
+                | Action::Count { .. }
+                | Action::NoteExplain { .. } => true,
+                Action::NotePrepare { sql } => command_required(DatabaseKind::MySql, sql)
+                    .is_some_and(|k| {
+                        matches!(
+                            k,
+                            "select"
+                                | "explain"
+                                | "show_create"
+                                | "show_columns"
+                                | "show_tables"
+                                | "show_databases"
+                                | "show_status"
+                                | "show_variables"
+                        )
+                    }),
+                Action::NoteExecute { plan, .. } => {
+                    plan.read_only
+                        && command_required(DatabaseKind::MySql, &plan.sql).is_some_and(|k| {
+                            matches!(
+                                k,
+                                "select"
+                                    | "explain"
+                                    | "show_create"
+                                    | "show_columns"
+                                    | "show_tables"
+                                    | "show_databases"
+                                    | "show_status"
+                                    | "show_variables"
+                            )
+                        })
+                }
+                Action::NoteGrid { plan, action, .. } => {
+                    plan.read_only
+                        && matches!(action, GridAction::Page { .. } | GridAction::Count { .. })
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        return if read {
+            Ok(())
+        } else {
+            Err("mysql.gbk.read_only".into())
+        };
+    }
     if p.driver_id != "doris" {
         return Ok(());
     }
@@ -231,7 +297,14 @@ pub(crate) fn check_operation(p: &Profile, op: &crate::database::Operation) -> R
         | OperationKind::Objects { .. }
         | OperationKind::Details { .. } => true,
         OperationKind::Workbench(request) => match &request.action {
-            Action::Catalog
+            Action::AccountGrants { .. }
+            | Action::AccountMode
+            | Action::AccountPermissions { .. }
+            | Action::Accounts { .. }
+            | Action::BrowseCatalog { .. }
+            | Action::BrowseColumns(_)
+            | Action::BrowseSection { .. }
+            | Action::Catalog
             | Action::Describe(_)
             | Action::Ddl(_)
             | Action::NoteColumns(_)

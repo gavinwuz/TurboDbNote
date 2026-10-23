@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use uuid::Uuid;
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
+pub const MAX_SCRIPT_TEXT_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Note {
@@ -15,7 +16,19 @@ pub struct Note {
     pub default_connection_id: Option<Uuid>,
     #[serde(default)]
     pub default_database: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_query: Option<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_query_origin: Option<TableQueryOrigin>,
     pub cells: Vec<Cell>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TableQueryOrigin {
+    pub connection: Uuid,
+    pub database: String,
+    pub schema: String,
+    pub table: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -29,6 +42,11 @@ pub struct Cell {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CellContent {
     Sql {
+        source: String,
+        connection_id: Option<Uuid>,
+        database: Option<String>,
+    },
+    SqlScriptText {
         source: String,
         connection_id: Option<Uuid>,
         database: Option<String>,
@@ -51,6 +69,12 @@ pub enum CellContent {
         linked_cells: Vec<Uuid>,
         connection_id: Option<Uuid>,
     },
+}
+
+impl CellContent {
+    pub fn is_editable_sql(&self) -> bool {
+        matches!(self, Self::Sql { .. } | Self::SqlScriptText { .. })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -155,6 +179,8 @@ pub enum NoteError {
     InvalidTask,
     #[error("SQL 脚本引用无效")]
     InvalidScript,
+    #[error("可编辑 SQL 脚本超过 1 MiB 上限，请拆分或导入为脚本附件")]
+    ScriptTextTooLarge,
 }
 
 impl Note {
@@ -166,6 +192,8 @@ impl Note {
             project: String::new(),
             default_connection_id: None,
             default_database: None,
+            table_query: None,
+            table_query_origin: None,
             cells: vec![],
         }
     }
@@ -177,7 +205,7 @@ impl Note {
             schema_version: u32,
         }
         let version: Version = serde_json::from_str(json)?;
-        if ![1, 2, SCHEMA_VERSION].contains(&version.schema_version) {
+        if ![1, 2, 3, SCHEMA_VERSION].contains(&version.schema_version) {
             return Err(NoteError::UnsupportedVersion(version.schema_version));
         }
         let mut note: Self = serde_json::from_str(json)?;
@@ -198,8 +226,30 @@ impl Note {
         if self.title.len() > 1024 || self.project.len() > 1024 {
             return Err(NoteError::MetadataTooLong);
         }
+        if self.table_query.as_ref().is_some_and(|(schema, name)| {
+            schema.len() > 256
+                || name.is_empty()
+                || name.len() > 256
+                || schema.chars().chain(name.chars()).any(char::is_control)
+        }) {
+            return Err(NoteError::MetadataTooLong);
+        }
+        if self.table_query_origin.as_ref().is_some_and(|o| {
+            o.database.is_empty()
+                || o.table.is_empty()
+                || [&o.database, &o.schema, &o.table]
+                    .iter()
+                    .any(|s| s.len() > 256 || s.chars().any(char::is_control))
+        }) {
+            return Err(NoteError::MetadataTooLong);
+        }
         let mut ids = HashSet::new();
         for cell in &self.cells {
+            if let CellContent::SqlScriptText { source, .. } = &cell.content
+                && source.len() > MAX_SCRIPT_TEXT_BYTES
+            {
+                return Err(NoteError::ScriptTextTooLarge);
+            }
             if let CellContent::SqlScript { script, .. } = &cell.content
                 && !script.valid()
             {
@@ -282,7 +332,7 @@ impl Cell {
                 connection_id,
                 database,
                 ..
-            } => CellContent::Sql {
+            } => CellContent::SqlScriptText {
                 source: String::new(),
                 connection_id: *connection_id,
                 database: database.clone(),
@@ -292,6 +342,15 @@ impl Cell {
                 database,
                 ..
             } => CellContent::Sql {
+                source: String::new(),
+                connection_id: *connection_id,
+                database: database.clone(),
+            },
+            CellContent::SqlScriptText {
+                connection_id,
+                database,
+                ..
+            } => CellContent::SqlScriptText {
                 source: String::new(),
                 connection_id: *connection_id,
                 database: database.clone(),
@@ -323,6 +382,32 @@ impl Cell {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn single_query_origin_survives_save_and_older_notes_remain_ordinary() {
+        let mut note = Note::new("table");
+        note.table_query = Some(("public".into(), "items".into()));
+        note.cells.push(Cell::new(
+            "",
+            CellContent::Sql {
+                source: "SELECT * FROM items;".into(),
+                connection_id: None,
+                database: None,
+            },
+        ));
+        let saved = note.to_json().unwrap();
+        let loaded = Note::from_json(&saved).unwrap();
+        assert_eq!(loaded, note);
+        let mut old: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        old.as_object_mut().unwrap().remove("table_query");
+        assert!(
+            Note::from_json(&old.to_string())
+                .unwrap()
+                .table_query
+                .is_none()
+        );
+        note.table_query = Some(("public".into(), "bad\0name".into()));
+        assert!(note.to_json().is_err());
+    }
     #[test]
     fn script_references_roundtrip_without_source_and_legacy_v2_migrates() {
         let mut note = Note::new("script");
@@ -358,7 +443,7 @@ mod tests {
         let legacy = note
             .to_json()
             .unwrap()
-            .replace("\"schema_version\": 3", "\"schema_version\": 2");
+            .replace("\"schema_version\": 4", "\"schema_version\": 2");
         assert_eq!(
             Note::from_json(&legacy).unwrap().schema_version,
             SCHEMA_VERSION
@@ -468,6 +553,67 @@ mod tests {
         }
     }
     #[test]
+    fn editable_scripts_roundtrip_preserve_scope_and_remain_distinct_from_queries() {
+        let connection = Uuid::new_v4();
+        let mut note = Note::new("script");
+        note.cells.push(Cell::new(
+            "",
+            CellContent::SqlScriptText {
+                source: "SELECT 1; SELECT 2;".into(),
+                connection_id: Some(connection),
+                database: Some("db".into()),
+            },
+        ));
+        let text = note.to_json().unwrap();
+        let loaded = Note::from_json(&text).unwrap();
+        assert_eq!(loaded, note);
+        let sibling = loaded.cells[0].empty_sibling();
+        assert!(
+            matches!(sibling.content,CellContent::SqlScriptText{source,connection_id:Some(id),database:Some(db)} if source.is_empty()&&id==connection&&db=="db")
+        );
+        assert!(!text.contains("results"));
+        assert!(!text.contains("authorized"));
+        let mut future: serde_json::Value = serde_json::from_str(&text).unwrap();
+        future["schema_version"] = serde_json::json!(SCHEMA_VERSION + 1);
+        assert!(matches!(
+            Note::from_json(&future.to_string()),
+            Err(NoteError::UnsupportedVersion(_))
+        ));
+    }
+    #[test]
+    fn legacy_v3_queries_are_not_promoted_to_scripts() {
+        let mut note = Note::new("old");
+        note.cells.push(Cell::new(
+            "",
+            CellContent::Sql {
+                source: "SELECT 1; SELECT 2;".into(),
+                connection_id: None,
+                database: None,
+            },
+        ));
+        let mut value = serde_json::to_value(&note).unwrap();
+        value["schema_version"] = serde_json::json!(3);
+        let loaded = Note::from_json(&value.to_string()).unwrap();
+        assert_eq!(loaded.schema_version, SCHEMA_VERSION);
+        assert!(matches!(loaded.cells[0].content, CellContent::Sql { .. }));
+    }
+    #[test]
+    fn editable_script_byte_limit_does_not_constrain_imported_descriptors() {
+        let mut note = Note::new("limit");
+        note.cells.push(Cell::new(
+            "",
+            CellContent::SqlScriptText {
+                source: "x".repeat(MAX_SCRIPT_TEXT_BYTES + 1),
+                connection_id: None,
+                database: None,
+            },
+        ));
+        assert!(matches!(
+            note.validate(),
+            Err(NoteError::ScriptTextTooLarge)
+        ));
+    }
+    #[test]
     fn all_cell_types_round_trip_without_runtime_data() {
         let note = Note::welcome();
         let json = note.to_json().unwrap();
@@ -506,5 +652,47 @@ mod tests {
         let mut note = Note::welcome();
         note.cells.push(note.cells[0].clone());
         assert!(matches!(note.to_json(), Err(NoteError::DuplicateCell(_))));
+    }
+}
+
+#[cfg(test)]
+mod query_origin_tests {
+    use super::*;
+    #[test]
+    fn query_origin_survives_edited_sql_and_default_scope_and_is_optional_for_old_notes() {
+        let mut note = Note::new("items");
+        let origin = TableQueryOrigin {
+            connection: Uuid::new_v4(),
+            database: "main".into(),
+            schema: String::new(),
+            table: "items".into(),
+        };
+        note.table_query = Some((String::new(), "items".into()));
+        note.table_query_origin = Some(origin.clone());
+        note.default_connection_id = Some(Uuid::new_v4());
+        note.default_database = Some("other".into());
+        note.cells.push(Cell::new(
+            "",
+            CellContent::Sql {
+                source: "SELECT * FROM items WHERE id>1".into(),
+                connection_id: None,
+                database: None,
+            },
+        ));
+        let encoded = note.to_json().unwrap();
+        assert_eq!(
+            Note::from_json(&encoded).unwrap().table_query_origin,
+            Some(origin)
+        );
+        let mut old: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        old.as_object_mut().unwrap().remove("table_query_origin");
+        assert!(
+            Note::from_json(&old.to_string())
+                .unwrap()
+                .table_query_origin
+                .is_none()
+        );
+        note.table_query_origin.as_mut().unwrap().table = "bad\0name".into();
+        assert!(note.to_json().is_err());
     }
 }

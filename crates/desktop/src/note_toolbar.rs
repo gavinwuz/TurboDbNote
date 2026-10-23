@@ -46,9 +46,10 @@ pub(super) fn valid_name(name: &str) -> bool {
                 | "LPT9"
         )
 }
-pub(super) fn cell_types() -> [(usize, &'static str); 3] {
+pub(super) fn cell_types() -> [(usize, &'static str); 4] {
     [
         (0, "notes.add_sql"),
+        (3, "notes.add_sql_file"),
         (1, "notes.add_markdown"),
         (2, "notes.add_task"),
     ]
@@ -94,7 +95,14 @@ impl NoteView {
         self.active_queries(cx) || self.cells.iter().any(|c| c.read(cx).result_pending(cx))
     }
     pub(super) fn add_cell(&mut self, kind: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.single_sql() {
+            return;
+        }
         if self.batch.is_some() || self.cells.len() >= note_store::MAX_CELLS {
+            return;
+        }
+        if kind == 3 {
+            self.import_sql(window, cx);
             return;
         }
         let content = match kind {
@@ -126,14 +134,42 @@ impl NoteView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         div()
-            .h_flex()
-            .gap_1()
-            .min_h(px(32.))
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(self.toolbar_actions(cx))
-            .child(self.toolbar_scope(window, cx))
-            .child(self.access_control(cx))
+            .id("note-file-toolbar")
+            .w_full()
+            .min_w_0()
+            .h(px(36.))
+            .flex_shrink_0()
+            .relative()
+            .overflow_x_scroll()
+            .track_scroll(&self.toolbar_scroll)
+            .map(|mut bar| {
+                bar.style().restrict_scroll_to_axis = Some(true);
+                bar
+            })
+            .child(
+                div()
+                    .h_flex()
+                    .gap_1()
+                    .items_center()
+                    .h(px(28.))
+                    .w_full()
+                    .min_w(px(700.))
+                    .child(self.toolbar_actions(cx))
+                    .child(self.toolbar_scope(window, cx))
+                    .child(self.access_control(cx)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(8.))
+                    .child(
+                        Scrollbar::horizontal(&self.toolbar_scroll)
+                            .scrollbar_show(ScrollbarShow::Always),
+                    ),
+            )
             .into_any_element()
     }
     fn access_control(&self, cx: &Context<Self>) -> AnyElement {
@@ -195,7 +231,11 @@ impl NoteView {
                     )
                     .dropdown_caret(true)
                     .tooltip(t(cx, "notes.new_cell"))
-                    .disabled(self.batch.is_some() || self.cells.len() >= note_store::MAX_CELLS)
+                    .disabled(
+                        self.single_sql()
+                            || self.batch.is_some()
+                            || self.cells.len() >= note_store::MAX_CELLS,
+                    )
                     .dropdown_menu(move |mut menu, _, _| {
                         for (kind, key) in cell_types() {
                             let view = view.clone();
@@ -263,7 +303,8 @@ impl NoteView {
                     )
                     .tooltip(t(cx, "script.import"))
                     .disabled(
-                        active
+                        self.single_sql()
+                            || active
                             || self.picking
                             || self.saving
                             || self.cells.len() >= note_store::MAX_CELLS,
@@ -315,6 +356,9 @@ impl NoteView {
         if !value.is_empty() {
             names.push(value.clone());
         }
+        if let Some(id) = self.note.default_connection_id {
+            names.retain(|name| self.connections.read(cx).note_database_visible(id, name));
+        }
         names.sort();
         names.dedup();
         names.truncate(2000);
@@ -346,16 +390,21 @@ impl NoteView {
             .flex_1()
             .min_w_0()
             .gap_1()
-            .flex_wrap()
             .child(
                 Button::new("note-default-connection")
                     .small()
                     .ghost()
                     .w(px(150.))
+                    .min_w(px(150.))
+                    .flex_shrink_0()
                     .justify_start()
                     .child(
                         selected
-                            .map(crate::connection_choice::identity)
+                            .map(|p| {
+                                crate::connection_choice::identity(p)
+                                    .max_w(px(110.))
+                                    .overflow_hidden()
+                            })
                             .unwrap_or_else(|| div().truncate().child(connection)),
                     )
                     .tooltip(t(cx, "notes.default_hint"))
@@ -403,14 +452,16 @@ impl NoteView {
                 div()
                     .text_sm()
                     .text_color(cx.theme().muted_foreground)
+                    .max_w(px(180.))
+                    .truncate()
                     .child(sqlite_name)
                     .into_any_element()
             } else {
                 Input::new(&self.default_database)
                     .small()
-                    .w(px(220.))
-                    .min_w(px(96.))
-                    .flex_1()
+                    .w(px(180.))
+                    .min_w(px(180.))
+                    .flex_shrink_0()
                     .cleanable(!self.defaults_locked(cx))
                     .disabled(self.defaults_locked(cx))
                     .suffix(
@@ -584,7 +635,7 @@ impl NoteView {
                 })
         });
     }
-    pub(super) fn render_tab(&self, cx: &Context<Self>) -> AnyElement {
+    pub(super) fn render_tab_for(&self, view_key: &str, cx: &Context<Self>) -> AnyElement {
         let status = if !self.error.is_empty() {
             self.error.clone()
         } else {
@@ -605,6 +656,7 @@ impl NoteView {
         } else {
             self.note.project.clone()
         };
+        let (_, _, connection, _) = self.search_identity(cx);
         let info = crate::locale::tr(
             cx,
             "notes.tab_info",
@@ -612,6 +664,14 @@ impl NoteView {
                 ("title", self.display_title(cx).as_ref()),
                 ("status", &status),
                 ("project", &project),
+                (
+                    "connection",
+                    if connection.is_empty() {
+                        "—"
+                    } else {
+                        &connection
+                    },
+                ),
                 ("path", &compact_path(&self.path.display().to_string())),
             ],
         );
@@ -622,58 +682,61 @@ impl NoteView {
         } else {
             cx.theme().success
         };
-        let name = self.key.clone();
+        let name = view_key.to_owned();
         let close = name.clone();
         let view = cx.entity().downgrade();
-        div()
-            .id(SharedString::from(format!("tab-title-{name}")))
-            .h_flex()
-            .gap_2()
-            .child(crate::assets::note_icon(2, cx))
-            .child(
+        crate::tabs::draggable(
+            name.clone(),
+            self.display_title(cx),
+            div().id(SharedString::from(format!("tab-title-{name}"))),
+        )
+        .h_flex()
+        .gap_2()
+        .child(crate::assets::note_icon(2, cx))
+        .child(
+            div()
+                .max_w(px(220.))
+                .overflow_hidden()
+                .text_ellipsis()
+                .whitespace_nowrap()
+                .child(self.display_title(cx)),
+        )
+        .child(div().size(px(7.)).rounded_full().bg(color))
+        .tooltip(move |window, cx| {
+            let info = info.clone();
+            gpui_component::tooltip::Tooltip::element(move |_, _| {
                 div()
-                    .max_w(px(220.))
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .whitespace_nowrap()
-                    .child(self.display_title(cx)),
-            )
-            .child(div().size(px(7.)).rounded_full().bg(color))
-            .tooltip(move |window, cx| {
-                let info = info.clone();
-                gpui_component::tooltip::Tooltip::element(move |_, _| {
-                    div()
-                        .v_flex()
-                        .max_w(px(520.))
-                        .children(info.lines().map(|line| {
-                            div()
-                                .max_w(px(520.))
-                                .overflow_hidden()
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .child(line.to_owned())
-                        }))
-                })
-                .build(window, cx)
+                    .v_flex()
+                    .max_w(px(520.))
+                    .children(info.lines().map(|line| {
+                        div()
+                            .max_w(px(520.))
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .child(line.to_owned())
+                    }))
             })
-            .child(
-                Button::new(SharedString::from(format!("tab-close-{name}")))
-                    .ghost()
-                    .icon(IconName::Close)
-                    .tooltip(t(cx, "common.action.close"))
-                    .on_click(move |_, _, cx| {
-                        cx.stop_propagation();
-                        crate::tabs::send(close.clone(), crate::tabs::CloseMode::Current, cx);
-                    }),
+            .build(window, cx)
+        })
+        .child(
+            Button::new(SharedString::from(format!("tab-close-{name}")))
+                .ghost()
+                .icon(IconName::Close)
+                .tooltip(t(cx, "common.action.close"))
+                .on_click(move |_, _, cx| {
+                    cx.stop_propagation();
+                    crate::tabs::send(close.clone(), crate::tabs::CloseMode::Current, cx);
+                }),
+        )
+        .context_menu(move |menu, _, cx| {
+            crate::tabs::close_menu(
+                Self::file_menu(menu, view.clone(), cx).separator(),
+                name.clone(),
+                cx,
             )
-            .context_menu(move |menu, _, cx| {
-                crate::tabs::close_menu(
-                    Self::file_menu(menu, view.clone(), cx).separator(),
-                    name.clone(),
-                    cx,
-                )
-            })
-            .into_any_element()
+        })
+        .into_any_element()
     }
 }
 

@@ -16,6 +16,9 @@ pub(super) struct NotebookContext {
     confirmed: bool,
     pub source: GridSource,
     pub stale: bool,
+    pub page_only: bool,
+    pub compact: bool,
+    show_details: bool,
     ticket: Option<Uuid>,
     started: std::time::Instant,
     session: Option<Session>,
@@ -23,6 +26,94 @@ pub(super) struct NotebookContext {
 }
 impl EventEmitter<crate::note_permissions::Advice> for TableView {}
 impl TableView {
+    pub(super) fn render_note_status(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let note = self.notebook.as_ref()?;
+        if note.compact {
+            return None;
+        }
+        let hint = t(
+            cx,
+            if note.page_only {
+                "notes.multi.session_result"
+            } else if note.stale {
+                "notes.results_stale"
+            } else if self.target.writable {
+                "notes.result_editable"
+            } else {
+                "notes.result_readonly"
+            },
+        );
+        let status = if note.stale || note.page_only {
+            hint.clone()
+        } else {
+            crate::locale::tr(
+                cx,
+                "notes.results.complete",
+                &[
+                    ("count", "1"),
+                    ("elapsed", &crate::duration::elapsed(self.elapsed_ms)),
+                ],
+            )
+        };
+        Some(
+            div()
+                .v_flex()
+                .gap_1()
+                .min_w_0()
+                .child(
+                    div()
+                        .h_flex()
+                        .items_center()
+                        .gap_2()
+                        .min_w_0()
+                        .text_sm()
+                        .child(gpui_component::Icon::new(if note.stale {
+                            IconName::Info
+                        } else {
+                            IconName::Check
+                        }))
+                        .child(div().flex_1().min_w_0().truncate().child(status))
+                        .child(
+                            Button::new("note-single-result-info")
+                                .ghost()
+                                .small()
+                                .icon(
+                                    gpui_component::Icon::default()
+                                        .path("icons/ai-permissions.svg"),
+                                )
+                                .tooltip(hint),
+                        )
+                        .child(
+                            Button::new("note-single-result-details")
+                                .ghost()
+                                .small()
+                                .icon(if note.show_details {
+                                    IconName::ChevronUp
+                                } else {
+                                    IconName::ChevronDown
+                                })
+                                .label(t(cx, "notes.results.details"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(note) = &mut this.notebook {
+                                        note.show_details = !note.show_details;
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .when(note.show_details, |body| {
+                    body.child(
+                        div()
+                            .id("note-single-frozen-sql")
+                            .max_h(px(80.))
+                            .overflow_y_scroll()
+                            .text_xs()
+                            .child(note.plan.sql.clone()),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
     pub(crate) fn set_note_access_mode(
         &mut self,
         mode: turbodbn_services::access_mode::AccessMode,
@@ -69,6 +160,7 @@ impl TableView {
             generation: saved.generation,
             kind: saved.profile.kind,
             writable: false,
+            mysql_raw_gbk: saved.profile.mysql_raw_gbk,
         };
         let mut this = Self::create(
             format!("note-result-{}", Uuid::new_v4()),
@@ -86,6 +178,9 @@ impl TableView {
             confirmed,
             source: meta.clone(),
             stale: false,
+            page_only: false,
+            compact: false,
+            show_details: false,
             ticket: None,
             started: std::time::Instant::now(),
             session: None,
@@ -123,10 +218,26 @@ impl TableView {
             .as_ref()
             .is_none_or(|note| !note.stale && note.source.object.is_some())
     }
-    pub(crate) fn stale_result(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn compact_note_result(&mut self) {
         if let Some(note) = &mut self.notebook {
+            note.compact = true;
+        }
+    }
+    pub(crate) fn freeze_note_page(&mut self, cx: &mut Context<Self>) {
+        if let Some(note) = &mut self.notebook {
+            note.page_only = true;
             note.stale = true;
         }
+        self.sync_grid(cx);
+    }
+    pub(crate) fn stale_result(&mut self, cx: &mut Context<Self>) {
+        let Some(note) = &mut self.notebook else {
+            return;
+        };
+        if note.stale {
+            return;
+        }
+        note.stale = true;
         self.sync_grid(cx);
     }
     pub(crate) fn cancel_result(&mut self, discard: bool, cx: &mut Context<Self>) {

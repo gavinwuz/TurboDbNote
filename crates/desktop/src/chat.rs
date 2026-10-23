@@ -4,6 +4,8 @@ mod authorization;
 mod markup;
 #[path = "chat_mcp.rs"]
 mod mcp_ui;
+#[path = "codex_setup.rs"]
+mod setup_ui;
 #[path = "chat_sql.rs"]
 mod sql_draft;
 use crate::chat_history::{HistoryWriter, LastChat, SavedMessage};
@@ -401,6 +403,7 @@ struct EngineDraft {
 }
 
 pub struct ChatView {
+    setup: Option<Entity<setup_ui::Setup>>,
     sql_access: authorization::AccessMode,
     access_scope: Option<crate::feedback::SqlScope>,
     access_generation: usize,
@@ -539,6 +542,9 @@ impl ChatView {
                 scope: self.sql_scope.clone(),
             },
         );
+        if let Some(setup) = self.setup.take() {
+            setup.update(cx, |setup, cx| setup.cancel(cx));
+        }
         self.disconnect(cx);
         self.discovery_task = None;
         self.detecting = false;
@@ -827,6 +833,7 @@ impl ChatView {
             access_scope: None,
             access_generation: 0,
             access_connection_generation: None,
+            setup: None,
             sql_reviews: vec![],
             sql_scope: None,
             databases: None,
@@ -946,9 +953,25 @@ impl ChatView {
         let before = self.path.read(cx).value().to_string();
         let engine = self.engine;
         let generation = self.generation;
+        let managed = Preferences::path()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.join("agents/codex")));
         let scan = cx.background_executor().spawn(async move {
             match engine {
-                Engine::Codex => codex_discovery::discover(),
+                Engine::Codex => {
+                    let mut candidates = codex_discovery::discover();
+                    if let Some(root) = managed
+                        && let Ok(path) = turbodbn_services::codex_install::managed_path(&root)
+                        && path.is_file()
+                        && let Ok(mut candidate) =
+                            turbodbn_services::codex_install::verify_executable(&path)
+                        && !candidates.iter().any(|c| c.path == candidate.path)
+                    {
+                        candidate.source = "TurboDBNote".into();
+                        candidates.insert(0, candidate);
+                    }
+                    candidates
+                }
                 Engine::Claude => codex_discovery::discover_claude(),
             }
         });
@@ -1017,48 +1040,84 @@ impl ChatView {
         }
     }
     fn browse_codex(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let selection = cx.prompt_for_paths(PathPromptOptions {
+        let engine = self.engine;
+        let generation = self.generation;
+        let before = self.path.read(cx).value().to_string();
+        let selected = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some(
-                crate::locale::tr(
-                    cx,
-                    "agents.executable.browse_title",
-                    &[("executable", self.engine.executable_name())],
-                )
-                .to_string()
-                .into(),
-            ),
+            prompt: Some(crate::locale::tr(
+                cx,
+                "agents.executable.browse_title",
+                &[("executable", engine.executable_name())],
+            )),
         });
         cx.spawn_in(window, async move |view, cx| {
-            let result = selection.await;
+            let path = match selected.await {
+                Ok(Ok(Some(paths))) => paths.into_iter().next(),
+                Ok(Ok(None)) => None,
+                _ => {
+                    let _ = view.update(cx, |_, cx| {
+                        crate::feedback::error(crate::locale::t(cx, "agents.error.browse"), cx)
+                    });
+                    return;
+                }
+            };
+            let Some(path) = path else {
+                return;
+            };
+            let probe = cx.background_executor().spawn(async move {
+                if engine == Engine::Codex {
+                    turbodbn_services::codex_install::verify_executable(&path)
+                        .map(|c| (c.path.clone(), Some(c)))
+                } else if cfg!(windows)
+                    && !path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                {
+                    Err("agents.error.executable_type".into())
+                } else {
+                    Ok((path, None))
+                }
+            });
+            let result = probe.await;
             let _ = cx.update(|window, cx| {
-                let _ = view.update(cx, |this, cx| {
-                    if this.connection.is_some() {
+                view.update(cx, |this, cx| {
+                    if this.engine != engine
+                        || this.generation != generation
+                        || this.path.read(cx).value().as_ref() != before
+                        || this.connection.is_some()
+                    {
                         return;
                     }
                     match result {
-                        Ok(Ok(Some(paths))) => {
-                            if let Some(path) = paths.first() {
-                                if cfg!(windows)
-                                    && !path
-                                        .extension()
-                                        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-                                {
-                                    this.discovery_status = "agents.error.executable_type".into();
-                                } else {
-                                    this.path.update(cx, |input, cx| {
-                                        input.set_value(path.display().to_string(), window, cx)
-                                    });
-                                }
+                        Ok((path, candidate)) => {
+                            this.automatic.suppress(engine);
+                            this.path.update(cx, |input, cx| {
+                                input.set_value(path.display().to_string(), window, cx)
+                            });
+                            if let Some(candidate) = candidate {
+                                this.discovery_status = crate::locale::tr(
+                                    cx,
+                                    "agents.discovery.found",
+                                    &[
+                                        ("source", &candidate.source),
+                                        ("version", &candidate.version),
+                                    ],
+                                )
+                                .to_string();
+                                this.candidates.retain(|c| c.path != candidate.path);
+                                this.candidates.insert(0, candidate);
                             }
                         }
-                        Ok(Ok(None)) => {}
-                        _ => this.discovery_status = "agents.error.browse".into(),
+                        Err(error) => {
+                            this.discovery_status = error.clone();
+                            crate::feedback::error(crate::locale::message(cx, &error), cx);
+                        }
                     }
                     cx.notify();
-                });
+                })
             });
         })
         .detach();
@@ -1086,6 +1145,15 @@ impl ChatView {
         cx.notify();
     }
     fn connect(&mut self, cx: &mut Context<Self>) {
+        if self.engine == Engine::Codex
+            && self
+                .setup
+                .as_ref()
+                .is_some_and(|setup| setup.read(cx).busy())
+        {
+            crate::feedback::error(crate::locale::t(cx, "agents.setup.busy"), cx);
+            return;
+        }
         self.discovery_task = None;
         self.detecting = false;
         self.disconnect(cx);
@@ -1198,6 +1266,7 @@ impl ChatView {
                     cx,
                 );
             }
+            Event::Login { .. } | Event::LoginFinished { .. } => {}
             Event::Account { ready, label } => {
                 self.ready = ready;
                 self.account_status = if ready { label.clone() } else { String::new() };
@@ -2006,7 +2075,17 @@ impl ChatView {
             .into_any_element()
     }
     pub fn render_ai_settings(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.engine == Engine::Codex && self.setup.is_none() {
+            let owner = cx.entity().downgrade();
+            let path = self.path.clone();
+            let log = self.log.clone();
+            self.setup = Some(cx.new(|cx| setup_ui::Setup::new(owner, path, log, cx)));
+        }
         let candidates = self.candidates.clone();
+        let setup_busy = self
+            .setup
+            .as_ref()
+            .is_some_and(|setup| setup.read(cx).busy());
         let view = cx.entity().downgrade();
         div()
             .v_flex()
@@ -2050,6 +2129,10 @@ impl ChatView {
                     .text_size(rems(crate::typography::META))
                     .text_color(cx.theme().muted_foreground)
                     .child(crate::locale::t(cx, "agents.isolation.description")),
+            )
+            .when_some(
+                self.setup.clone().filter(|_| self.engine == Engine::Codex),
+                |el, setup| el.child(setup),
             )
             .child(crate::locale::t(cx, "agents.executable.label"))
             .child(
@@ -2156,7 +2239,9 @@ impl ChatView {
                             .icon(IconName::Bot)
                             .primary()
                             .label(crate::locale::t(cx, "agents.action.connect"))
-                            .disabled(self.saving || self.busy || self.connection.is_some())
+                            .disabled(
+                                self.saving || self.busy || self.connection.is_some() || setup_busy,
+                            )
                             .on_click(cx.listener(|this, _, _, cx| this.save_settings(true, cx))),
                     )
                     .when(self.connection.is_some(), |el| {

@@ -153,6 +153,10 @@ impl Focusable for WorkbenchPanel {
     }
 }
 impl Panel for WorkbenchPanel {
+    fn toolbar_buttons(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Option<Vec<Button>> {
+        (self.name == "notebook").then(|| crate::tabs::new_note_button(self.name, cx))
+    }
+
     fn panel_name(&self) -> &'static str {
         self.name
     }
@@ -168,11 +172,15 @@ impl Panel for WorkbenchPanel {
     fn dropdown_menu(
         &mut self,
         menu: gpui_component::menu::PopupMenu,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_component::menu::PopupMenu {
         if self.name == "notebook" {
-            crate::tabs::editor_menu(menu, self.name, cx)
+            crate::tabs::editor_menu(
+                crate::tabs::opened_notes(menu, self.name, window, cx).separator(),
+                self.name,
+                cx,
+            )
         } else if let PanelContent::Databases(view) = &self.content {
             view.update(cx, |this, cx| this.navigation_menu(menu, cx))
         } else {

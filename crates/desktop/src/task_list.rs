@@ -20,6 +20,7 @@ pub struct Changed;
 pub struct TaskList {
     items: Vec<TaskItem>,
     description: String,
+    undo_batch: Vec<TaskItem>,
     legacy: (TaskStatus, Option<i64>, Option<i64>),
     pub note_name: String,
     _timer: Task<()>,
@@ -45,6 +46,7 @@ impl TaskList {
         Self {
             items,
             description,
+            undo_batch: vec![],
             legacy,
             note_name: String::new(),
             _timer: timer,
@@ -207,6 +209,7 @@ impl TaskList {
             .unwrap_or_else(|| TaskItem::new(""));
         let title = cx.new(|cx| {
             InputState::new(window, cx)
+                .multi_line(id.is_none())
                 .default_value(item.title.clone())
                 .placeholder(t(cx, "tasks.name"))
         });
@@ -261,7 +264,21 @@ impl TaskList {
                     div()
                         .v_flex()
                         .gap_2()
-                        .child(Input::new(&title).cleanable(true))
+                        .child(if id.is_none() {
+                            feedback::editable_multiline(&title, false, cx)
+                                .h(px(110.))
+                                .into_any_element()
+                        } else {
+                            Input::new(&title).cleanable(true).into_any_element()
+                        })
+                        .when(id.is_none(), |form| {
+                            form.child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(t(cx, "tasks.batch_help")),
+                            )
+                        })
                         .child(Input::new(&assignee).cleanable(true))
                         .child(
                             Checkbox::new("task-deadline-enabled")
@@ -333,7 +350,7 @@ impl TaskList {
                                     .on_click(move |_, window, cx| {
                                         let name = field.read(cx).value().trim().to_string();
                                         if name.is_empty()
-                                            || name.len() > 8192
+                                            || (id.is_some() && name.len() > 8192)
                                             || person.read(cx).value().len() > 1024
                                         {
                                             feedback::error(t(cx, "tasks.invalid_name"), cx);
@@ -384,6 +401,44 @@ impl TaskList {
                                         updated.reminder_minutes = due.and(alarm.get());
                                         if updated.reminder_at() != original.reminder_at() {
                                             updated.reminded_at = None;
+                                        }
+                                        if id.is_none() {
+                                            let Some(mut batch) = parse_task_lines(&updated.title)
+                                            else {
+                                                feedback::error(t(cx, "tasks.limit"), cx);
+                                                return;
+                                            };
+                                            for item in &mut batch {
+                                                item.assignee = updated.assignee.clone();
+                                                item.due_at = updated.due_at;
+                                                item.reminder_minutes = updated.reminder_minutes;
+                                            }
+                                            let count = batch.len();
+                                            let added = owner
+                                                .update(cx, |this, cx| {
+                                                    if this.items.len() + count > 1000 {
+                                                        return false;
+                                                    }
+                                                    this.undo_batch = batch.clone();
+                                                    this.items.extend(batch);
+                                                    this.changed(cx);
+                                                    true
+                                                })
+                                                .unwrap_or(false);
+                                            if !added {
+                                                feedback::error(t(cx, "tasks.limit"), cx);
+                                                return;
+                                            }
+                                            feedback::success(
+                                                tr(
+                                                    cx,
+                                                    "tasks.batch_added",
+                                                    &[("count", &count.to_string())],
+                                                ),
+                                                cx,
+                                            );
+                                            window.close_dialog(cx);
+                                            return;
                                         }
                                         let _ = owner.update(cx, |this, cx| {
                                             if let Some(existing) = this
@@ -556,6 +611,35 @@ impl Render for TaskList {
                     .on_click(cx.listener(|this, _, window, cx| this.edit_description(window, cx))),
             );
         }
+        body = body.when(!self.undo_batch.is_empty(), |body| {
+            body.child(
+                Button::new("undo-task-batch")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Undo)
+                    .label(t(cx, "tasks.undo_batch"))
+                    .disabled(
+                        !self
+                            .undo_batch
+                            .iter()
+                            .all(|original| self.items.iter().any(|item| item == original)),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this
+                            .undo_batch
+                            .iter()
+                            .all(|original| this.items.iter().any(|item| item == original))
+                        {
+                            let ids = std::mem::take(&mut this.undo_batch)
+                                .into_iter()
+                                .map(|item| item.id)
+                                .collect::<Vec<_>>();
+                            this.items.retain(|item| !ids.contains(&item.id));
+                            this.changed(cx);
+                        }
+                    })),
+            )
+        });
         body.child(
             Button::new("add-task-item")
                 .ghost()
@@ -564,5 +648,70 @@ impl Render for TaskList {
                 .label(t(cx, "tasks.add"))
                 .on_click(cx.listener(|this, _, window, cx| this.edit(None, window, cx))),
         )
+    }
+}
+
+// Parse only new-task input: editing an existing title never splits it.
+fn parse_task_lines(source: &str) -> Option<Vec<TaskItem>> {
+    if source.len() > 8_192_000 {
+        return None;
+    }
+    let mut items = vec![];
+    for line in source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        if matches!(line, "-" | "*") {
+            continue;
+        }
+        let body = line
+            .strip_prefix("- ")
+            .or_else(|| line.strip_prefix("* "))
+            .unwrap_or(line);
+        if matches!(body, "[ ]" | "[x]" | "[X]") {
+            continue;
+        }
+        let (body, completed) = if let Some(body) = body
+            .strip_prefix("[x] ")
+            .or_else(|| body.strip_prefix("[X] "))
+        {
+            (body, true)
+        } else {
+            (body.strip_prefix("[ ] ").unwrap_or(body), false)
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        if body.len() > 8192 || items.len() >= 1000 {
+            return None;
+        }
+        let mut item = TaskItem::new(body);
+        item.completed = completed;
+        items.push(item);
+    }
+    (!items.is_empty()).then_some(items)
+}
+#[cfg(test)]
+mod batch_tests {
+    use super::parse_task_lines;
+    #[test]
+    fn batch_tasks_preserve_state_duplicates_and_inner_symbols() {
+        let items = parse_task_lines("- aa\r\n* bb\n- [x] cc\n- [ ] aa\n\nplain - text\n").unwrap();
+        assert_eq!(
+            items.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+            ["aa", "bb", "cc", "aa", "plain - text"]
+        );
+        assert!(items[2].completed);
+        assert!(!items[3].completed);
+        assert_ne!(items[0].id, items[3].id);
+        assert!(parse_task_lines(&"a\n".repeat(1001)).is_none());
+        assert!(parse_task_lines(&"a".repeat(8193)).is_none());
+        assert!(parse_task_lines("\n ").is_none());
+        assert_eq!(
+            parse_task_lines("- \n* \n- [ ]\n- [x]\naa").unwrap().len(),
+            1
+        );
     }
 }

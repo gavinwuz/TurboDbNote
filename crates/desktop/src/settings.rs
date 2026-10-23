@@ -18,6 +18,7 @@ pub enum Category {
 }
 pub enum SettingsRequest {
     ToggleAiZoom,
+    ToggleSidebarLayout,
     Open(Option<Category>),
     Close,
     CancelClose,
@@ -100,6 +101,20 @@ impl SettingsView {
     pub fn sync_close_to_tray(&mut self, value: bool, cx: &mut Context<Self>) {
         self.configuration
             .update(cx, |form, cx| form.sync_close_to_tray(value, cx));
+    }
+    pub fn toggle_sidebar_layout(&mut self, cx: &mut Context<Self>) {
+        let layout = cx
+            .global::<crate::preferences::Preferences>()
+            .database
+            .sidebar_layout
+            .toggled();
+        self.configuration
+            .update(cx, |form, cx| form.set_sidebar_layout(layout, cx));
+    }
+    pub fn select_database_layout(&mut self, cx: &mut Context<Self>) {
+        self.category = Category::Database;
+        self.database_tab = 0;
+        cx.notify();
     }
     pub fn select_sql(&mut self, cx: &mut Context<Self>) {
         self.category = Category::Database;
@@ -185,6 +200,14 @@ impl Focusable for SettingsView {
     }
 }
 impl Panel for SettingsView {
+    fn toolbar_buttons(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Vec<gpui_component::button::Button>> {
+        Some(crate::tabs::new_note_button("settings", cx))
+    }
+
     fn panel_name(&self) -> &'static str {
         "settings"
     }

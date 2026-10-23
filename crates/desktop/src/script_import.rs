@@ -34,7 +34,6 @@ pub struct ImportView {
     busy: bool,
     epoch: u64,
     cancel: Arc<AtomicBool>,
-    split: bool,
     task: Option<Task<()>>,
     preview: Vec<sql_script::Entry>,
     output: Option<Entity<crate::chat::AiLog>>,
@@ -67,7 +66,6 @@ impl ImportView {
             busy: false,
             epoch: 0,
             cancel: Arc::new(AtomicBool::new(false)),
-            split: false,
             task: None,
             preview: vec![],
             output,
@@ -103,7 +101,6 @@ impl ImportView {
         let epoch = self.epoch;
         self.dialect = Some(dialect);
         self.busy = true;
-        self.split = false;
         self.prepared = None;
         self.status = t(cx, "script.parsing");
         self.job = uuid::Uuid::new_v4();
@@ -201,7 +198,6 @@ impl ImportView {
         let Some(prepared) = self.prepared.clone() else {
             return;
         };
-        let split = self.split;
         let path = self.path.clone();
         let note = self.note.clone();
         let cancel = self.cancel.clone();
@@ -209,31 +205,14 @@ impl ImportView {
         self.busy = true;
         self.status = t(cx, "script.importing");
         let work = cx.background_executor().spawn(async move {
-            let cells = if split {
-                prepared
-                    .split()?
-                    .into_iter()
-                    .map(|source| {
-                        Cell::new(
-                            "",
-                            CellContent::Sql {
-                                source,
-                                connection_id: None,
-                                database: None,
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                vec![Cell::new(
-                    prepared.script.name.clone(),
-                    CellContent::SqlScript {
-                        script: prepared.script.clone(),
-                        connection_id: None,
-                        database: None,
-                    },
-                )]
-            };
+            let cells = vec![Cell::new(
+                prepared.script.name.clone(),
+                CellContent::SqlScript {
+                    script: prepared.script.clone(),
+                    connection_id: None,
+                    database: None,
+                },
+            )];
             let mut candidate = note;
             candidate.cells.extend(cells.clone());
             if candidate.cells.len() > note_store::MAX_CELLS
@@ -245,9 +224,7 @@ impl ImportView {
             {
                 return Err("script.error.note_limit".to_string());
             }
-            if !split {
-                prepared.publish(&path, &cancel)?;
-            }
+            prepared.publish(&path, &cancel)?;
             if cancel.load(Ordering::Relaxed) {
                 return Err("script.cancelled".into());
             }
@@ -318,11 +295,6 @@ impl Drop for ImportView {
 }
 impl Render for ImportView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let split_allowed = self.prepared.as_ref().is_some_and(|prepared| {
-            prepared.split_allowed()
-                && self.note.cells.len() + prepared.script.statements as usize
-                    <= note_store::MAX_CELLS
-        });
         let mut dialects = div().h_flex().gap_3().child(t(cx, "script.dialect"));
         for (dialect, name) in [
             (SqlDialect::MySql, "MySQL"),
@@ -398,36 +370,6 @@ impl Render for ImportView {
                     ))
                     .child(self.status.clone()),
             )
-            .when(self.prepared.is_some(), |el| {
-                el.child(
-                    div()
-                        .h_flex()
-                        .gap_3()
-                        .child(
-                            Button::new("import-as-script")
-                                .icon(IconName::File)
-                                .label(t(cx, "script.mode.script"))
-                                .selected(!self.split)
-                                .disabled(self.busy)
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.split = false;
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("import-as-cells")
-                                .icon(IconName::GalleryVerticalEnd)
-                                .label(t(cx, "script.mode.cells"))
-                                .selected(self.split)
-                                .disabled(self.busy || !split_allowed)
-                                .tooltip(t(cx, "script.split_limit"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.split = true;
-                                    cx.notify();
-                                })),
-                        ),
-                )
-            })
             .child(
                 div()
                     .text_color(cx.theme().muted_foreground)

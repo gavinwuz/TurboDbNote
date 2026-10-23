@@ -4,6 +4,24 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-10-23
+
+- Unify editable SQL and script cells as SQL Query: execute complete selections or whole cells, show multiple named result tabs, and keep execution status on one line with expandable details. Read-only queries run directly; risky batches retain frozen-target authorization.
+- Add managed SQL File cells with connection/database controls, guarded file replacement, preview and compact results. Import SQL File uses the same flow.
+- Improve native SQL input and caret movement through bounded layout caching, visible-line rendering and background highlighting. Completion uses bounded cached metadata and cannot execute SQL.
+- Anchor T and Col suggestions at the caret. Resolve aliases throughout a statement, load missing metadata in place without dismissing suggestions, show table comments and column types/comments, and offer context-aware table-name or SELECT insertion.
+- Add offline function descriptions, parameters, examples and editable call templates with existing-argument protection. Reuse column-header key, text, numeric and date markers.
+- Fix selection-first DDL targeting for quoted/qualified table names and SQL in multi-statement cells. Offer line-tagged candidates, explicit unresolved selection and retry; discard stale requests.
+- Keep Notes in both panes for same-document comparison, with independent scrolling. Add searchable project-aware open-note lists, connection-aware titles and dated filenames; compact toolbars, bottom Top action, Markdown clearing and multiline task creation with undo.
+- Improve split/merged database navigation with persistent per-connection database rules, scoped cached filtering, expandable database/user branches, progressive loading and explicit refresh. Object searches stay inside displayed, expanded databases and never implicitly connect servers.
+- Add MySQL user creation and direct privilege inspection/editing in central three-pane tabs, with staged drafts, SQL previews and explicit authorization.
+- Improve bounded, paged object browsing, lazy columns and MySQL name-first metadata loading. Preserve original grid values, custom widths, result edits and independent sessions.
+- Share compact seven-column table designers across center/right panels, with searchable driver-specific types, guarded SQL previews and separate execution confirmation. Add field-grid structure comparison and copy-only synchronization drafts.
+- Add center-tab reordering, horizontal panes and restore controls; improve ER comments, read-only data/DDL comparisons and typed WHERE generation.
+- Add opt-in read-only MySQL legacy raw-GBK compatibility, preserving binary values and guarded metadata decoding.
+- Add hash-pinned managed Codex installation, offline archives and explicit sign-in without automatic inference.
+- Include the patched GPUI Component source in Windows source archives. Windows packages remain unsigned; native Windows/isolated SQLite verification does not establish Linux or live external-server acceptance.
+
 ## [0.1.2] - 2026-10-16
 
 - Verify and cache official Oracle/Db2 clients before release compilation; retry transient downloads and report actionable component-specific failures.

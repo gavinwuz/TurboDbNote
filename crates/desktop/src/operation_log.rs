@@ -99,6 +99,8 @@ pub struct Record {
     pub kind: Kind,
     pub phase: Phase,
     pub elapsed_ms: u64,
+    pub queued_ms: Option<u64>,
+    pub execution_ms: Option<u64>,
     pub rows: u64,
     pub affected_rows: Option<u64>,
     pub command: bool,
@@ -115,6 +117,8 @@ impl Record {
             kind,
             phase,
             elapsed_ms: 0,
+            queued_ms: None,
+            execution_ms: None,
             rows: 0,
             affected_rows: None,
             command: false,
@@ -124,7 +128,7 @@ impl Record {
     }
     pub fn line(&self) -> String {
         format!(
-            "{} task={} source={} target={} {} {} elapsed_ms={} rows={} bytes={} class={} affected_rows={} command={}\n",
+            "{} task={} source={} target={} {} {} elapsed_ms={} rows={} bytes={} class={} affected_rows={} command={} queued_ms={} execution_ms={}\n",
             chrono::Utc::now().to_rfc3339(),
             self.task,
             self.source
@@ -142,7 +146,11 @@ impl Record {
             self.affected_rows
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "unavailable".into()),
-            self.command
+            self.command,
+            self.queued_ms
+                .map_or_else(|| "unavailable".into(), |n| n.to_string()),
+            self.execution_ms
+                .map_or_else(|| "unavailable".into(), |n| n.to_string())
         )
     }
 }
@@ -177,7 +185,7 @@ pub fn failure_class(error: &str) -> &'static str {
         "driver"
     } else if s.contains("已存在") {
         "exists"
-    } else if s.contains("超时") {
+    } else if s.contains("超时") || matches!(error, "browser.timeout" | "script.error.timeout") {
         "timeout"
     } else if s.contains("约束") || s.contains("主键") || s.contains("结构") {
         "schema"

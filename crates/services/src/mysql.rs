@@ -53,6 +53,7 @@ pub struct Profile {
     pub driver: Driver,
     pub target_version: String,
     pub charset: String,
+    pub mysql_raw_gbk: bool,
     pub tls: TlsMode,
     pub ca: String,
     pub client_cert: String,
@@ -87,6 +88,7 @@ impl Default for Profile {
             driver: Driver::Auto,
             target_version: "自动检测".into(),
             charset: "utf8mb4".into(),
+            mysql_raw_gbk: false,
             tls: TlsMode::VerifyIdentity,
             ca: String::new(),
             client_cert: String::new(),
@@ -99,6 +101,38 @@ impl Default for Profile {
             allow_old_auth: false,
         }
     }
+}
+pub(crate) async fn database_names(
+    connection: &mut MySqlConnection,
+) -> (Vec<String>, Option<String>) {
+    let mut databases = Vec::new();
+    let mut error = None;
+    let mut bytes = 0usize;
+    let mut rows = sqlx::raw_sql("SHOW DATABASES").fetch(connection);
+    loop {
+        match rows.try_next().await {
+            Ok(Some(row)) => match crate::database::mysql_text(&row, 0) {
+                Ok(name) if !name.is_empty() => {
+                    bytes += name.len();
+                    if bytes > 16 * 1024 * 1024 {
+                        error = Some("browser.response_failed".into());
+                        break;
+                    }
+                    databases.push(name);
+                }
+                _ => {
+                    error = Some("dbwork.detect.name_decode_failed".into());
+                    break;
+                }
+            },
+            Ok(None) => break,
+            Err(cause) => {
+                error = Some(error_message(cause));
+                break;
+            }
+        }
+    }
+    (databases, error)
 }
 pub fn valid_charset(value: &str) -> bool {
     !value.is_empty()
@@ -137,6 +171,20 @@ impl Profile {
         }
         if self.port == 0 || !(1..=60).contains(&self.timeout_seconds) {
             return Err("端口须为 1–65535，超时须为 1–60 秒".into());
+        }
+        if self.mysql_raw_gbk
+            && (self.kind != DatabaseKind::MySql
+                || !self.charset.eq_ignore_ascii_case("gbk")
+                || (self
+                    .target_version
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_digit)
+                    && !(self.target_version == "4.1"
+                        || self.target_version.starts_with("4.1.")
+                        || self.target_version.starts_with("5."))))
+        {
+            return Err("mysql.gbk.invalid".into());
         }
         if self.charset != "server-default" && !valid_charset(&self.charset) {
             return Err("字符集名称须为 1–64 位英文字母、数字或下划线".into());
@@ -242,13 +290,20 @@ pub fn modern_version(version: &str) -> bool {
 }
 pub fn uses_legacy(profile: &Profile) -> bool {
     profile.kind == DatabaseKind::MySql
-        && (profile.driver == Driver::Legacy
+        && (profile.mysql_raw_gbk
+            || profile.driver == Driver::Legacy
             || (profile.driver == Driver::Auto
                 && ["4.0", "4.1", "5.0", "5.1", "5.5", "5.0–5.5"]
                     .contains(&profile.target_version.as_str())))
 }
 pub fn detected_profile(mut profile: Profile, version: &str) -> Profile {
     if profile.kind == DatabaseKind::MySql && profile.driver == Driver::Auto {
+        if profile.mysql_raw_gbk {
+            profile.driver = Driver::Legacy;
+            profile.target_version = version.to_owned();
+            return profile;
+        }
+
         if let Some(target) = automatic::legacy_target(version) {
             profile.driver = Driver::Legacy;
             profile.target_version = target.into();
@@ -454,32 +509,7 @@ async fn open(profile: &Profile, password: &str) -> Result<(MySqlConnection, Ser
     }
     let (databases, database_list_error) =
         if profile.database.is_empty() || profile.list_all_databases {
-            let mut databases = Vec::new();
-            let mut error = None;
-            let mut rows = sqlx::query("SHOW DATABASES").fetch(&mut connection);
-            loop {
-                match rows.try_next().await {
-                    Ok(Some(row)) => {
-                        if databases.len() == 512 {
-                            error = Some("数据库超过 512 个，请直接输入库名缩小范围".into());
-                            break;
-                        }
-                        match crate::database::mysql_text(&row, 0) {
-                            Ok(name) if !name.is_empty() => databases.push(name),
-                            _ => {
-                                error = Some("dbwork.detect.name_decode_failed".into());
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(cause) => {
-                        error = Some(error_message(cause));
-                        break;
-                    }
-                }
-            }
-            (databases, error)
+            database_names(&mut connection).await
         } else {
             (vec![profile.database.clone()], None)
         };
@@ -739,8 +769,15 @@ mod tests {
                         packet(&mut socket, 3, &[0xfe, 0, 0, 2, 0]);
                         let mut row = vec![sent.len() as u8];
                         row.extend_from_slice(&sent);
-                        packet(&mut socket, 4, &row);
-                        packet(&mut socket, 5, &[0xfe, 0, 0, 2, 0]);
+                        let count = if std::str::from_utf8(&sent).is_ok() {
+                            640
+                        } else {
+                            1
+                        };
+                        for i in 0..count {
+                            packet(&mut socket, (4 + i) as u8, &row);
+                        }
+                        packet(&mut socket, (count + 4) as u8, &[0xfe, 0, 0, 2, 0]);
                     } else {
                         // SQLx connection initialization only changes this test session.
                         packet(&mut socket, 1, &[0, 0, 0, 2, 0, 0, 0]);
@@ -773,6 +810,14 @@ mod tests {
                         assert_eq!(decoded.unwrap(), expected);
                     } else {
                         assert!(decoded.is_err(), "invalid UTF-8 must still fail");
+                    }
+                    // Drain the first response, then exercise the same reader used by connect and refresh.
+                    let (names, error) = database_names(&mut connection).await;
+                    if std::str::from_utf8(&value).is_ok() {
+                        assert!(error.is_none());
+                        assert_eq!(names.len(), 640);
+                    } else {
+                        assert!(error.is_some());
                     }
                     connection.close().await.unwrap();
                 });

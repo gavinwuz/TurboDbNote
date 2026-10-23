@@ -169,7 +169,13 @@ impl TableView {
         let Some(field) = self.rows.columns.get(col).cloned() else {
             return;
         };
-        let width = self.widths.widths.get(&field).copied().unwrap_or(220.);
+        let width = self
+            .widths
+            .widths
+            .get(&field)
+            .copied()
+            .or_else(|| self.auto_widths.get(&field).copied())
+            .unwrap_or(220.);
         if action == "fit" {
             let maximum = self
                 .rows
@@ -185,7 +191,16 @@ impl TableView {
             return;
         }
         if action == "reset" {
-            self.apply_width(&field, 220., cx);
+            self.widths.widths.remove(&field);
+            self.auto_widths.remove(&field);
+            self.width_revision += 1;
+            self.sync_grid(cx);
+            self.grid_state.update(cx, |table, cx| table.refresh(cx));
+            if self.widths_writable
+                && let Some(sender) = &self.width_sender
+            {
+                let _ = sender.force_send(self.widths.clone());
+            }
             return;
         }
         let input =

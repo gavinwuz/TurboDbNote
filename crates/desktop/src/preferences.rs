@@ -145,9 +145,48 @@ impl Default for AgentExtension {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidebarLayout {
+    #[default]
+    Split,
+    Tree,
+}
+impl SidebarLayout {
+    pub const fn toggled(self) -> Self {
+        match self {
+            Self::Split => Self::Tree,
+            Self::Tree => Self::Split,
+        }
+    }
+    pub const fn icon(self) -> &'static str {
+        match self {
+            Self::Split => "icons/sidebar-split.svg",
+            Self::Tree => "icons/sidebar-tree.svg",
+        }
+    }
+    pub const fn hint(self) -> &'static str {
+        match self {
+            Self::Split => "database.sidebar.split_hint",
+            Self::Tree => "database.sidebar.tree_hint",
+        }
+    }
+    pub const fn toggle_tip(self) -> &'static str {
+        match self {
+            Self::Split => "database.sidebar.switch_tree",
+            Self::Tree => "database.sidebar.switch_split",
+        }
+    }
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Split => "database.sidebar.split",
+            Self::Tree => "database.sidebar.tree",
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DatabasePreferences {
+    pub sidebar_layout: SidebarLayout,
     pub page_size: usize,
     pub connect_timeout_seconds: u64,
     pub execution_timeout_seconds: u64,
@@ -160,6 +199,7 @@ pub struct DatabasePreferences {
 impl Default for DatabasePreferences {
     fn default() -> Self {
         Self {
+            sidebar_layout: SidebarLayout::Split,
             page_size: 200,
             connect_timeout_seconds: 5,
             execution_timeout_seconds: turbodbn_core::timeouts::DEFAULT_EXECUTION_SECONDS,
@@ -483,5 +523,22 @@ mod command_permissions_tests {
         assert!(loaded.command_enabled("update"));
         assert!(!loaded.command_enabled("delete"));
         assert!(!loaded.command_enabled("show_databases"));
+    }
+}
+
+#[cfg(test)]
+mod sidebar_layout_tests {
+    use super::*;
+    #[test]
+    fn old_settings_keep_split_layout_and_tree_choice_round_trips() {
+        let old: DatabasePreferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.sidebar_layout, SidebarLayout::Split);
+        let selected = DatabasePreferences {
+            sidebar_layout: SidebarLayout::Tree,
+            ..Default::default()
+        };
+        let restored: DatabasePreferences =
+            serde_json::from_str(&serde_json::to_string(&selected).unwrap()).unwrap();
+        assert_eq!(restored.sidebar_layout, SidebarLayout::Tree);
     }
 }

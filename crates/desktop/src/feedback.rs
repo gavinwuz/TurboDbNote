@@ -435,15 +435,51 @@ mod tests {
     }
 }
 
+#[derive(Clone, PartialEq)]
+pub struct NoteDdlTable {
+    pub database: String,
+    pub object: turbodbn_services::database::workbench::Object,
+    pub line: usize,
+}
+#[derive(Clone, PartialEq)]
+pub struct NoteDdlContext {
+    pub selection: bool,
+    pub tables: Vec<NoteDdlTable>,
+    pub fallback: Vec<NoteDdlTable>,
+    pub recognized: bool,
+}
 #[derive(Clone)]
 pub struct DdlContext {
+    pub note: Option<NoteDdlContext>,
+    pub candidates: Vec<turbodbn_services::database::workbench::Object>,
     pub origin: Option<uuid::Uuid>,
     pub scope: Option<(uuid::Uuid, String)>,
     pub object: Option<turbodbn_services::database::workbench::Object>,
     pub open: bool,
 }
 impl EventEmitter<DdlContext> for Events {}
+#[derive(Default)]
+struct DdlRequests(u64);
+impl Global for DdlRequests {}
+pub fn ddl_request(cx: &mut App) -> u64 {
+    if cx.try_global::<DdlRequests>().is_none() {
+        cx.set_global(DdlRequests::default());
+    }
+    let state = cx.global_mut::<DdlRequests>();
+    state.0 = state.0.wrapping_add(1);
+    state.0
+}
+pub fn ddl_request_current(ticket: u64, cx: &App) -> bool {
+    cx.try_global::<DdlRequests>()
+        .is_some_and(|state| state.0 == ticket)
+}
 pub fn ddl_context(event: DdlContext, cx: &mut App) {
+    let ticket = event.open.then(|| ddl_request(cx));
     let hub = cx.global::<Hub>().0.clone();
-    cx.defer(move |cx| hub.update(cx, |_, cx| cx.emit(event)));
+    cx.defer(move |cx| {
+        if ticket.is_some_and(|ticket| !ddl_request_current(ticket, cx)) {
+            return;
+        }
+        hub.update(cx, |_, cx| cx.emit(event));
+    });
 }

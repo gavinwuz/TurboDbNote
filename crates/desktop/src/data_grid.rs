@@ -72,17 +72,23 @@ impl GridDelegate {
         columns.extend(view.rows.columns.iter().enumerate().map(|(i, name)| {
             GridColumn::new(format!("data-{i}"), name.clone())
                 .p_0()
-                .width(px(view.widths.widths.get(name).copied().unwrap_or(
-                    if view.target.kind == turbodbn_services::DatabaseKind::Redis {
-                        if view.rows.columns.len() == 1 {
-                            720.
+                .width(px(view
+                    .widths
+                    .widths
+                    .get(name)
+                    .copied()
+                    .or_else(|| view.auto_widths.get(name).copied())
+                    .unwrap_or(
+                        if view.target.kind == turbodbn_services::DatabaseKind::Redis {
+                            if view.rows.columns.len() == 1 {
+                                720.
+                            } else {
+                                360.
+                            }
                         } else {
-                            360.
-                        }
-                    } else {
-                        220.
-                    },
-                )))
+                            220.
+                        },
+                    )))
         }));
         Self {
             mongo: view.mongo.is_some(),
@@ -143,6 +149,11 @@ pub(crate) fn column_icon(c: Option<&workbench::Column>, cx: &App) -> AnyElement
             .into_any_element();
     }
     let ty = c.map(|c| c.data_type.to_lowercase()).unwrap_or_default();
+    if ty.is_empty() {
+        return gpui_component::Icon::new(IconName::Menu)
+            .text_color(cx.theme().muted_foreground)
+            .into_any_element();
+    }
     if ["objectid", "array", "object", "mixed", "null", "boolean"].contains(&ty.as_str()) {
         return div()
             .text_xs()
@@ -579,6 +590,8 @@ impl TableDelegate for GridDelegate {
                                 let _ = owner.update(cx, |this, cx| {
                                     crate::feedback::ddl_context(
                                         crate::feedback::DdlContext {
+                                            note: None,
+                                            candidates: vec![],
                                             origin: None,
                                             scope: Some((
                                                 this.target.connection,

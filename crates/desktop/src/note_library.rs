@@ -282,7 +282,12 @@ impl NoteLibrary {
         }
         let view =
             cx.new(|cx| NoteView::new(loaded, path, draft, self.database.clone(), window, cx));
-        let key = view.read(cx).key.clone();
+        let mut key = view.read(cx).key.clone();
+        if self.documents.contains_key(&key) {
+            key = format!("{key}:{}", view.read(cx).path.to_string_lossy());
+            view.update(cx, |view, _| view.key = key.clone());
+        }
+
         let subscribed_key = key.clone();
         let subscription = cx.subscribe(&view, move |this, _, event: &NoteEvent, cx| match event {
             NoteEvent::Changed(entry) => {
@@ -491,6 +496,46 @@ impl NoteLibrary {
         }
     }
     pub fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.create_note(None, window, cx);
+    }
+    pub fn new_table_query(
+        &mut self,
+        target: crate::database::OpenTable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !matches!(
+            target.kind,
+            turbodbn_services::DatabaseKind::MySql
+                | turbodbn_services::DatabaseKind::PostgreSql
+                | turbodbn_services::DatabaseKind::Sqlite
+        ) {
+            feedback::error(t(cx, "query_note.unsupported"), cx);
+            return;
+        }
+        if let Some((key, view)) = self
+            .documents
+            .iter()
+            .find(|(_, v)| v.read(cx).matches_table_query(&target, cx))
+            .map(|(k, v)| (k.clone(), v.clone()))
+        {
+            cx.emit(LibraryEvent::Open {
+                key,
+                view: view.clone(),
+            });
+            cx.defer_in(window, move |_, window, cx| {
+                view.update(cx, |note, cx| note.open_table_query(window, cx))
+            });
+            return;
+        }
+        self.create_note(Some(target), window, cx);
+    }
+    fn create_note(
+        &mut self,
+        target: Option<crate::database::OpenTable>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.ready || self.loading || self.opening {
             return;
         }
@@ -499,6 +544,7 @@ impl NoteLibrary {
             return;
         }
         self.opening = true;
+        let query_open = target.is_some();
         let mut note = Note::new("");
         note.cells.push(Cell::new(
             "",
@@ -508,11 +554,33 @@ impl NoteLibrary {
                 database: None,
             },
         ));
-        let path = Self::directory(cx).join(format!("{}.note", note.id));
-        let saved = path.clone();
-        let work = cx.background_executor().spawn(async move {
-            note_store::save(&saved, &note, None).map(|hash| Loaded { note, hash })
-        });
+        if let Some(target) = target {
+            note.title = target.object.name.clone();
+            note.default_connection_id = Some(target.connection);
+            note.default_database = Some(target.database.clone());
+            note.table_query = Some((target.object.schema.clone(), target.object.name.clone()));
+            note.table_query_origin = Some(turbodbn_core::notebook::TableQueryOrigin {
+                connection: target.connection,
+                database: target.database.clone(),
+                schema: target.object.schema.clone(),
+                table: target.object.name.clone(),
+            });
+            if let CellContent::Sql { source, .. } = &mut note.cells[0].content {
+                *source = format!(
+                    "SELECT * FROM {};",
+                    turbodbn_services::database::workbench::qualified(
+                        target.kind,
+                        &target.database,
+                        &target.object
+                    )
+                );
+            }
+        }
+        let directory = Self::directory(cx);
+        let date = chrono::Local::now().format("%y%m%d").to_string();
+        let work = cx
+            .background_executor()
+            .spawn(async move { note_store::create_dated(&directory, &date, note) });
         cx.spawn_in(window, async move |view, cx| {
             let result = work.await;
             let _ = cx.update(|window, cx| {
@@ -520,7 +588,23 @@ impl NoteLibrary {
                     this.opening = false;
                     let success = result.is_ok();
                     match result {
-                        Ok(loaded) => this.install(path, true, loaded, window, cx),
+                        Ok((path, loaded)) => {
+                            this.install(path.clone(), true, loaded, window, cx);
+                            if query_open {
+                                cx.defer_in(window, move |this, window, cx| {
+                                    if let Some(view) = this
+                                        .documents
+                                        .values()
+                                        .find(|v| v.read(cx).path == path)
+                                        .cloned()
+                                    {
+                                        view.update(cx, |note, cx| {
+                                            note.open_table_query(window, cx)
+                                        });
+                                    }
+                                });
+                            }
+                        }
                         Err(e) => feedback::error(e, cx),
                     }
                     cx.emit(LibraryEvent::Settled {
@@ -689,20 +773,12 @@ fn entry_title(entry: &Entry, cx: &App) -> String {
     if !entry.title.trim().is_empty() {
         return entry.title.clone();
     }
-    if !entry.draft {
-        return entry
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
+    let stem = entry.path.file_stem().unwrap_or_default().to_string_lossy();
+    if uuid::Uuid::parse_str(&stem).is_ok() {
+        t(cx, "notes.legacy_title").to_string()
+    } else {
+        stem.into_owned()
     }
-    crate::locale::tr(
-        cx,
-        "notes.untitled",
-        &[("id", &entry.id.simple().to_string()[..6])],
-    )
-    .to_string()
 }
 impl Render for NoteLibrary {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
