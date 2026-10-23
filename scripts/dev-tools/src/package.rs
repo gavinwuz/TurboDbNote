@@ -122,6 +122,7 @@ pub fn linux(root: &Path) -> Result<(), String> {
             "Cargo.toml",
             "Cargo.lock",
             "crates",
+            "vendor/gpui-component",
             "scripts",
             "LICENSE",
             "README.md",

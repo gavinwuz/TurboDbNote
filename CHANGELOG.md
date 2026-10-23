@@ -20,7 +20,7 @@ Release notes are generated from the version sections below.
 - Add center-tab reordering, horizontal panes and restore controls; improve ER comments, read-only data/DDL comparisons and typed WHERE generation.
 - Add opt-in read-only MySQL legacy raw-GBK compatibility, preserving binary values and guarded metadata decoding.
 - Add hash-pinned managed Codex installation, offline archives and explicit sign-in without automatic inference.
-- Include the patched GPUI Component source in Windows source archives. Windows packages remain unsigned; native Windows/isolated SQLite verification does not establish Linux or live external-server acceptance.
+- Include the patched GPUI Component source in Windows and Linux source archives. Windows packages remain unsigned; native Windows/isolated SQLite verification does not establish Linux or live external-server acceptance.
 
 ## [0.1.2] - 2026-10-16
 

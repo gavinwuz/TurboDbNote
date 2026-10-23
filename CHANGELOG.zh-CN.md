@@ -20,7 +20,7 @@
 - 增加中间页签排序、水平分栏及还原，优化 ER 注释、只读数据／DDL 对比和按类型生成 WHERE。
 - 增加可选的 MySQL 历史原始 GBK 只读兼容，保留二进制值与元数据解码保护。
 - 增加固定哈希校验的 Codex 托管安装、离线包及明确登录，不自动推理。
-- Windows 源码包包含本项目修补的 GPUI Component 源码。Windows 包尚未签名；原生 Windows／隔离 SQLite 验证不代表 Linux 或真实外部服务端已验收。
+- Windows 与 Linux 源码包包含本项目修补的 GPUI Component 源码。Windows 包尚未签名；原生 Windows／隔离 SQLite 验证不代表 Linux 或真实外部服务端已验收。
 
 ## [0.1.2] - 2026-10-16
 
