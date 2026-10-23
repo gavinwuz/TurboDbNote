@@ -8,7 +8,7 @@ The single-pane database tree persists target-scoped directory snapshots in conn
 
 A native SQL Notebook and database workbench built with Rust and GPUI. Write SQL, Markdown and task notes alongside database browsing and AI chat.
 
-**Version 0.1.3 · Windows and Linux x64**
+**Version 0.1.4 · Windows and Linux x64**
 
 [Download](https://github.com/gavinwuz/TurboDbNote/releases) · [Changelog](CHANGELOG.md) · [Release workflow](docs/releasing.md)
 
@@ -167,3 +167,5 @@ Note cells share connection/database selection across SQL Query and SQL File. Co
 Note function completions offer offline, dialect-aware explanations, parameters and examples. Enter inserts the function name; Tab inserts an editable call template. Column completions share the result-header primary-key and type markers.
 
 Note DDL follows selected relation names or SQL before the current statement; multiple tables offer line-tagged candidates. Unresolved targets provide explicit selection, and failed metadata loads retain the target for retry. Editor SQL is never executed by this action.
+
+Windows installed editions use a separate update helper staged outside the application folder. Download and SHA256 verification show byte-based progress; after saving and confirmation, the helper waits for the process and other instances to exit, then opens the normal installer with its own installation progress. Reopening after success is optional. Portable editions remain manual; older installed editions need one manual upgrade to acquire the helper.

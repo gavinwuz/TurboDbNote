@@ -40,6 +40,10 @@ LicenseFile={#SourceDir}\LICENSE
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+DisableWelcomePage=no
+WizardImageFile=assets/update-wizard.bmp,assets/update-wizard@2x.bmp,assets/update-wizard@3x.bmp
+WizardSmallImageFile=assets/update-small.bmp,assets/update-small@2x.bmp,assets/update-small@3x.bmp
+WizardImageStretch=yes
 CloseApplications=no
 RestartApplications=no
 AppMutex=TurboDbNote.Running
@@ -59,3 +63,26 @@ Name: "{group}\TurboDBNote"; Filename: "{app}\turbodbnote.exe"; WorkingDir: "{ap
 Name: "{autodesktop}\TurboDBNote"; Filename: "{app}\turbodbnote.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 ; No automatic launch and no deletion of user data directories on uninstall.
+
+[Code]
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  { Updates retain the explicitly frozen installation directory. }
+  Result := (ExpandConstant('{param:TURBODBNUPDATE|0}') = '1') and
+    (PageID = wpSelectDir);
+end;
+
+procedure InitializeWizard;
+var
+  TextLeft, TextRight: Integer;
+begin
+  { Keep the application logo to the left of all standard page headings. }
+  WizardForm.WizardSmallBitmapImage.Left := ScaleX(12);
+  TextLeft := WizardForm.WizardSmallBitmapImage.Left +
+    WizardForm.WizardSmallBitmapImage.Width + ScaleX(12);
+  TextRight := WizardForm.MainPanel.ClientWidth - ScaleX(12);
+  WizardForm.PageNameLabel.Left := TextLeft;
+  WizardForm.PageNameLabel.Width := TextRight - TextLeft;
+  WizardForm.PageDescriptionLabel.Left := TextLeft;
+  WizardForm.PageDescriptionLabel.Width := TextRight - TextLeft;
+end;

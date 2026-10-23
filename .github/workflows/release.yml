@@ -99,6 +99,8 @@ jobs:
         run: cargo run --locked -j 1 -p turbodbnote-driver-host --example verify_contracts -- dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-windows-x64/drivers/native
       - name: Open the packaged Windows window in isolation
         run: python scripts/verify-windows-startup.py dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-windows-x64
+      - name: Verify standalone update handoff with mock installers
+        run: python scripts/verify-update-handoff.py --executable dist/TurboDBNote-v${{ needs.metadata.outputs.version }}-windows-x64/turbodbnote-update-helper.exe
       - uses: actions/upload-artifact@v4
         with:
           name: release-windows

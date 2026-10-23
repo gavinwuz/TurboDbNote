@@ -18,7 +18,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Preview build failed' }
     Stage-DatabaseDrivers -Destination (Join-Path $preview 'drivers/native') -HostPath (Join-Path $target 'debug/turbodbnote-driver-host.exe')
     Stage-MySqlDriver -Destination (Join-Path $preview 'drivers') -CargoPath $CargoPath -LegacyDriverArchive $LegacyDriverArchive -LegacySourceArchive $LegacySourceArchive
-    foreach ($name in @('turbodbnote.exe', 'turbodbnote.pdb', 'turbodbnote-mysql-legacy.exe', 'turbodbnote_mysql_legacy.pdb')) {
+    foreach ($name in @('turbodbnote-update-helper.exe', 'turbodbnote_update_helper.pdb', 'turbodbnote.exe', 'turbodbnote.pdb', 'turbodbnote-mysql-legacy.exe', 'turbodbnote_mysql_legacy.pdb')) {
         Copy-Item -LiteralPath (Join-Path $target "debug/$name") -Destination (Join-Path $preview $name) -Force
     }
     if (-not (Test-Path -LiteralPath (Join-Path $preview 'portable.flag'))) {

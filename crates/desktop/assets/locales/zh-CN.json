@@ -1906,6 +1906,27 @@
     "ddl.note.table_line": "{table} · L{line}",
     "ddl.note.retry": "重试加载定义",
     "ddl.note.selection_tables": "选区中的表",
-    "ddl.note.definition_missing": "未返回可见的表定义。请确认数据库、表名及元数据读取权限后重试。"
+    "ddl.note.definition_missing": "未返回可见的表定义。请确认数据库、表名及元数据读取权限后重试。",
+    "updates.restart": "更新完成后重新打开 TurboDBNote",
+    "updates.transfer_rate": "{speed} MB/s · 预计剩余 {seconds} 秒",
+    "updates.helper.title": "TurboDBNote 更新",
+    "updates.helper.cancel": "取消更新",
+    "updates.helper.waiting": "等待 TurboDBNote 退出…",
+    "updates.helper.others": "请关闭其他 TurboDBNote 窗口，关闭后将继续。",
+    "updates.helper.installing": "正在安装，请查看安装向导进度。",
+    "updates.helper.wait_timeout": "TurboDBNote 仍在运行。请关闭其他窗口后重新开始更新。",
+    "updates.helper.install_cancelled": "安装已取消，未删除用户数据。",
+    "updates.helper.restart_failed": "安装已完成，但无法重新打开 TurboDBNote。请从安装目录手动打开。",
+    "updates.helper.recovery": "是否打开安装包所在目录？可以手动安装，或从原快捷方式重新打开 TurboDBNote。",
+    "updates.error.package_identity": "安装包类型不匹配。请重新下载适用的 Windows 更新包。",
+    "updates.error.target": "无法确认安装目录。请手动打开已下载的安装包。",
+    "updates.error.parent": "无法确认当前程序进程，TurboDBNote 将保持打开。",
+    "updates.error.helper_missing": "更新助手缺失或无法读取，请手动安装本次更新以修复。",
+    "updates.error.helper_start": "更新助手未就绪，TurboDBNote 将保持打开。请重试或手动安装。",
+    "updates.completed": "TurboDBNote 已更新至 {version}。",
+    "updates.verify_progress": "正在校验安装包 · {percent}%",
+    "updates.helper.log_failed": "无法记录更新结果。请检查应用缓存目录是否可写。",
+    "updates.helper.restart_recovery": "是否打开安装目录，以便手动启动 TurboDBNote？",
+    "updates.error.in_progress": "另一个更新正在进行。请关闭本程序窗口，让该更新继续。"
   }
 }

@@ -87,6 +87,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw 'Unable to resolve Rust version' }
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     Copy-Item -LiteralPath $exe -Destination (Join-Path $stage 'turbodbnote.exe')
+    Copy-Item -LiteralPath (Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote-update-helper.exe') -Destination $stage
     $legacyHelper=Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote-mysql-legacy.exe'
     if (-not (Test-Path -LiteralPath $legacyHelper)) {throw 'Legacy helper was not built'}
     Copy-Item -LiteralPath $legacyHelper -Destination $stage
@@ -125,7 +126,7 @@ try {
     if (-not (Test-Path -LiteralPath $pdb -PathType Leaf)) { throw 'Release PDB missing; crash reports would not be symbolicated' }
     New-Item -ItemType Directory -Path $symbols | Out-Null
     Copy-Item -LiteralPath $exe, $pdb -Destination $symbols
-    foreach ($nativeSymbolName in @('turbodbnote-driver-host.exe', 'turbodbnote_driver_host.pdb', 'turbodbnote-mysql-legacy.exe', 'turbodbnote_mysql_legacy.pdb')) {
+    foreach ($nativeSymbolName in @('turbodbnote-update-helper.exe', 'turbodbnote_update_helper.pdb', 'turbodbnote-driver-host.exe', 'turbodbnote_driver_host.pdb', 'turbodbnote-mysql-legacy.exe', 'turbodbnote_mysql_legacy.pdb')) {
         $nativeSymbolFile = Join-Path $buildTarget "x86_64-pc-windows-msvc/release/$nativeSymbolName"
         if (-not (Test-Path -LiteralPath $nativeSymbolFile -PathType Leaf)) { throw 'Native driver symbols missing' }
         Copy-Item -LiteralPath $nativeSymbolFile -Destination $symbols

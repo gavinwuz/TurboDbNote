@@ -59,6 +59,34 @@ pub struct Progress {
     pub verifying: bool,
 }
 
+/// Exact release identity shared by download selection and the Windows helper.
+pub fn installer_version(name: &str) -> Option<semver::Version> {
+    let value = name.strip_prefix("TurboDBNote-v")?;
+    let version = value
+        .strip_suffix("-windows-x64-setup.exe")
+        .or_else(|| value.strip_suffix("-windows-x64-minimal-setup.exe"))?;
+    let parsed = semver::Version::parse(version).ok()?;
+    (parsed.pre.is_empty() && parsed.build.is_empty() && parsed.to_string() == version)
+        .then_some(parsed)
+}
+
+#[derive(Clone, Debug, serde::Serialize, Deserialize)]
+pub struct InstallRequest {
+    pub path: PathBuf,
+    pub sha256: String,
+    pub parent: u32,
+    pub application: PathBuf,
+    pub restart: bool,
+    pub language: String,
+}
+
+#[derive(Debug, serde::Serialize, Deserialize)]
+pub enum InstallEvent {
+    Progress { bytes: u64, total: u64 },
+    Ready,
+    Failed(String),
+}
+
 pub fn trusted_url(value: &str) -> bool {
     Url::parse(value).is_ok_and(|url| {
         url.scheme() == "https"
@@ -379,7 +407,7 @@ async fn verified_transfer(
     std::fs::create_dir_all(directory).map_err(|_| "updates.error.disk")?;
     let path = directory.join(&package.name);
     if path.exists() {
-        verify(&path, hash, cancel)?;
+        verify_progress(&path, hash, cancel, progress)?;
         return Ok(Download {
             path,
             sha256: hash.to_owned(),
@@ -431,6 +459,7 @@ async fn verified_transfer(
         .map_err(|_| "updates.error.disk")?;
     temp.persist_noclobber(&path)
         .map_err(|_| "updates.error.disk")?;
+    verify_progress(&path, hash, cancel, progress)?;
     Ok(Download {
         path,
         sha256: hash.to_owned(),
@@ -496,6 +525,14 @@ fn stream(
     Ok(())
 }
 pub fn verify(path: &Path, expected: &str, cancel: &AtomicBool) -> Result<(), String> {
+    verify_progress(path, expected, cancel, &|_| {})
+}
+pub fn verify_progress(
+    path: &Path,
+    expected: &str,
+    cancel: &AtomicBool,
+    progress: &impl Fn(Progress),
+) -> Result<(), String> {
     let mut file = File::open(path).map_err(|_| "updates.error.disk")?;
     let size = file.metadata().map_err(|_| "updates.error.disk")?.len();
     if size == 0 || size > MAX_PACKAGE {
@@ -507,13 +544,61 @@ pub fn verify(path: &Path, expected: &str, cancel: &AtomicBool) -> Result<(), St
         size,
         expected,
         cancel,
-        &|_| {},
+        &|value| {
+            progress(Progress {
+                verifying: true,
+                ..value
+            })
+        },
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn installer_identity_accepts_only_stable_full_and_minimal_packages() {
+        for name in [
+            "TurboDBNote-v1.2.3-windows-x64-setup.exe",
+            "TurboDBNote-v1.2.3-windows-x64-minimal-setup.exe",
+        ] {
+            assert_eq!(installer_version(name).unwrap().to_string(), "1.2.3");
+        }
+        for name in [
+            "TurboDBNote-v1.2.3-beta-windows-x64-setup.exe",
+            "TurboDBNote-v1.2.3-windows-x64-setup.exe.bak",
+            "TurboDBNote-v1.2.3-linux-x64.tar.gz",
+            "TurboDBNote-v01.2.3-windows-x64-setup.exe",
+            "other-v1.2.3-windows-x64-setup.exe",
+        ] {
+            assert!(installer_version(name).is_none(), "{name}");
+        }
+    }
+    #[test]
+    fn file_verification_reports_real_bytes_and_remains_cancellable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("installer.exe");
+        let payload = vec![7; 200_000];
+        std::fs::write(&path, &payload).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&payload));
+        let cancel = AtomicBool::new(false);
+        let events = std::cell::RefCell::new(vec![]);
+        verify_progress(&path, &hash, &cancel, &|p| events.borrow_mut().push(p)).unwrap();
+        let events = events.into_inner();
+        assert!(
+            events
+                .iter()
+                .all(|p| p.verifying && p.total == 200_000 && p.bytes <= p.total)
+        );
+        assert_eq!(events.first().unwrap().bytes, 0);
+        assert_eq!(events.last().unwrap().bytes, 200_000);
+        assert_eq!(
+            verify_progress(&path, &hash, &cancel, &|_| cancel
+                .store(true, Ordering::Relaxed))
+            .unwrap_err(),
+            "updates.status.cancelled"
+        );
+    }
     fn release(tag: &str) -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({"tag_name": tag, "html_url": format!("{RELEASES}/tag/{tag}"), "assets": []})).unwrap()
     }

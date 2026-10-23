@@ -4,6 +4,14 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-10-23
+
+- Existing installed versions need one manual installation of v0.1.4 to acquire the new helper; this release cannot repair the updater already running in an older executable. Portable editions continue to use manual replacement. No automatic SQL execution or forced shutdown of other instances.
+
+- Reuse the application logo in the update helper and on the left of Windows installer pages, with checked-in multi-DPI wizard artwork.
+
+- Use a standalone Windows update helper outside the installation folder; accept full/minimal installer identities, show real download/verification progress, wait for processes and instances, and optionally reopen only after successful installation. Keep installation progress in the standard installer.
+
 ## [0.1.3] - 2026-10-23
 
 - Unify editable SQL and script cells as SQL Query: execute complete selections or whole cells, show multiple named result tabs, and keep execution status on one line with expandable details. Read-only queries run directly; risky batches retain frozen-target authorization.

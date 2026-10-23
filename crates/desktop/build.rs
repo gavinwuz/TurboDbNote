@@ -182,12 +182,21 @@ fn main() {
         .warnings(false)
         .compile("mysql_comments");
     validate_locales();
+    println!("cargo:rerun-if-changed=assets/update-helper.rc");
+    println!("cargo:rerun-if-changed=assets/update-helper.manifest");
     println!("cargo:rerun-if-changed=assets/windows.rc");
     println!("cargo:rerun-if-changed=assets/turbodbnote.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         // GPUI's nested notebook/grid/dialog frames exceed the Windows 1 MiB
         // default in debug builds. Reserve bounded virtual space; commit on demand.
         println!("cargo:rustc-link-arg-bin=turbodbnote=/STACK:8388608");
+        embed_resource::compile_for(
+            "assets/update-helper.rc",
+            ["turbodbnote-update-helper"],
+            embed_resource::NONE,
+        )
+        .manifest_required()
+        .expect("Unable to embed update helper manifest");
         embed_resource::compile("assets/windows.rc", embed_resource::NONE)
             .manifest_required()
             .expect("Unable to embed TurboDBNote Windows icon resource");

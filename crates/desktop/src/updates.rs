@@ -10,8 +10,6 @@ use gpui_component::{
     notification::{Notification, NotificationType},
 };
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "windows")]
-use std::path::PathBuf;
 use std::{
     sync::{
         Arc,
@@ -47,7 +45,8 @@ impl Preferences {
             .is_none_or(|last| now < last || now.saturating_sub(last) >= 86400)
     }
 }
-pub struct Install(pub Download);
+#[derive(Clone)]
+pub struct Install(pub Download, pub bool);
 pub struct UpdateView {
     preferences: Preferences,
     release: Option<Release>,
@@ -55,6 +54,9 @@ pub struct UpdateView {
     checking: bool,
     downloading: bool,
     progress: Option<Progress>,
+    restart: bool,
+    rate: f64,
+    sample: Option<(Instant, u64)>,
     status: SharedString,
     cancel: Arc<AtomicBool>,
     task: Option<Task<()>>,
@@ -71,6 +73,9 @@ impl UpdateView {
             checking: false,
             downloading: false,
             progress: None,
+            restart: true,
+            rate: 0.,
+            sample: None,
             status: t(cx, "updates.status.idle"),
             cancel: Arc::new(AtomicBool::new(false)),
             task: None,
@@ -280,6 +285,8 @@ impl UpdateView {
         self.downloading = true;
         self.download = None;
         self.progress = None;
+        self.rate = 0.;
+        self.sample = None;
         self.status = t(cx, "updates.status.downloading");
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
@@ -308,6 +315,23 @@ impl UpdateView {
             while let Ok(progress) = receiver.recv().await {
                 if owner
                     .update(cx, |this, cx| {
+                        if !progress.verifying {
+                            if let Some((when, bytes)) = this.sample {
+                                let elapsed = when.elapsed().as_secs_f64();
+                                if elapsed >= 0.2 {
+                                    let rate =
+                                        progress.bytes.saturating_sub(bytes) as f64 / elapsed;
+                                    this.rate = if this.rate == 0. {
+                                        rate
+                                    } else {
+                                        this.rate * 0.7 + rate * 0.3
+                                    };
+                                    this.sample = Some((Instant::now(), progress.bytes));
+                                }
+                            } else {
+                                this.sample = Some((Instant::now(), progress.bytes));
+                            }
+                        }
                         this.progress = Some(progress);
                         this.log(id, Phase::Progress, started, progress.bytes, "-", cx);
                         cx.notify();
@@ -414,7 +438,17 @@ impl Render for UpdateView {
                     t(cx, "updates.status.cancelling")
                 } else if let Some(progress) = self.progress {
                     if progress.verifying {
-                        t(cx, "updates.status.verifying")
+                        tr(
+                            cx,
+                            "updates.verify_progress",
+                            &[(
+                                "percent",
+                                &format!(
+                                    "{:.0}",
+                                    progress.bytes as f64 * 100. / progress.total.max(1) as f64
+                                ),
+                            )],
+                        )
                     } else {
                         tr(
                             cx,
@@ -438,7 +472,27 @@ impl Render for UpdateView {
                 } else {
                     t(cx, "updates.status.downloading")
                 };
-                el.child(status)
+                let percent = self
+                    .progress
+                    .map_or(0., |p| p.bytes as f32 * 100. / p.total.max(1) as f32);
+                el.child(gpui_component::progress::Progress::new().value(percent))
+                    .child(status)
+                    .when(
+                        self.rate > 0. && self.progress.is_some_and(|p| !p.verifying),
+                        |el| {
+                            let remaining = self
+                                .progress
+                                .map_or(0., |p| p.total.saturating_sub(p.bytes) as f64 / self.rate);
+                            el.child(tr(
+                                cx,
+                                "updates.transfer_rate",
+                                &[
+                                    ("speed", &format!("{:.1}", self.rate / 1048576.)),
+                                    ("seconds", &format!("{:.0}", remaining)),
+                                ],
+                            ))
+                        },
+                    )
             })
             .when(self.download.is_some(), |el| {
                 el.child(t(
@@ -454,6 +508,22 @@ impl Render for UpdateView {
                     },
                 ))
             })
+            .when(
+                self.download
+                    .as_ref()
+                    .is_some_and(|d| d.kind == PackageKind::WindowsInstaller),
+                |el| {
+                    el.child(
+                        gpui_component::checkbox::Checkbox::new("restart-after-update")
+                            .label(t(cx, "updates.restart"))
+                            .checked(self.restart)
+                            .on_click(cx.listener(|this, checked, _, cx| {
+                                this.restart = *checked;
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
             .child(
                 crate::feedback::actions()
                     .flex_wrap()
@@ -533,9 +603,9 @@ impl Render for UpdateView {
                                         .icon(IconName::ArrowDown)
                                         .label(t(cx, "updates.action.install"))
                                         .disabled(busy)
-                                        .on_click(cx.listener(move |_, _, window, cx| {
+                                        .on_click(cx.listener(move |this, _, window, cx| {
                                             window.close_dialog(cx);
-                                            cx.emit(Install(download.clone()));
+                                            cx.emit(Install(download.clone(), this.restart));
                                         })),
                                 )
                             },
@@ -568,73 +638,96 @@ fn installed() -> bool {
 }
 
 #[cfg(target_os = "windows")]
-#[derive(Serialize, Deserialize)]
-struct InstallerRequest {
-    path: PathBuf,
-    sha256: String,
-    parent: u32,
-    #[serde(default = "default_install_failure")]
-    failure_message: String,
-}
-
-#[cfg(target_os = "windows")]
-fn default_install_failure() -> String {
-    crate::locale_catalog::parse_pack(include_str!("../assets/locales/en.json"))
-        .expect("validated bundled pack")
-        .strings["updates.error.install_after_exit"]
-        .clone()
-}
-
-#[cfg(target_os = "windows")]
 pub fn launch_installer_helper(
     download: &Download,
-    failure_message: String,
+    restart: bool,
+    language: String,
 ) -> Result<std::process::Child, String> {
+    use service::{InstallEvent, InstallRequest};
     use std::{
-        io::{Read, Write},
+        io::{BufRead, Read, Write},
         os::windows::process::CommandExt,
         process::{Command, Stdio},
+        time::Duration,
     };
-    if download.kind != PackageKind::WindowsInstaller {
-        return Err("updates.error.install".into());
+    if download.kind != PackageKind::WindowsInstaller
+        || download
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(service::installer_version)
+            .is_none()
+    {
+        return Err("updates.error.package_identity".into());
     }
-    let mut child = Command::new(std::env::current_exe().map_err(|_| "updates.error.install")?)
-        .arg("--install-verified-update")
+    let application = std::env::current_exe().map_err(|_| "updates.error.target")?;
+    let source = application.with_file_name("turbodbnote-update-helper.exe");
+    let root = dirs::cache_dir()
+        .ok_or("updates.error.disk")?
+        .join("TurboDbNote/update-helper");
+    std::fs::create_dir_all(&root).map_err(|_| "updates.error.disk")?;
+    let staging = root.join(env!("CARGO_PKG_VERSION"));
+    std::fs::create_dir_all(&staging).map_err(|_| "updates.error.disk")?;
+    let executable = staging.join("turbodbnote-update-helper.exe");
+    let cancel = AtomicBool::new(false);
+    let hash = turbodbn_services::driver_packages::hash(&source, &cancel)
+        .map_err(|_| "updates.error.helper_missing")?;
+    std::fs::copy(&source, &executable).map_err(|_| "updates.error.disk")?;
+    service::verify(&executable, &hash, &cancel)?;
+    let mut child = Command::new(&executable)
         .creation_flags(0x08000000)
+        .current_dir(&staging)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|_| "updates.error.install")?;
-    let request = InstallerRequest {
+        .map_err(|_| "updates.error.helper_start")?;
+    let request = InstallRequest {
         path: download.path.clone(),
         sha256: download.sha256.clone(),
         parent: std::process::id(),
-        failure_message,
+        application,
+        restart,
+        language,
     };
     let result = (|| {
         let bytes = serde_json::to_vec(&request).map_err(|_| "updates.error.install")?;
         child
             .stdin
             .take()
-            .ok_or("updates.error.install")?
+            .ok_or("updates.error.helper_start")?
             .write_all(&bytes)
-            .map_err(|_| "updates.error.install")?;
-        let mut ready = [0];
-        let mut stdout = child.stdout.take().ok_or("updates.error.install")?;
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            .map_err(|_| "updates.error.helper_start")?;
+        let stdout = child.stdout.take().ok_or("updates.error.helper_start")?;
+        let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = stdout.read_exact(&mut ready).map(|()| ready);
-            let _ = sender.send(result);
+            let mut reader = std::io::BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                let result = (&mut reader).take(4097).read_line(&mut line);
+                if !matches!(result, Ok(1..=4096)) {
+                    let _ = sender.send(Err("updates.error.helper_start".to_string()));
+                    break;
+                }
+                match serde_json::from_str::<InstallEvent>(&line) {
+                    Ok(InstallEvent::Progress { .. }) => {}
+                    Ok(InstallEvent::Ready) => {
+                        let _ = sender.send(Ok(()));
+                    }
+                    Ok(InstallEvent::Failed(key)) => {
+                        let _ = sender.send(Err(key));
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = sender.send(Err("updates.error.helper_start".to_string()));
+                        break;
+                    }
+                }
+            }
         });
-        let ready = receiver
-            .recv_timeout(std::time::Duration::from_secs(60))
-            .map_err(|_| "updates.error.install")?
-            .map_err(|_| "updates.error.install")?;
-        if ready != [1] {
-            return Err("updates.error.install".into());
-        }
-        Ok(())
+        receiver
+            .recv_timeout(Duration::from_secs(120))
+            .map_err(|_| "updates.error.helper_start".to_string())?
     })();
     if result.is_err() {
         let _ = child.kill();
@@ -643,107 +736,12 @@ pub fn launch_installer_helper(
     result.map(|()| child)
 }
 #[cfg(not(target_os = "windows"))]
-pub fn launch_installer_helper(_: &Download, _: String) -> Result<std::process::Child, String> {
+pub fn launch_installer_helper(
+    _: &Download,
+    _: bool,
+    _: String,
+) -> Result<std::process::Child, String> {
     Err("updates.error.platform".into())
-}
-
-/// This mode runs before GPUI, diagnostics and the application lifetime mutex.
-#[cfg(target_os = "windows")]
-pub fn run_installer_helper() -> bool {
-    if std::env::args_os().nth(1).as_deref()
-        != Some(std::ffi::OsStr::new("--install-verified-update"))
-    {
-        return false;
-    }
-    let mut failure = default_install_failure();
-    if installer_helper(&mut failure).is_err() {
-        use std::io::Write;
-        let _ = std::io::stdout().write_all(&[0]);
-        let _ = std::io::stdout().flush();
-        use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
-        let text: Vec<u16> = failure.encode_utf16().chain(std::iter::once(0)).collect();
-        let title: Vec<u16> = "TurboDBNote\0".encode_utf16().collect();
-        unsafe {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                text.as_ptr(),
-                title.as_ptr(),
-                MB_OK | MB_ICONERROR,
-            );
-        }
-    }
-    true
-}
-#[cfg(target_os = "windows")]
-fn installer_helper(failure: &mut String) -> Result<(), String> {
-    use std::{
-        io::{Read, Write},
-        os::windows::{fs::OpenOptionsExt, process::CommandExt},
-    };
-    use windows_sys::Win32::{
-        Foundation::{CloseHandle, WAIT_OBJECT_0},
-        System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject},
-    };
-    let mut bytes = Vec::new();
-    std::io::stdin()
-        .take(16385)
-        .read_to_end(&mut bytes)
-        .map_err(|_| "updates.error.install")?;
-    if bytes.len() > 16384 {
-        return Err("updates.error.install".into());
-    }
-    let request: InstallerRequest =
-        serde_json::from_slice(&bytes).map_err(|_| "updates.error.install")?;
-    *failure = request.failure_message;
-    let root = dirs::cache_dir()
-        .ok_or("updates.error.install")?
-        .join("TurboDbNote/updates")
-        .canonicalize()
-        .map_err(|_| "updates.error.install")?;
-    let path = request
-        .path
-        .canonicalize()
-        .map_err(|_| "updates.error.install")?;
-    if !path.starts_with(root)
-        || !path.file_name().is_some_and(|name| {
-            name.to_string_lossy().starts_with("TurboDBNote-v")
-                && name.to_string_lossy().ends_with("-windows-x64-setup.exe")
-        })
-    {
-        return Err("updates.error.install".into());
-    }
-    // Keep a read handle that denies modification/deletion until the installer starts.
-    let _locked_package = std::fs::OpenOptions::new()
-        .read(true)
-        .share_mode(1)
-        .open(&path)
-        .map_err(|_| "updates.error.install")?;
-    let cancel = AtomicBool::new(false);
-    service::verify(&path, &request.sha256, &cancel)?;
-    let parent = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, request.parent) };
-    if parent.is_null() {
-        return Err("updates.error.install".into());
-    }
-    let mut stdout = std::io::stdout().lock();
-    let ready = stdout.write_all(&[1]).and_then(|()| stdout.flush());
-    drop(stdout);
-    let wait = if ready.is_ok() {
-        unsafe { WaitForSingleObject(parent, 300_000) }
-    } else {
-        u32::MAX
-    };
-    unsafe {
-        CloseHandle(parent);
-    }
-    if wait != WAIT_OBJECT_0 {
-        return Err("updates.error.install".into());
-    }
-    service::verify(&path, &request.sha256, &cancel)?;
-    std::process::Command::new(&path)
-        .creation_flags(0x08000000)
-        .spawn()
-        .map_err(|_| "updates.error.install")?;
-    Ok(())
 }
 
 #[cfg(test)]

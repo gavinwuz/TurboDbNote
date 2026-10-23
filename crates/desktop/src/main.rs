@@ -66,10 +66,6 @@ use gpui_component::{Root, TitleBar};
 
 fn main() {
     #[cfg(target_os = "windows")]
-    if updates::run_installer_helper() {
-        return;
-    }
-    #[cfg(target_os = "windows")]
     let _install_guard =
         windows_icon::install_guard().expect("Unable to register running application");
     Application::new().with_assets(assets::Assets).run(|cx| {
@@ -171,6 +167,20 @@ fn main() {
                 eprintln!("Unable to set TurboDBNote window icons: {error}");
             }
             let view = cx.new(|cx| workspace::Workspace::new(window, cx));
+            if std::env::args_os().any(|arg| arg == "--update-completed") {
+                window.defer(cx, |_, cx| {
+                    feedback::notify(
+                        gpui_component::notification::NotificationType::Success,
+                        locale::tr(
+                            cx,
+                            "updates.completed",
+                            &[("version", env!("CARGO_PKG_VERSION"))],
+                        ),
+                        cx,
+                    );
+                });
+            }
+
             let weak = view.downgrade();
             window.on_window_should_close(cx, move |window, cx| {
                 weak.update(cx, |view, cx| view.request_window_close(window, cx))

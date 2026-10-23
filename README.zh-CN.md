@@ -8,7 +8,7 @@
 
 基于 Rust 与 GPUI 的原生 SQL Notebook 和数据库工作台，将 SQL、Markdown、任务笔记、数据库浏览及 AI 对话放在一起。
 
-**版本 0.1.3 · Windows 与 Linux x64**
+**版本 0.1.4 · Windows 与 Linux x64**
 
 [下载](https://github.com/gavinwuz/TurboDbNote/releases) · [更新日志](CHANGELOG.zh-CN.md) · [发布流程](docs/releasing.zh-CN.md)
 
@@ -167,3 +167,5 @@ SQL查询与SQL文件共用连接／数据库选择器；列提示和 DDL 跟随
 Note 函数补全提供离线、按驱动区分的说明、参数和示例；Enter 插入函数名，Tab 插入可编辑调用模板。列补全与结果表头共用主键及类型标识。
 
 Note DDL 优先关联选中的表名或 SQL，其次使用当前语句；多表提供带来源行号的候选。未识别时明确选择，元数据加载失败保留目标并支持重试，不执行编辑器 SQL。
+
+Windows 安装版使用安装目录外的独立更新助手。下载和 SHA256 校验按字节显示进度；保存并确认后，助手等待进程及其他实例退出，再由常规安装器展示安装进度。安装成功后可选择重新打开。绿色版仍手动替换；旧安装版需手动升级一次以获得新助手。

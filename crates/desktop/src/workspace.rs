@@ -72,7 +72,7 @@ pub struct Workspace {
     update_status: String,
     updates: Entity<crate::updates::UpdateView>,
     _update_subscription: Subscription,
-    pending_install: Option<turbodbn_services::updates::Download>,
+    pending_install: Option<crate::updates::Install>,
     install_launching: bool,
     _settings_subscription: Subscription,
     _status_observe: Subscription,
@@ -681,7 +681,7 @@ impl Workspace {
                     );
                     return;
                 }
-                let download = event.0.clone();
+                let download = event.clone();
                 let owner = cx.entity().downgrade();
                 crate::feedback::confirm_labels(
                     t(cx, "updates.install.title"),
@@ -1139,7 +1139,11 @@ impl Workspace {
             self.install_launching = true;
             let id = uuid::Uuid::new_v4();
             let started = std::time::Instant::now();
-            let failure_message = t(cx, "updates.error.install_after_exit").to_string();
+            let language = cx
+                .global::<crate::preferences::Preferences>()
+                .general
+                .language
+                .clone();
             self.updates.update(cx, |updates, cx| {
                 updates.log(
                     id,
@@ -1156,14 +1160,14 @@ impl Workspace {
                 cx,
             );
             let work = cx.background_executor().spawn(async move {
-                crate::updates::launch_installer_helper(&download, failure_message)
+                crate::updates::launch_installer_helper(&download.0, download.1, language)
             });
             cx.spawn_in(window, async move |owner, cx| {
                 let result = work.await;
                 let _ = owner.update_in(cx, |this, window, cx| {
                     this.install_launching = false;
                     match result {
-                        Err(_) => {
+                        Err(error) => {
                             this.updates.update(cx, |updates, cx| {
                                 updates.log(
                                     id,
@@ -1174,7 +1178,7 @@ impl Workspace {
                                     cx,
                                 )
                             });
-                            crate::feedback::error(t(cx, "updates.error.install"), cx);
+                            crate::feedback::error(crate::locale::message(cx, &error), cx);
                         }
                         Ok(mut helper) => {
                             if this.database.read(cx).update_blocked(cx)

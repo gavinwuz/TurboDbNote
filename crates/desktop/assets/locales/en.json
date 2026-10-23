@@ -1906,6 +1906,27 @@
     "ddl.note.table_line": "{table} · L{line}",
     "ddl.note.retry": "Retry loading definition",
     "ddl.note.selection_tables": "Tables in the selection",
-    "ddl.note.definition_missing": "No visible definition was returned. Check the database, table name and metadata access, then retry."
+    "ddl.note.definition_missing": "No visible definition was returned. Check the database, table name and metadata access, then retry.",
+    "updates.restart": "Reopen TurboDBNote after updating",
+    "updates.transfer_rate": "{speed} MB/s · About {seconds} seconds remaining",
+    "updates.helper.title": "TurboDBNote Update",
+    "updates.helper.cancel": "Cancel update",
+    "updates.helper.waiting": "Waiting for TurboDBNote to exit…",
+    "updates.helper.others": "Close other TurboDBNote windows to continue.",
+    "updates.helper.installing": "Installing. Follow the installer progress.",
+    "updates.helper.wait_timeout": "TurboDBNote is still running. Close its other windows and start the update again.",
+    "updates.helper.install_cancelled": "Installation was cancelled. Your data was not removed.",
+    "updates.helper.restart_failed": "Installation finished, but TurboDBNote could not reopen. Open it from the installation folder.",
+    "updates.helper.recovery": "Open the downloaded installer folder? You can install manually, or reopen TurboDBNote from its existing shortcut.",
+    "updates.error.package_identity": "This installer does not match a supported Windows package. Download the update again.",
+    "updates.error.target": "The installation folder could not be verified. Open the downloaded installer manually.",
+    "updates.error.parent": "The running application could not be verified. TurboDBNote will remain open.",
+    "updates.error.helper_missing": "The update helper is missing or unreadable. Install this update manually to repair it.",
+    "updates.error.helper_start": "The update helper is not ready. TurboDBNote will remain open; retry or install manually.",
+    "updates.completed": "TurboDBNote has been updated to {version}.",
+    "updates.verify_progress": "Verifying installer · {percent}%",
+    "updates.helper.log_failed": "The update result could not be recorded. Check that the application cache folder is writable.",
+    "updates.helper.restart_recovery": "Open the installation folder to start TurboDBNote manually?",
+    "updates.error.in_progress": "Another update is already in progress. Close this application window so that update can continue."
   }
 }
