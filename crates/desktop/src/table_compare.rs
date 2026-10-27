@@ -31,11 +31,44 @@ struct Side {
     schema: Entity<InputState>,
     table: Entity<InputState>,
 }
+#[path = "compare_layout.rs"]
+mod layout;
+type SavedComparison = (
+    String,
+    Option<Entity<TableState<QueryGrid>>>,
+    [Option<Entity<TableState<QueryGrid>>>; 2],
+    bool,
+    bool,
+    bool,
+);
 pub struct Comparison {
+    field_filter: Entity<InputState>,
+    detail_grid: Option<Entity<TableState<QueryGrid>>>,
+    table_scroll: UniformListScrollHandle,
+    table_class: usize,
+    detail_class: usize,
+    progress: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    field_position: usize,
+    metadata_view: bool,
+    expanded_fields: std::collections::HashSet<String>,
+    saved_views: std::collections::HashMap<String, SavedComparison>,
     source: WeakEntity<DatabaseView>,
     sides: [Side; 2],
     structure: bool,
     busy: bool,
+    compare_control: Option<std::sync::Arc<turbodbn_services::database::transfer::Control>>,
+    whole_database: bool,
+    include_data: bool,
+    ignore_comments: bool,
+    ignore_column_order: bool,
+    reasons_view: bool,
+    table_reasons: std::collections::BTreeMap<String, Vec<comparison::Difference>>,
+    only_differences: bool,
+    snapshots: Option<[comparison::DatabaseSnapshot; 2]>,
+    selected_table: Option<String>,
+    sync_tables: std::collections::BTreeSet<String>,
+    table_status: std::collections::BTreeMap<String, bool>,
+    table_filter: Entity<InputState>,
     revision: u64,
     locked: std::rc::Rc<std::cell::Cell<bool>>,
     scroll_subscriptions: Vec<Subscription>,
@@ -49,6 +82,434 @@ pub struct Comparison {
 }
 impl EventEmitter<crate::table_view::TableDraftChanged> for Comparison {}
 impl Comparison {
+    fn start_database(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !cx
+            .global::<crate::preferences::Preferences>()
+            .database
+            .command_enabled("select")
+        {
+            feedback::error(t(cx, "compare.select_disabled"), cx);
+            return;
+        }
+
+        let Some(source) = self.source.upgrade() else {
+            return;
+        };
+        let mut endpoints = vec![];
+        let mut targets = self.snapshot(cx);
+        for target in &mut targets {
+            let db = source.read(cx);
+            if db.note_connection_state(target.connection) != Some(true) {
+                feedback::error(t(cx, "compare.connect_first"), cx);
+                return;
+            }
+            let saved = match db.saved_connection(target.connection, cx) {
+                Ok(s) => s,
+                Err(e) => {
+                    feedback::error(e, cx);
+                    return;
+                }
+            };
+            target.kind = saved.profile.kind;
+            target.generation = db.note_generation(target.connection);
+            match saved.endpoint(target.database.clone()) {
+                Ok(e) => endpoints.push(e),
+                Err(e) => {
+                    feedback::error(e, cx);
+                    return;
+                }
+            }
+        }
+        self.invalidate();
+        self.busy = true;
+        let revision = self.revision;
+        let include_data = self.include_data;
+        let ignore_comments = self.ignore_comments;
+        let ignore_order = self.ignore_column_order;
+        let kind = targets[0].kind;
+        let control =
+            std::sync::Arc::new(turbodbn_services::database::transfer::Control::default());
+        self.compare_control = Some(control.clone());
+        let output = source.read(cx).output.clone();
+        let job = uuid::Uuid::new_v4();
+        let started = std::time::Instant::now();
+        if let Some(output) = &output {
+            let record = crate::operation_log::Record::new(
+                job,
+                crate::operation_log::Kind::Metadata,
+                crate::operation_log::Phase::Started,
+            );
+            output.update(cx, |output, cx| output.operation(record, cx));
+        }
+        self.progress.store(0, std::sync::atomic::Ordering::Relaxed);
+        let progress = self.progress.clone();
+        cx.spawn(async move |owner, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+                let keep = owner
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        this.busy
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let (partial_tx, partial_rx) =
+            async_channel::bounded::<(usize, comparison::TableSnapshot)>(400);
+        let partial_targets = targets.clone();
+        cx.spawn_in(window, async move |owner, cx| {
+            while let Ok((side, table)) = partial_rx.recv().await {
+                let _ = owner.update_in(cx, |this, window, cx| {
+                    if this.revision != revision
+                        || !this.busy
+                        || partial_targets.iter().any(|target| {
+                            source.read(cx).note_generation(target.connection) != target.generation
+                        })
+                    {
+                        return;
+                    }
+                    let snapshots = this.snapshots.get_or_insert_with(|| {
+                        [
+                            comparison::DatabaseSnapshot { tables: vec![] },
+                            comparison::DatabaseSnapshot { tables: vec![] },
+                        ]
+                    });
+                    snapshots[side].tables.push(table);
+                    if snapshots[side].tables.len().is_multiple_of(50) {
+                        cx.notify();
+                    }
+                    let completed_key =
+                        comparison::table_key(snapshots[side].tables.last().unwrap());
+                    if this.selected_table.is_none()
+                        || this.selected_table.as_deref() == Some(&completed_key)
+                            && this.schemas.is_none()
+                    {
+                        let key = comparison::table_key(snapshots[side].tables.last().unwrap());
+                        this.show_database_table(&key, window, cx);
+                    }
+                });
+            }
+        })
+        .detach();
+        let source = self.source.upgrade().unwrap();
+        let work = cx.background_executor().spawn(async move {
+            let c = control;
+            let a = comparison::database_snapshot_stream(
+                &endpoints[0],
+                include_data,
+                &c,
+                |done, _| {
+                    progress.store(done, std::sync::atomic::Ordering::Relaxed);
+                },
+                |table| {
+                    let _ = partial_tx.send_blocking((0, table.clone()));
+                },
+            )?;
+            let a_count = a.tables.len();
+            let b = comparison::database_snapshot_stream(
+                &endpoints[1],
+                include_data,
+                &c,
+                |done, _| {
+                    progress.store(a_count + done, std::sync::atomic::Ordering::Relaxed);
+                },
+                |table| {
+                    let _ = partial_tx.send_blocking((1, table.clone()));
+                },
+            )?;
+            let reasons = comparison::database_pairs(&a, &b)
+                .into_iter()
+                .map(|key| {
+                    let l = comparison::database_find(&a, &key);
+                    let r = comparison::database_find(&b, &key);
+                    let mut reasons = comparison::structural_differences(
+                        kind,
+                        l,
+                        r,
+                        ignore_comments,
+                        ignore_order,
+                    );
+                    if include_data {
+                        let left = l
+                            .and_then(|table| table.rows.as_ref())
+                            .cloned()
+                            .unwrap_or_default();
+                        let right = r
+                            .and_then(|table| table.rows.as_ref())
+                            .cloned()
+                            .unwrap_or_default();
+                        let changed = comparison::data(
+                            &left,
+                            &l.map(|table| table.schema.clone()).unwrap_or_default(),
+                            &right,
+                            &r.map(|table| table.schema.clone()).unwrap_or_default(),
+                        )
+                        .different;
+                        if changed > 0 {
+                            reasons.push(comparison::Difference {
+                                category: "compare.reason.data",
+                                reference: left.values.len().to_string(),
+                                target: right.values.len().to_string(),
+                            });
+                        }
+                    }
+                    (key, reasons)
+                })
+                .collect::<std::collections::BTreeMap<_, _>>();
+            Ok::<_, String>(([a, b], reasons))
+        });
+        cx.spawn_in(window, async move |owner, cx| {
+            let result = work.await;
+            let _ = owner.update_in(cx, |this, window, cx| {
+                let cancelled = this
+                    .compare_control
+                    .as_ref()
+                    .is_some_and(|control| control.is_cancelled());
+                this.busy = false;
+                this.compare_control = None;
+                if let Some(output) = &output {
+                    let phase = if cancelled || this.revision != revision {
+                        crate::operation_log::Phase::Cancelled
+                    } else if result.is_ok() {
+                        crate::operation_log::Phase::Succeeded
+                    } else {
+                        crate::operation_log::Phase::Failed
+                    };
+                    let mut record = crate::operation_log::Record::new(
+                        job,
+                        crate::operation_log::Kind::Metadata,
+                        phase,
+                    );
+                    record.elapsed_ms = started.elapsed().as_millis() as u64;
+                    output.update(cx, |output, cx| output.operation(record, cx));
+                }
+                if this.revision != revision
+                    || targets
+                        .iter()
+                        .any(|t| source.read(cx).note_generation(t.connection) != t.generation)
+                {
+                    cx.notify();
+                    return;
+                }
+                match result {
+                    Ok((snapshots, reasons)) => {
+                        this.table_reasons = reasons;
+                        this.refresh_table_status();
+                        let keys = comparison::database_pairs(&snapshots[0], &snapshots[1]);
+                        this.compared_targets = Some(targets);
+                        this.snapshots = Some(snapshots);
+                        this.notice = tr(
+                            cx,
+                            "compare.database_summary",
+                            &[("count", &keys.len().to_string())],
+                        )
+                        .to_string();
+                        let visible = this.visible_tables(cx);
+                        let selected = this
+                            .selected_table
+                            .clone()
+                            .filter(|key| visible.contains(key))
+                            .or_else(|| visible.first().cloned());
+                        this.saved_views.clear();
+                        this.detail_grid = None;
+                        if let Some(key) = selected {
+                            this.show_database_table(&key, window, cx);
+                        } else {
+                            this.selected_table = None;
+                            this.schemas = None;
+                            this.grids = [None, None];
+                        }
+                    }
+                    Err(e) => {
+                        this.snapshots = None;
+                        this.schemas = None;
+                        this.detail_grid = None;
+                        this.grids = [None, None];
+                        this.saved_views.clear();
+                        this.selected_table = None;
+                        this.notice = if cancelled {
+                            t(cx, "compare.cancelled").to_string()
+                        } else {
+                            crate::locale::message(cx, &e).to_string()
+                        };
+                        if cancelled {
+                            feedback::notify(
+                                gpui_component::notification::NotificationType::Info,
+                                this.notice.clone(),
+                                cx,
+                            );
+                        } else {
+                            feedback::error(this.notice.clone(), cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+    fn show_database_table(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let previous = self.selected_table.clone();
+        if previous.as_deref() != Some(key)
+            && let Some(previous) = previous.clone()
+        {
+            self.saved_views.insert(
+                previous,
+                (
+                    self.field_filter.read(cx).value().to_string(),
+                    self.detail_grid.take(),
+                    self.grids.clone(),
+                    self.reasons_view,
+                    self.metadata_view,
+                    self.table_mode,
+                ),
+            );
+        }
+        if self.saved_views.len() > 32
+            && let Some(oldest) = self
+                .saved_views
+                .keys()
+                .find(|saved| saved.as_str() != key)
+                .cloned()
+        {
+            self.saved_views.remove(&oldest);
+        }
+        let Some(snapshots) = &self.snapshots else {
+            return;
+        };
+        let l = comparison::database_find(&snapshots[0], key);
+        let r = comparison::database_find(&snapshots[1], key);
+        if self.busy && (l.is_none() || r.is_none()) {
+            self.selected_table = Some(key.into());
+            self.schemas = None;
+            self.detail_grid = None;
+            self.grids = [None, None];
+            self.notice = t(cx, "compare.wait_pair").to_string();
+            cx.notify();
+            return;
+        }
+        let schemas = [
+            l.map(|t| t.schema.clone()).unwrap_or_default(),
+            r.map(|t| t.schema.clone()).unwrap_or_default(),
+        ];
+        let compared = if self.structure && !self.table_mode {
+            comparison::ddl(&schemas[0].ddl, &schemas[1].ddl)
+        } else if self.structure {
+            comparison::fields_with_options(
+                &schemas[0],
+                &schemas[1],
+                comparison::CompareOptions {
+                    ignore_comments: self.ignore_comments,
+                    only_differences: self.only_differences,
+                },
+            )
+        } else {
+            Ok(comparison::data(
+                &l.and_then(|t| t.rows.clone()).unwrap_or_default(),
+                &schemas[0],
+                &r.and_then(|t| t.rows.clone()).unwrap_or_default(),
+                &schemas[1],
+            ))
+        };
+        let reasons = self.table_reasons.get(key).cloned().unwrap_or_default();
+        self.reasons_view = self.structure;
+        self.selected_table = Some(key.into());
+        self.schemas = Some(schemas.clone());
+        self.ddl = [schemas[0].ddl.clone(), schemas[1].ddl.clone()];
+        if let Some(targets) = &mut self.compared_targets {
+            for (i, table) in [l, r].iter().enumerate() {
+                if let Some(table) = table {
+                    targets[i].object = table.object.clone();
+                } else {
+                    targets[i].object.name = key.rsplit('.').next().unwrap_or(key).into();
+                }
+            }
+        }
+        match compared {
+            Ok(c) => {
+                let differences = if self.structure && !self.busy {
+                    comparison::structure_details(
+                        self.sides[0].target.kind,
+                        &schemas[0],
+                        &schemas[1],
+                        comparison::CompareOptions {
+                            ignore_comments: self.ignore_comments,
+                            only_differences: true,
+                        },
+                        self.ignore_column_order,
+                        "",
+                    )
+                    .map(|rows| rows.values.len())
+                    .unwrap_or(c.different)
+                } else {
+                    c.different
+                };
+                self.set_grids(c, window, cx);
+                self.notice = tr(
+                    cx,
+                    "compare.database_preview_summary",
+                    &[
+                        ("tables", &self.table_status.len().to_string()),
+                        (
+                            "changed",
+                            &self
+                                .table_status
+                                .values()
+                                .filter(|v| **v)
+                                .count()
+                                .to_string(),
+                        ),
+                        ("table", key),
+                        ("rows", &differences.to_string()),
+                        (
+                            "scope",
+                            &t(
+                                cx,
+                                if self.structure {
+                                    "compare.scope_structure"
+                                } else {
+                                    "compare.scope_sample"
+                                },
+                            ),
+                        ),
+                    ],
+                )
+                .to_string();
+            }
+            Err(e) => feedback::error(crate::locale::message(cx, &e), cx),
+        }
+        let summary = reasons
+            .iter()
+            .filter(|reason| self.structure == (reason.category != "compare.reason.data"))
+            .map(|reason| t(cx, reason.category).to_string())
+            .collect::<Vec<_>>()
+            .join(" / ");
+        if !summary.is_empty() {
+            self.notice.push_str(" · ");
+            self.notice.push_str(&summary);
+        }
+        if previous.as_deref() != Some(key) && self.saved_views.contains_key(key) {
+            let (query, detail, grids, reasons, metadata, table_mode) =
+                self.saved_views.get(key).cloned().unwrap();
+            self.reasons_view = reasons;
+            self.metadata_view = metadata;
+            self.table_mode = table_mode;
+            self.field_filter
+                .update(cx, |input, cx| input.set_value(query, window, cx));
+            self.detail_grid = detail;
+            self.grids = grids;
+        } else {
+            self.refresh_detail(window, cx);
+        }
+        cx.notify();
+    }
     pub(crate) fn snapshot(&self, cx: &App) -> [OpenTable; 2] {
         std::array::from_fn(|i| {
             let mut target = self.sides[i].target.clone();
@@ -148,7 +609,7 @@ impl Comparison {
                 &side.database_picker,
                 window,
                 move |this, _, event: &SelectEvent<SearchableVec<String>>, window, cx| {
-                    if i == 0 || this.busy {
+                    if (i == 0 && !this.whole_database) || this.busy {
                         return;
                     }
                     if let SelectEvent::Confirm(Some(value)) = event {
@@ -164,11 +625,46 @@ impl Comparison {
                 },
             ));
         }
+        let table_filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "compare.search_tables")));
+        subscriptions.push(cx.observe(&table_filter, |_, _, cx| cx.notify()));
+        let field_filter =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "compare.search_fields")));
+        subscriptions.push(
+            cx.subscribe_in(&field_filter, window, |this, _, event, window, cx| {
+                if matches!(event, gpui_component::input::InputEvent::Change) {
+                    this.refresh_detail(window, cx);
+                }
+            }),
+        );
         Self {
+            field_filter,
+            detail_grid: None,
+            table_scroll: UniformListScrollHandle::new(),
+            table_class: 4,
+            detail_class: 0,
+            progress: Default::default(),
+            field_position: 0,
+            metadata_view: false,
+            expanded_fields: Default::default(),
+            saved_views: Default::default(),
             source,
             sides,
             structure,
             busy: false,
+            compare_control: None,
+            whole_database: target.object.name.is_empty(),
+            include_data: false,
+            ignore_comments: false,
+            ignore_column_order: true,
+            reasons_view: true,
+            table_reasons: Default::default(),
+            only_differences: true,
+            snapshots: None,
+            selected_table: None,
+            sync_tables: Default::default(),
+            table_status: Default::default(),
+            table_filter,
             revision: 0,
             locked: std::rc::Rc::new(std::cell::Cell::new(true)),
             scroll_subscriptions: vec![],
@@ -182,6 +678,19 @@ impl Comparison {
         }
     }
     fn invalidate(&mut self) {
+        if let Some(c) = self.compare_control.take() {
+            c.cancel();
+        }
+
+        self.detail_grid = None;
+        self.expanded_fields.clear();
+        self.saved_views.clear();
+        self.snapshots = None;
+        self.selected_table = None;
+        self.sync_tables.clear();
+        self.table_status.clear();
+        self.table_reasons.clear();
+        self.reasons_view = false;
         self.revision += 1;
         self.grids = [None, None];
         self.ddl = [String::new(), String::new()];
@@ -285,6 +794,10 @@ impl Comparison {
     }
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.busy {
+            return;
+        }
+        if self.whole_database {
+            self.start_database(window, cx);
             return;
         }
         let Some(source) = self.source.upgrade() else {
@@ -422,7 +935,14 @@ impl Comparison {
                     this.schemas = Some([values[0].1.clone(), values[1].1.clone()]);
                     this.compared_targets = Some([targets[0].clone(), targets[1].clone()]);
                     let result = if structure && this.table_mode {
-                        comparison::fields(&values[0].1, &values[1].1)
+                        comparison::fields_with_options(
+                            &values[0].1,
+                            &values[1].1,
+                            comparison::CompareOptions {
+                                ignore_comments: this.ignore_comments,
+                                only_differences: this.only_differences,
+                            },
+                        )
                     } else if structure {
                         comparison::ddl(&this.ddl[0], &this.ddl[1])
                     } else {
@@ -473,10 +993,13 @@ impl Comparison {
     }
     fn set_grids(
         &mut self,
-        compared: comparison::Compared,
+        mut compared: comparison::Compared,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.only_differences {
+            comparison::filter_differences(&mut compared);
+        }
         if self.structure {
             self.notice = tr(
                 cx,
@@ -574,24 +1097,170 @@ impl Comparison {
             feedback::error(t(cx, "compare.sync_cross_driver"), cx);
             return;
         }
-        let draft = match comparison::sync_ddl(
-            targets[0].kind,
-            &targets[0].database,
-            &targets[0].object,
-            &schemas[0],
-            &schemas[1],
-        ) {
-            Ok(draft) => draft,
-            Err(error) => {
-                feedback::error(crate::locale::message(cx, &error), cx);
+        let missing_right = self.whole_database
+            && self
+                .snapshots
+                .as_ref()
+                .zip(self.selected_table.as_ref())
+                .is_some_and(|(s, k)| comparison::database_find(&s[1], k).is_none());
+        let missing_left = self.whole_database
+            && self
+                .snapshots
+                .as_ref()
+                .zip(self.selected_table.as_ref())
+                .is_some_and(|(s, k)| comparison::database_find(&s[0], k).is_none());
+        if missing_left {
+            feedback::error(t(cx, "compare.no_drop_default"), cx);
+            return;
+        }
+        let filtered = schemas.clone();
+        let mut draft = if self.whole_database && !self.sync_tables.is_empty() {
+            let snapshots = self.snapshots.as_ref().unwrap();
+            let mut sql = String::new();
+            let mut incomplete = false;
+            let mut issues = vec![];
+            for key in &self.sync_tables {
+                let l = comparison::database_find(&snapshots[0], key);
+                let r = comparison::database_find(&snapshots[1], key);
+                let Some(l) = l else {
+                    incomplete = true;
+                    continue;
+                };
+                let object = r.map(|t| &t.object).unwrap_or(&l.object);
+                let result = if !self.structure {
+                    r.ok_or_else(|| "compare.data_sync_unavailable".to_string())
+                        .and_then(|r| {
+                            comparison::data_sync(
+                                targets[1].kind,
+                                &targets[1].database,
+                                object,
+                                l,
+                                r,
+                            )
+                        })
+                        .map(|sql| comparison::SyncDraft {
+                            sql,
+                            incomplete: l.more || r.is_some_and(|r| r.more),
+                            issues: vec![],
+                        })
+                } else if let Some(r) = r {
+                    (if self.ignore_comments {
+                        comparison::sync_preserving_comments
+                    } else {
+                        comparison::sync_ddl
+                    })(
+                        targets[1].kind,
+                        &targets[1].database,
+                        object,
+                        &r.schema,
+                        &l.schema,
+                    )
+                } else {
+                    comparison::create_table_draft(
+                        targets[1].kind,
+                        &targets[1].database,
+                        object,
+                        &l.schema,
+                    )
+                };
+                match result {
+                    Ok(d) => {
+                        sql.push_str(&format!("-- Table: {}\n", key.replace(['\n', '\r'], " ")));
+                        sql.push_str(&d.sql);
+                        sql.push('\n');
+                        incomplete |= d.incomplete;
+                        issues.extend(d.issues);
+                    }
+                    Err(e) => {
+                        feedback::error(crate::locale::message(cx, &e), cx);
+                        return;
+                    }
+                }
+                if sql.len() > 1024 * 1024 {
+                    feedback::error(t(cx, "compare.ddl_limit"), cx);
+                    return;
+                }
+            }
+            comparison::SyncDraft {
+                sql,
+                incomplete,
+                issues,
+            }
+        } else if missing_right {
+            match comparison::create_table_draft(
+                targets[1].kind,
+                &targets[1].database,
+                &targets[1].object,
+                &filtered[0],
+            ) {
+                Ok(d) => d,
+                Err(e) => {
+                    feedback::error(crate::locale::message(cx, &e), cx);
+                    return;
+                }
+            }
+        } else if !self.structure {
+            let Some(snapshots) = &self.snapshots else {
                 return;
+            };
+            let Some(key) = &self.selected_table else {
+                return;
+            };
+            let Some((l, r)) = comparison::database_find(&snapshots[0], key)
+                .zip(comparison::database_find(&snapshots[1], key))
+            else {
+                return;
+            };
+            match comparison::data_sync(
+                targets[1].kind,
+                &targets[1].database,
+                &targets[1].object,
+                l,
+                r,
+            ) {
+                Ok(sql) => comparison::SyncDraft {
+                    sql,
+                    incomplete: l.more || r.more,
+                    issues: vec![],
+                },
+                Err(e) => {
+                    feedback::error(crate::locale::message(cx, &e), cx);
+                    return;
+                }
+            }
+        } else {
+            match (if self.ignore_comments {
+                comparison::sync_preserving_comments
+            } else {
+                comparison::sync_ddl
+            })(
+                targets[1].kind,
+                &targets[1].database,
+                &targets[1].object,
+                &filtered[1],
+                &filtered[0],
+            ) {
+                Ok(draft) => draft,
+                Err(error) => {
+                    feedback::error(crate::locale::message(cx, &error), cx);
+                    return;
+                }
             }
         };
+        if self.structure
+            && let Err(e) = comparison::omit_column_deletions(targets[1].kind, &mut draft)
+        {
+            feedback::error(crate::locale::message(cx, &e), cx);
+            return;
+        }
         let issues = draft
             .issues
             .iter()
             .map(|item| {
-                if matches!(item.key, "compare.issue.column" | "compare.issue.comment") {
+                if matches!(
+                    item.key,
+                    "compare.issue.column" | "compare.issue.comment" | "compare.issue.parse_column"
+                ) {
                     tr(cx, item.key, &[("column", item.column.as_str())])
                 } else {
                     t(cx, item.key)
@@ -611,14 +1280,18 @@ impl Comparison {
             format!(
                 "{} / {}",
                 connection,
-                turbodbn_services::database::workbench::qualified(
-                    target.kind,
-                    &target.database,
-                    &target.object
-                )
+                if self.whole_database {
+                    target.database.clone()
+                } else {
+                    turbodbn_services::database::workbench::qualified(
+                        target.kind,
+                        &target.database,
+                        &target.object,
+                    )
+                }
             )
         });
-        let direction = format!("{}  ←  {}", labels[0], labels[1]);
+        let direction = format!("{}  →  {}", labels[0], labels[1]);
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .multi_line(true)
@@ -660,7 +1333,17 @@ impl Comparison {
                         })
                         .child(Input::new(&input).disabled(true).h(px(360.)))
                         .child(
-                            feedback::actions().child(feedback::close_button(cx)).child(
+                            feedback::actions().child(feedback::close_button(cx))
+                            .child(Button::new("save-sync-sql").icon(IconName::FolderOpen).label(t(cx,"compare.save_sql")).on_click({let sql=sql.clone();move|_,_window,cx|{
+                                let directory=dirs::document_dir().unwrap_or_else(||std::path::PathBuf::from("."));
+                                let name=format!("database-diff_{}.sql",chrono::Local::now().format("%Y%m%d_%H%M%S"));
+                                let pick=cx.prompt_for_new_path(&directory,Some(&name));let sql=sql.clone();
+                                cx.spawn(async move|cx|{if let Ok(Ok(Some(path)))=pick.await {
+                                    let result=cx.background_executor().spawn(async move{use std::io::Write;let mut temp=tempfile::NamedTempFile::new_in(path.parent().ok_or("compare.save_failed")?).map_err(|_|"compare.save_failed")?;temp.write_all(sql.as_bytes()).map_err(|_|"compare.save_failed")?;temp.persist_noclobber(path).map_err(|_|"compare.save_failed")?;Ok::<_,&str>(())}).await;
+                                    let _=cx.update(|cx|match result{Ok(())=>feedback::success(t(cx,"feedback.saved"),cx),Err(_)=>feedback::error(t(cx,"compare.save_failed"),cx)});
+                                }}).detach();
+                            }}))
+                            .child(
                                 Button::new("copy-sync-ddl")
                                     .icon(IconName::Copy)
                                     .label(t(cx, "dbwork.copy.ddl"))
@@ -708,7 +1391,7 @@ impl Comparison {
             .ghost()
             .justify_start()
             .w_full()
-            .disabled(busy || i == 0)
+            .disabled(busy || (i == 0 && !self.whole_database))
             .dropdown_caret(true)
             .when_some(profile.clone(), |b, p| {
                 b.child(crate::connection_choice::identity(&p))
@@ -720,7 +1403,7 @@ impl Comparison {
                     menu = menu.item(crate::connection_choice::item(&profile).on_click(
                         move |_, window, cx| {
                             let _ = owner.update(cx, |this, cx| {
-                                if this.busy || i == 0 {
+                                if this.busy || (i == 0 && !this.whole_database) {
                                     return;
                                 }
                                 let side = &mut this.sides[i];
@@ -770,11 +1453,10 @@ impl Comparison {
                 }
                 menu.scrollable(true).max_h(px(320.))
             });
-        let mut body =
+        let body =
             div()
                 .v_flex()
                 .flex_1()
-                .h_full()
                 .min_w_0()
                 .min_h_0()
                 .gap_2()
@@ -785,7 +1467,11 @@ impl Comparison {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(t(
                             cx,
-                            if i == 0 {
+                            if self.whole_database && i == 0 {
+                                "compare.reference_database"
+                            } else if self.whole_database {
+                                "compare.target_database"
+                            } else if i == 0 {
                                 "compare.current"
                             } else {
                                 "compare.target"
@@ -801,7 +1487,7 @@ impl Comparison {
                         .gap_1()
                         .child(div().flex_1().min_w_0().child(
                             Input::new(&side.database).cleanable(true).disabled(
-                                busy || i == 0
+                                busy || (i == 0 && !self.whole_database)
                                     || profile.as_ref().is_some_and(|p| {
                                         matches!(
                                             p.kind,
@@ -818,7 +1504,7 @@ impl Comparison {
                                     .placeholder("")
                                     .search_placeholder(t(cx, "dbwork.database.filter"))
                                     .disabled(
-                                        busy || i == 0
+                                        busy || (i == 0 && !self.whole_database)
                                             || profile.as_ref().is_some_and(|p| {
                                                 matches!(
                                                     p.kind,
@@ -839,187 +1525,61 @@ impl Comparison {
                         ))
                     },
                 )
-                .child(
-                    div()
-                        .h_flex()
-                        .w_full()
-                        .min_w_0()
-                        .gap_1()
-                        .child(
-                            div().flex_1().min_w_0().child(
-                                Input::new(&side.table)
-                                    .cleanable(true)
-                                    .disabled(busy || i == 0),
+                .when(!self.whole_database, |el| {
+                    el.child(
+                        div()
+                            .h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .gap_1()
+                            .child(
+                                div().flex_1().min_w_0().child(
+                                    Input::new(&side.table)
+                                        .cleanable(true)
+                                        .disabled(busy || (i == 0 && !self.whole_database)),
+                                ),
+                            )
+                            .child(
+                                Popover::new(("compare-table-picker", i))
+                                    .open(side.picker_open)
+                                    .trigger(
+                                        Button::new(("compare-table-arrow", i))
+                                            .ghost()
+                                            .icon(IconName::ChevronDown)
+                                            .tooltip(t(cx, "ddl.select_table"))
+                                            .disabled(busy || (i == 0 && !self.whole_database)),
+                                    )
+                                    .on_open_change({
+                                        let owner = cx.entity().downgrade();
+                                        move |open, window, cx| {
+                                            let _ = owner.update(cx, |this, cx| {
+                                                this.open_table_picker(i, *open, window, cx)
+                                            });
+                                        }
+                                    })
+                                    .content({
+                                        let owner = cx.entity().downgrade();
+                                        move |_, _, cx| {
+                                            owner
+                                                .upgrade()
+                                                .and_then(|owner| {
+                                                    owner.read(cx).sides[i].table_picker.clone()
+                                                })
+                                                .map(|picker| div().child(picker))
+                                                .unwrap_or_else(div)
+                                        }
+                                    }),
                             ),
-                        )
-                        .child(
-                            Popover::new(("compare-table-picker", i))
-                                .open(side.picker_open)
-                                .trigger(
-                                    Button::new(("compare-table-arrow", i))
-                                        .ghost()
-                                        .icon(IconName::ChevronDown)
-                                        .tooltip(t(cx, "ddl.select_table"))
-                                        .disabled(busy || i == 0),
-                                )
-                                .on_open_change({
-                                    let owner = cx.entity().downgrade();
-                                    move |open, window, cx| {
-                                        let _ = owner.update(cx, |this, cx| {
-                                            this.open_table_picker(i, *open, window, cx)
-                                        });
-                                    }
-                                })
-                                .content({
-                                    let owner = cx.entity().downgrade();
-                                    move |_, _, cx| {
-                                        owner
-                                            .upgrade()
-                                            .and_then(|owner| {
-                                                owner.read(cx).sides[i].table_picker.clone()
-                                            })
-                                            .map(|picker| div().child(picker))
-                                            .unwrap_or_else(div)
-                                    }
-                                }),
-                        ),
-                );
-        if self.structure {
-            body = body.child(
-                Button::new(("compare-copy-ddl", i))
-                    .ghost()
-                    .icon(IconName::Copy)
-                    .label(t(cx, "dbwork.copy.ddl"))
-                    .disabled(self.ddl[i].is_empty())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(this.ddl[i].clone()));
-                        feedback::success(t(cx, "feedback.copied"), cx);
-                    })),
-            );
-        }
-        if let Some(grid) = &self.grids[i] {
-            body = body.child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .child(crate::query_grid::view(grid, cx)),
-            );
-        }
+                    )
+                });
         body.into_any_element()
     }
 }
-impl Render for Comparison {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
-            .size_full()
-            .v_flex()
-            .min_w_0()
-            .gap_2()
-            .p_3()
-            .child(
-                div()
-                    .h_flex()
-                    .flex_wrap()
-                    .gap_2()
-                    .child(
-                        Button::new("compare-start")
-                            .icon(IconName::ArrowRight)
-                            .label(t(cx, "compare.run"))
-                            .disabled(self.busy)
-                            .on_click(cx.listener(|this, _, w, cx| this.start(w, cx))),
-                    )
-                    .child(
-                        Button::new("compare-sync")
-                            .ghost()
-                            .icon(IconName::Replace)
-                            .label(t(cx, "compare.sync_scroll"))
-                            .selected(self.locked.get())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.locked.set(!this.locked.get());
-                                if this.locked.get()
-                                    && let Some(grid) = &this.grids[0]
-                                    && let Some((link, _)) = &grid.read(cx).delegate().scroll_link
-                                {
-                                    link.synchronize(0);
-                                }
-                                cx.notify();
-                            })),
-                    )
-                    .when(self.structure, |el| {
-                        el.child(
-                            Button::new("compare-display")
-                                .ghost()
-                                .label(t(
-                                    cx,
-                                    if self.table_mode {
-                                        "compare.show_ddl"
-                                    } else {
-                                        "compare.show_fields"
-                                    },
-                                ))
-                                .disabled(self.busy)
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_structure(window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("compare-sync-preview")
-                                .ghost()
-                                .icon(IconName::Copy)
-                                .label(t(cx, "compare.sync_title"))
-                                .disabled(self.busy || self.schemas.is_none())
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.sync_preview(window, cx)
-                                    }),
-                                ),
-                        )
-                    })
-                    .child(
-                        div()
-                            .text_sm()
-                            .flex_1()
-                            .min_w_0()
-                            .whitespace_normal()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(t(
-                                cx,
-                                if self.structure && self.table_mode {
-                                    "compare.fields_hint"
-                                } else if self.structure {
-                                    "compare.ddl_hint"
-                                } else {
-                                    "compare.data_hint"
-                                },
-                            )),
-                    ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(cx, "compare.diff_legend")),
-            )
-            .when(self.busy, |b| b.child(t(cx, "ddl.loading")))
-            .when(!self.notice.is_empty(), |b| {
-                b.child(
-                    div()
-                        .text_sm()
-                        .whitespace_normal()
-                        .child(self.notice.clone()),
-                )
-            })
-            .child(
-                div()
-                    .h_flex()
-                    .items_start()
-                    .gap_3()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .child(self.side(0, cx))
-                    .child(self.side(1, cx)),
-            )
+
+impl Drop for Comparison {
+    fn drop(&mut self) {
+        if let Some(c) = &self.compare_control {
+            c.cancel();
+        }
     }
 }

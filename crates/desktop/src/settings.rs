@@ -223,10 +223,10 @@ impl Panel for SettingsView {
     fn dropdown_menu(
         &mut self,
         menu: gpui_component::menu::PopupMenu,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_component::menu::PopupMenu {
-        crate::tabs::editor_menu(menu, "settings", cx)
+        crate::tabs::opened_notes(menu, "settings", window, cx)
     }
     fn closable(&self, _: &App) -> bool {
         false

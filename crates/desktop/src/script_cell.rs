@@ -32,6 +32,7 @@ use turbodbn_services::{
 pub enum ScriptEvent {
     Run(bool),
     Reindexed(SqlScript),
+    RestoreOptions(turbodbn_core::notebook::RestoreOptions),
     SelectTarget,
     PermissionBlocked(crate::note_permissions::Advice),
     Finished { run: u64, success: bool },
@@ -287,6 +288,50 @@ impl ScriptView {
                 cx.notify();
             });
         }));
+    }
+    pub fn reanalyze(
+        &mut self,
+        dialect: turbodbn_core::notebook::SqlDialect,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active || self.indexing || self.locked {
+            return;
+        }
+        self.indexing = true;
+        self.status = t(cx, "script.reindexing");
+        let path = self.path.clone();
+        let snapshot = path.clone();
+        let script = self.script.clone();
+        let source = script.source_hash.clone();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        let work = cx
+            .background_executor()
+            .spawn(async move { sql_script::reparse(&path, &script, dialect, &cancel) });
+        self.page_task = Some(cx.spawn(async move |owner, cx| {
+            let result = work.await;
+            let _ = owner.update(cx, |this, cx| {
+                if this.path != snapshot || this.script.source_hash != source {
+                    return;
+                }
+                this.indexing = false;
+                match result {
+                    Ok(script) => {
+                        this.script = script.clone();
+                        this.index_error = false;
+                        this.status = "".into();
+                        cx.emit(ScriptEvent::Reindexed(script));
+                        this.load_page(0, cx);
+                    }
+                    Err(error) => {
+                        this.index_error = true;
+                        feedback::error(crate::locale::message(cx, &error), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
     }
     pub fn set_locked(&mut self, locked: bool, cx: &mut Context<Self>) {
         if self.locked != locked {

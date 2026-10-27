@@ -18,6 +18,7 @@ pub struct OpenTable {
 }
 pub(super) const TABLE_MENU_ACTIONS: &[(&str, &str, Option<crate::table_view::Mode>)] = &[
     ("designer.title", "", Some(crate::table_view::Mode::Design)),
+    ("indexes.title", "", Some(crate::table_view::Mode::Indexes)),
     ("designer.right", "structure", None),
     ("dbwork.data", "", Some(crate::table_view::Mode::Grid)),
     ("dbwork.note", "", Some(crate::table_view::Mode::Note)),
@@ -37,6 +38,64 @@ pub(super) const TABLE_MENU_ACTIONS: &[(&str, &str, Option<crate::table_view::Mo
     ("", "", None),
     ("dbwork.delete", "delete", None),
 ];
+pub(super) fn index_menu_items(
+    mut menu: gpui_component::menu::PopupMenu,
+    source: WeakEntity<DatabaseView>,
+    scope: (Uuid, String, u64),
+    object: Object,
+    cx: &App,
+) -> gpui_component::menu::PopupMenu {
+    let writable = source
+        .read_with(cx, |view, _| {
+            view.note_profile(scope.0).is_some_and(|profile| {
+                profile.supports_mutation()
+                    && matches!(
+                        profile.kind,
+                        DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+                    )
+            })
+        })
+        .unwrap_or(false);
+    for (key, kind) in [
+        ("indexes.view", "index"),
+        ("indexes.new", "index-create"),
+        ("indexes.stage_drop", "index-drop"),
+    ] {
+        let source = source.clone();
+        let scope = scope.clone();
+        let mut object = object.clone();
+        object.kind = kind.into();
+        let protected = object.name.eq_ignore_ascii_case("PRIMARY")
+            || object.name.starts_with("sqlite_autoindex_");
+        menu = menu.item(
+            PopupMenuItem::new(t(cx, key))
+                .disabled(kind != "index" && (!writable || kind == "index-drop" && protected))
+                .on_click(move |_, _, cx| {
+                    let _ = source.update(cx, |this, cx| {
+                        if this.note_generation(scope.0) != scope.2
+                            || this.note_connection_state(scope.0) != Some(true)
+                        {
+                            feedback::error(t(cx, "mcp.stale"), cx);
+                            return;
+                        }
+                        if let Some(profile) = this.note_profile(scope.0) {
+                            cx.emit(OpenTable {
+                                connection: scope.0,
+                                database: scope.1.clone(),
+                                object: object.clone(),
+                                mode: crate::table_view::Mode::Indexes,
+                                generation: scope.2,
+                                kind: profile.kind,
+                                writable: profile.supports_mutation(),
+                                mysql_raw_gbk: profile.mysql_raw_gbk,
+                            });
+                        }
+                    });
+                }),
+        );
+    }
+    menu
+}
 impl EventEmitter<OpenTable> for DatabaseView {}
 impl DatabaseView {
     pub(crate) fn mongo_context_current(&self, id: Uuid, generation: u64) -> bool {
@@ -122,7 +181,27 @@ impl DatabaseView {
             );
         }
     }
-    fn open_table(
+    fn index_context_menu(
+        &self,
+        object: Object,
+        row: AnyElement,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let Some((connection, database)) = self.selected_database.clone() else {
+            return row;
+        };
+        let scope = (connection, database, self.note_generation(connection));
+        let source = cx.entity().downgrade();
+        crate::context_menu::scoped(
+            SharedString::from(format!("index-menu-{}", Self::object_key(&object))),
+            row,
+            move |menu, _, cx| {
+                index_menu_items(menu, source.clone(), scope.clone(), object.clone(), cx)
+            },
+        )
+        .into_any_element()
+    }
+    pub(super) fn open_table(
         &mut self,
         object: Object,
         mode: crate::table_view::Mode,
@@ -203,7 +282,10 @@ impl DatabaseView {
             p.supports_mutation()
                 && matches!(
                     p.kind,
-                    DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+                    DatabaseKind::MySql
+                        | DatabaseKind::PostgreSql
+                        | DatabaseKind::Sqlite
+                        | DatabaseKind::ClickHouse
                 )
         });
         let connected = selected
@@ -213,6 +295,7 @@ impl DatabaseView {
         let relational = profile
             .as_ref()
             .is_some_and(|p| !matches!(p.kind, DatabaseKind::Redis | DatabaseKind::External));
+        let accounts = self.objects_accounts_supported();
         let copy_source = selected.clone();
         let mut body = div()
             .v_flex()
@@ -283,6 +366,36 @@ impl DatabaseView {
                             }),
                     )
                     .child(
+                        Button::new("objects-compare-databases")
+                            .ghost()
+                            .icon(IconName::Replace)
+                            .tooltip(t(cx, "compare.database_scope"))
+                            .disabled(!connected || busy || !relational)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some((connection, database)) = this.selected_database.clone()
+                                    && let Some(profile) =
+                                        this.profiles.iter().find(|p| p.id == connection)
+                                {
+                                    cx.emit(OpenTable {
+                                        connection,
+                                        database,
+                                        object: Object {
+                                            schema: String::new(),
+                                            name: String::new(),
+                                            kind: "table".into(),
+                                            comment: String::new(),
+                                            parent: String::new(),
+                                        },
+                                        mode: crate::table_view::Mode::StructureCompare,
+                                        generation: this.note_generation(connection),
+                                        kind: profile.kind,
+                                        writable: false,
+                                        mysql_raw_gbk: profile.mysql_raw_gbk,
+                                    });
+                                }
+                            })),
+                    )
+                    .child(
                         Button::new("objects-export")
                             .ghost()
                             .icon(gpui_component::Icon::default().path("icons/export.svg"))
@@ -300,11 +413,26 @@ impl DatabaseView {
                             .disabled(
                                 !connected
                                     || busy
-                                    || !(can_copy
+                                    || !(accounts
+                                        || can_copy
                                         || create_database.is_some()
                                         || (relational && writable)),
                             )
                             .dropdown_menu(move |mut menu, _, cx| {
+                                if accounts {
+                                    let view = source.clone();
+                                    menu = menu
+                                        .item(
+                                            PopupMenuItem::new(t(cx, "database.branch.users"))
+                                                .icon(IconName::User)
+                                                .on_click(move |_, _, cx| {
+                                                    let _ = view.update(cx, |this, cx| {
+                                                        this.objects_show_accounts(cx)
+                                                    });
+                                                }),
+                                        )
+                                        .separator();
+                                }
                                 if let Some(id) = create_database {
                                     let view = source.clone();
                                     menu = menu
@@ -566,6 +694,7 @@ impl DatabaseView {
         } else {
             format!("{}.{}", object.schema, object.name)
         };
+        let index_object = category == "index";
         let table = matches!(category, "table" | "view");
         root = root.child(
             div()
@@ -613,11 +742,30 @@ impl DatabaseView {
                                 .whitespace_nowrap()
                                 .child(name)
                                 .map(|label| {
-                                    if table {
+                                    if table || index_object {
                                         crate::context_menu::scoped(
                                             SharedString::from(format!("table-menu-{key}")),
                                             label,
                                             move |mut menu, _, cx| {
+                                                if index_object {
+                                                    if let Some(view) = view.upgrade()
+                                                        && let Some((id, db)) =
+                                                            view.read(cx).selected_database.clone()
+                                                    {
+                                                        return index_menu_items(
+                                                            menu,
+                                                            view.downgrade(),
+                                                            (
+                                                                id,
+                                                                db,
+                                                                view.read(cx).note_generation(id),
+                                                            ),
+                                                            menu_object.clone(),
+                                                            cx,
+                                                        );
+                                                    }
+                                                    return menu;
+                                                }
                                                 for &(label, action, mode) in TABLE_MENU_ACTIONS {
                                                     if label.is_empty() {
                                                         menu = menu.separator();
@@ -669,7 +817,11 @@ impl DatabaseView {
                         ),
                 )
                 .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
-                    if event.click_count() == 2 && table {
+                    if event.click_count() == 2 && index_object {
+                        let mut table = open.clone();
+                        table.kind = "index".into();
+                        this.open_table(table, crate::table_view::Mode::Indexes, cx);
+                    } else if event.click_count() == 2 && table {
                         this.open_table(open.clone(), crate::table_view::Mode::Grid, cx);
                     }
                 })),
@@ -771,7 +923,16 @@ impl DatabaseView {
                         gpui_component::Icon::new(IconName::Redo)
                     };
                     for (index, row) in rows.values.iter().enumerate() {
+                        let index_section = label == "dbwork.index";
                         let label = row.first().cloned().flatten().unwrap_or_default();
+                        let menu_index = Object {
+                            schema: object.schema.clone(),
+                            name: label.clone(),
+                            kind: "index".into(),
+                            comment: String::new(),
+                            parent: object.name.clone(),
+                        };
+                        let open_index = menu_index.clone();
                         let detail = row
                             .iter()
                             .filter_map(|v| v.as_deref())
@@ -794,9 +955,29 @@ impl DatabaseView {
                                         .whitespace_nowrap()
                                         .child(label),
                                 )
+                                .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                    if index_section && event.click_count() == 2 {
+                                        this.open_table(
+                                            open_index.clone(),
+                                            crate::table_view::Mode::Indexes,
+                                            cx,
+                                        );
+                                    }
+                                }))
                                 .tooltip(move |window, cx| {
                                     gpui_component::tooltip::Tooltip::new(detail.clone())
                                         .build(window, cx)
+                                })
+                                .map(|row| {
+                                    if index_section {
+                                        self.index_context_menu(
+                                            menu_index,
+                                            row.into_any_element(),
+                                            cx,
+                                        )
+                                    } else {
+                                        row.into_any_element()
+                                    }
                                 }),
                         );
                     }

@@ -35,6 +35,7 @@ use workbench::{Change, Filter, FilterJoin, FilterSet, PageOptions};
 pub enum Mode {
     Grid,
     Design,
+    Indexes,
     StructureCompare,
     Note,
     Er,
@@ -56,6 +57,8 @@ pub struct TableView {
     compare_view: Option<Entity<crate::table_compare::Comparison>>,
     filter_only: bool,
     designer: Option<Entity<crate::table_designer::Designer>>,
+    indexes: Option<Entity<crate::index_workbench::Indexes>>,
+    index_pending: bool,
     mongo_dirty: bool,
     mongo_preview: Option<turbodbn_core::mongo::Mutation>,
     mongo: Option<std::sync::Arc<turbodbn_core::mongo::Projection>>,
@@ -124,12 +127,81 @@ impl TableView {
         handles
     }
     pub(crate) fn restoration(&self, cx: &App) -> (OpenTable, Option<[OpenTable; 2]>) {
+        let mut target = self.target.clone();
+        if target.mode == Mode::Indexes && target.object.kind.starts_with("index-") {
+            target.object.kind = "index".into();
+        }
         (
-            self.target.clone(),
+            target,
             self.compare_view
                 .as_ref()
                 .map(|view| view.read(cx).snapshot(cx))
                 .or_else(|| self.restored_comparison.clone()),
+        )
+    }
+    pub(crate) fn route_index_request(
+        &mut self,
+        target: &OpenTable,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if target.mode == Mode::Indexes
+            && let Some(indexes) = &self.indexes
+        {
+            indexes.update(cx, |indexes, cx| {
+                indexes.request(
+                    &target.object.kind,
+                    &target.object.name,
+                    &target.object.parent,
+                    window,
+                    cx,
+                )
+            });
+        }
+    }
+    pub(crate) fn tab_identity(&self, cx: &App) -> (String, String, String) {
+        let profile = self.source.upgrade().and_then(|source| {
+            source
+                .read(cx)
+                .note_profile(self.target.connection)
+                .cloned()
+        });
+        let label = t(
+            cx,
+            match self.target.mode {
+                Mode::Grid => "dbwork.data",
+                Mode::Design => "designer.title",
+                Mode::Indexes => "indexes.title",
+                Mode::StructureCompare => "compare.structure",
+                Mode::Note => "dbwork.note",
+                Mode::Er => "dbwork.er",
+                Mode::Compare => "dbwork.compare",
+                Mode::Import => "dbwork.import",
+                Mode::Export => "dbwork.export",
+            },
+        );
+        (
+            format!(
+                "{} · {}",
+                if self.target.object.name.is_empty() {
+                    &self.target.database
+                } else {
+                    &self.target.object.name
+                },
+                label
+            ),
+            profile
+                .as_ref()
+                .map(|p| p.group.clone())
+                .unwrap_or_default(),
+            profile
+                .map(|p| {
+                    format!(
+                        "{} · {}:{} · {}",
+                        p.name, p.host, p.port, self.target.database
+                    )
+                })
+                .unwrap_or_default(),
         )
     }
     pub(crate) fn matches_target(&self, target: &OpenTable) -> bool {
@@ -138,6 +210,7 @@ impl TableView {
             && self.target.object.schema == target.object.schema
             && self.target.object.name == target.object.name
             && self.target.mode == target.mode
+            && (target.mode != Mode::Indexes || self.target.object.parent == target.object.parent)
             && (self.restored || self.target.generation == target.generation)
     }
     pub(crate) fn restored(
@@ -191,19 +264,23 @@ impl TableView {
                 }
                 view
             }));
-        } else if self.target.mode != Mode::Design {
+        } else if !matches!(self.target.mode, Mode::Design | Mode::Indexes) {
             self.load(cx);
         }
         cx.notify();
     }
     pub(crate) fn staged(&self) -> bool {
-        !self.changes.is_empty()
+        self.index_pending || !self.changes.is_empty()
     }
     pub(crate) fn writing(&self) -> bool {
         self.committing
     }
     pub(crate) fn discard_staged(&mut self, cx: &mut Context<Self>) {
         if !self.committing {
+            if let Some(indexes) = &self.indexes {
+                indexes.update(cx, |indexes, cx| indexes.discard(cx));
+            }
+            self.index_pending = false;
             self.changes.clear();
             self.insert_count = 0;
             self.selected = None;
@@ -267,7 +344,7 @@ impl TableView {
             cx.defer_in(window, |this, _, cx| {
                 if !matches!(
                     this.target.mode,
-                    Mode::Design | Mode::Compare | Mode::StructureCompare
+                    Mode::Design | Mode::Indexes | Mode::Compare | Mode::StructureCompare
                 ) {
                     this.load(cx);
                 }
@@ -326,6 +403,8 @@ impl TableView {
             compare_view: None,
             filter_only: false,
             designer: None,
+            indexes: None,
+            index_pending: false,
             mongo_dirty: false,
             mongo_preview: None,
             mongo: None,
@@ -1747,25 +1826,17 @@ impl Panel for TableView {
         crate::tabs::title(
             self.key.clone(),
             IconName::GalleryVerticalEnd,
-            format!(
-                "{} · {}",
-                self.target.object.name,
-                t(
-                    cx,
-                    match self.target.mode {
-                        Mode::Grid => "dbwork.data",
-                        Mode::Design => "designer.title",
-                        Mode::StructureCompare => "compare.structure",
-                        Mode::Note => "dbwork.note",
-                        Mode::Er => "dbwork.er",
-                        Mode::Compare => "dbwork.compare",
-                        Mode::Import => "dbwork.import",
-                        Mode::Export => "dbwork.export",
-                    }
-                )
-            ),
+            self.tab_identity(cx).0,
             cx,
         )
+    }
+    fn dropdown_menu(
+        &mut self,
+        menu: gpui_component::menu::PopupMenu,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui_component::menu::PopupMenu {
+        crate::tabs::opened_notes(menu, &self.key, window, cx)
     }
     fn closable(&self, _: &App) -> bool {
         false
@@ -1835,6 +1906,36 @@ impl TableView {
                 .child(self.filter_bar(cx))
                 .into_any_element();
         }
+        if self.target.mode == Mode::Indexes {
+            let indexes = self
+                .indexes
+                .get_or_insert_with(|| {
+                    cx.new(|cx| {
+                        crate::index_workbench::Indexes::new(
+                            self.source.clone(),
+                            self.target.clone(),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+                .clone();
+            if self.compare_subscription.is_none() {
+                self.compare_subscription = Some(cx.subscribe(
+                    &indexes,
+                    |this, indexes, _: &TableDraftChanged, cx| {
+                        this.index_pending = indexes.read(cx).pending();
+                        cx.emit(TableDraftChanged);
+                        cx.notify();
+                    },
+                ));
+            }
+            return div()
+                .size_full()
+                .min_h_0()
+                .child(indexes)
+                .into_any_element();
+        }
         if self.target.mode == Mode::Design {
             let designer = self
                 .designer
@@ -1849,7 +1950,12 @@ impl TableView {
                     })
                 })
                 .clone();
-            return div().size_full().child(designer).into_any_element();
+            return div()
+                .size_full()
+                .min_h_0()
+                .min_w_0()
+                .child(designer)
+                .into_any_element();
         }
         if let Some(change) = self.mongo_preview.take() {
             cx.defer_in(window, move |this, window, cx| {

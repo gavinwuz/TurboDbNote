@@ -3,6 +3,8 @@ use super::super::{
     DatabaseKind,
     workbench::{self, Object, Schema},
 };
+#[path = "mysql_ddl_parts.rs"]
+pub(super) mod mysql_parts;
 use sqlparser::{
     ast::{ColumnDef, ColumnOption, CreateTable, Expr, Statement, UnaryOperator, Value},
     dialect::{ClickHouseDialect, Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
@@ -28,6 +30,9 @@ fn issue(issues: &mut Vec<SyncIssue>, key: &'static str, column: &str) {
     }
 }
 fn parse(kind: DatabaseKind, ddl: &str) -> Option<CreateTable> {
+    if kind == DatabaseKind::MySql && (ddl.contains("/*!") || ddl.contains("/*M!")) {
+        return None;
+    }
     let dialect: Box<dyn Dialect> = match kind {
         DatabaseKind::MySql => Box::new(MySqlDialect {}),
         DatabaseKind::PostgreSql => Box::new(PostgreSqlDialect {}),
@@ -74,10 +79,13 @@ pub fn sync_ddl(
     {
         return Err("compare.ddl_limit".into());
     }
-    let (left, right) = (
-        parse(kind, &current.ddl).ok_or("compare.sync_parse")?,
-        parse(kind, &desired.ddl).ok_or("compare.sync_parse")?,
-    );
+    let (left, right) = match (parse(kind, &current.ddl), parse(kind, &desired.ddl)) {
+        (Some(left), Some(right)) => (left, right),
+        _ if kind == DatabaseKind::MySql => {
+            return mysql_recover(database, object, current, desired);
+        }
+        _ => return Err("compare.sync_parse".into()),
+    };
     let target = workbench::qualified(kind, database, object);
     let mut statements = vec![];
     let mut issues = vec![];
@@ -303,10 +311,31 @@ pub fn sync_ddl(
             }
         }
     }
+    if kind == DatabaseKind::MySql {
+        let (index_sql, unresolved) =
+            super::super::index_design::sync_mysql(database, object, current, desired);
+        statements.extend(index_sql);
+        if unresolved {
+            issue(&mut issues, "compare.issue.indexes", "");
+        } else {
+            issues.retain(|item| item.key != "compare.issue.indexes");
+            let constraints = |table: &CreateTable, schema: &Schema| {
+                table
+                    .constraints
+                    .iter()
+                    .map(ToString::to_string)
+                    .filter(|definition| !represented_index(schema, definition))
+                    .collect::<Vec<_>>()
+            };
+            if constraints(&left, current) == constraints(&right, desired) {
+                issues.retain(|item| item.key != "compare.issue.constraints");
+            }
+        }
+    }
     let incomplete = !issues.is_empty();
     let mut sql = String::from(
         "-- COPY ONLY: review before running in a Note.
--- Applies to the CURRENT (left) table; desired definitions come from the right.
+-- Applies to the explicitly named target; desired definitions come from the reference snapshot.
 -- DROP/MODIFY may lose data or fail on constraints. No automatic transaction or retry.
 ",
     );
@@ -350,6 +379,257 @@ pub fn sync_ddl(
         incomplete,
         issues,
     })
+}
+
+pub(super) fn mysql_comments(current: Option<&Schema>, desired: &Schema) -> Option<Schema> {
+    let target = mysql_parts::split(&desired.ddl)?;
+    let source = current.and_then(|schema| mysql_parts::split(&schema.ddl));
+    let rewrite = |value: &str, previous: Option<&str>| -> Option<String> {
+        let mut value = value.to_owned();
+        if let Some((start, end)) = workbench::comment_clause(&value).ok()? {
+            value.replace_range(start..end, "");
+        }
+        if let Some(previous) = previous
+            && let Some((start, end)) = workbench::comment_clause(previous).ok()?
+        {
+            value.push(' ');
+            value.push_str(&previous[start..end]);
+        }
+        Some(value)
+    };
+    let mut columns = Vec::new();
+    for (name, value) in &target.columns {
+        let previous = source
+            .as_ref()
+            .and_then(|s| s.columns.get(name))
+            .map(String::as_str);
+        // New columns have no old comment to preserve.
+        columns.push(if current.is_some() && previous.is_none() {
+            value.clone()
+        } else {
+            rewrite(value, previous)?
+        });
+    }
+    columns.extend(target.constraints);
+    let options = rewrite(&target.options, source.as_ref().map(|s| s.options.as_str()))?;
+    let mut output = desired.clone();
+    output.ddl = format!("CREATE TABLE _comments ({}) {}", columns.join(","), options);
+    for column in &mut output.columns {
+        column.comment = current
+            .and_then(|s| s.columns.iter().find(|c| c.name == column.name))
+            .map(|c| c.comment.clone())
+            .unwrap_or_default();
+    }
+    if let Some(index) = output
+        .indexes
+        .columns
+        .iter()
+        .position(|name| name.eq_ignore_ascii_case("Comment"))
+    {
+        for row in &mut output.indexes.values {
+            if let Some(value) = row.get_mut(index) {
+                *value = Some(String::new());
+            }
+        }
+    }
+    Some(output)
+}
+
+fn mysql_recover(
+    database: &str,
+    object: &Object,
+    current: &Schema,
+    desired: &Schema,
+) -> Result<SyncDraft, String> {
+    let (a, b) = (
+        mysql_parts::split(&current.ddl).ok_or("compare.sync_parse")?,
+        mysql_parts::split(&desired.ddl).ok_or("compare.sync_parse")?,
+    );
+    let kind = DatabaseKind::MySql;
+    let mut blocked = std::collections::BTreeSet::new();
+    for (name, definition) in a.columns.iter().chain(&b.columns) {
+        if parse(kind, &format!("CREATE TABLE _recovered ({definition})")).is_none() {
+            blocked.insert(name.clone());
+        }
+    }
+    let sanitized = |original: &Schema, columns: &std::collections::BTreeMap<String, String>| {
+        let mut schema = original.clone();
+        let mut definitions = original
+            .columns
+            .iter()
+            .filter_map(|c| columns.get(&c.name).filter(|_| !blocked.contains(&c.name)))
+            .cloned()
+            .collect::<Vec<_>>();
+        for (name, definition) in columns {
+            if !blocked.contains(name) && !original.columns.iter().any(|c| &c.name == name) {
+                definitions.push(definition.clone());
+            }
+        }
+        if definitions.is_empty() {
+            definitions.push("_recovery_placeholder INT".into());
+        }
+        schema.ddl = format!("CREATE TABLE _recovered ({})", definitions.join(","));
+        schema
+    };
+    let mut plan = sync_ddl(
+        kind,
+        database,
+        object,
+        &sanitized(current, &a.columns),
+        &sanitized(desired, &b.columns),
+    )?;
+    for name in blocked {
+        issue(&mut plan.issues, "compare.issue.parse_column", &name);
+    }
+    let non_index = |parts: &mysql_parts::Parts, schema: &Schema| {
+        parts
+            .constraints
+            .iter()
+            .filter(|definition| !represented_index(schema, definition))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    if non_index(&a, current) != non_index(&b, desired) {
+        issue(&mut plan.issues, "compare.issue.constraints", "");
+    }
+    if mysql_parts::options_key(&a.options) != mysql_parts::options_key(&b.options) {
+        issue(&mut plan.issues, "compare.issue.options", "");
+    }
+    plan.incomplete = !plan.issues.is_empty();
+    if plan.incomplete {
+        for item in &plan.issues {
+            plan.sql.push_str(&format!(
+                "\n-- MANUAL REVIEW: {} {:?}",
+                item.key, item.column
+            ));
+        }
+    }
+    plan.sql.insert_str(0, "-- Recovered individual columns and indexes from metadata; unsupported components are listed below.\n");
+    Ok(plan)
+}
+
+type ColumnAttributes =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+pub(super) fn column_attributes(kind: DatabaseKind, schema: &Schema) -> Option<ColumnAttributes> {
+    let table = match parse(kind, &schema.ddl) {
+        Some(table) => table,
+        None if kind == DatabaseKind::MySql => {
+            let parts = mysql_parts::split(&schema.ddl)?;
+            let columns = parts
+                .columns
+                .values()
+                .filter(|definition| {
+                    parse(kind, &format!("CREATE TABLE _detail ({definition})")).is_some()
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if columns.len() != parts.columns.len() {
+                return None;
+            }
+            parse(
+                kind,
+                &format!("CREATE TABLE _detail ({})", columns.join(",")),
+            )?
+        }
+        None => return None,
+    };
+    Some(
+        table
+            .columns
+            .into_iter()
+            .map(|column| {
+                let mut attributes = std::collections::BTreeMap::new();
+                attributes.insert("compare.column_definition".into(), column.to_string());
+                attributes.insert("grid.structure.type".into(), column.data_type.to_string());
+                attributes.insert(
+                    "ddl.column.not_null".into(),
+                    if column
+                        .options
+                        .iter()
+                        .any(|o| matches!(o.option, ColumnOption::NotNull))
+                    {
+                        "✓"
+                    } else {
+                        "—"
+                    }
+                    .into(),
+                );
+                for option in &column.options {
+                    let (key, value) = match &option.option {
+                        ColumnOption::NotNull | ColumnOption::Null => continue,
+                        ColumnOption::Default(value) => {
+                            ("compare.default_value", value.to_string())
+                        }
+                        ColumnOption::Comment(value) => ("ddl.column.comment", value.clone()),
+                        _ => ("ddl.column.extra", option.to_string()),
+                    };
+                    attributes
+                        .entry(key.into())
+                        .and_modify(|v| {
+                            v.push_str("; ");
+                            v.push_str(&value);
+                        })
+                        .or_insert(value);
+                }
+                (column.name.value, attributes)
+            })
+            .collect(),
+    )
+}
+
+fn represented_index(schema: &Schema, definition: &str) -> bool {
+    let Some(name) = mysql_parts::index_name(definition) else {
+        return false;
+    };
+    if !schema.index_columns.contains_key(&name) {
+        return false;
+    }
+    schema
+        .indexes
+        .values
+        .iter()
+        .any(|row| row.first().and_then(Option::as_deref) == Some(name.as_str()))
+}
+
+/// Canonical structural pieces, excluding names and mutable row-allocation counters.
+type ComparisonParts = (Vec<(String, String)>, Vec<String>, String);
+pub(super) fn comparison_parts(kind: DatabaseKind, schema: &Schema) -> Option<ComparisonParts> {
+    use sqlparser::ast::{CreateTableOptions, SqlOption};
+    let mut table = match parse(kind, &schema.ddl) {
+        Some(table) => table,
+        None if kind == DatabaseKind::MySql => {
+            let parts = mysql_parts::split(&schema.ddl)?;
+            return Some((
+                parts.columns.into_iter().collect(),
+                parts
+                    .constraints
+                    .into_iter()
+                    .filter(|definition| !represented_index(schema, definition))
+                    .collect(),
+                mysql_parts::options_key(&parts.options),
+            ));
+        }
+        None => return None,
+    };
+    let columns = table
+        .columns
+        .iter()
+        .map(|column| (column.name.value.clone(), column.to_string()))
+        .collect();
+    let mut constraints = table
+        .constraints
+        .iter()
+        .map(ToString::to_string)
+        .filter(|definition| kind != DatabaseKind::MySql || !represented_index(schema, definition))
+        .collect::<Vec<_>>();
+    constraints.sort();
+    table.columns.clear();
+    table.constraints.clear();
+    table.name = parse(kind, "CREATE TABLE _comparison (id INT)")?.name;
+    if let CreateTableOptions::Plain(options) = &mut table.table_options {
+        options.retain(|option|!matches!(option,SqlOption::KeyValue{key,..} if key.value.eq_ignore_ascii_case("AUTO_INCREMENT")));
+    }
+    Some((columns, constraints, table.to_string()))
 }
 
 #[cfg(test)]
@@ -512,5 +792,78 @@ mod tests {
                 .is_err()
             );
         }
+    }
+    #[test]
+    fn unknown_table_option_does_not_block_known_column_changes() {
+        let a = schema(
+            "CREATE TABLE old(id INT DEFAULT 0 COMMENT 'old') ENGINE=InnoDB FUTURE_OPTION='x'",
+        );
+        let b = schema(
+            "CREATE TABLE desired(id BIGINT DEFAULT 1 COMMENT 'new', label VARCHAR(30)) ENGINE=InnoDB FUTURE_OPTION='x'",
+        );
+        assert!(parse(DatabaseKind::MySql, &a.ddl).is_none());
+        let plan = sync_ddl(DatabaseKind::MySql, "target", &object(), &a, &b).unwrap();
+        assert!(
+            plan.sql
+                .contains("MODIFY COLUMN `id` BIGINT DEFAULT 1 COMMENT 'new'"),
+            "{}",
+            plan.sql
+        );
+        assert!(plan.sql.contains("ADD COLUMN `label` VARCHAR(30)"));
+        assert!(!plan.sql.contains("DROP TABLE"));
+    }
+    #[test]
+    fn recovery_skips_unknown_columns_without_dropping_or_modifying_them() {
+        let a = schema(
+            "CREATE TABLE old(id INT, opaque FUTURE_TYPE FUTURE_COLUMN_OPTION) FUTURE_OPTION='x'",
+        );
+        let b = schema(
+            "CREATE TABLE desired(id BIGINT, opaque FUTURE_TYPE FUTURE_COLUMN_OPTION) FUTURE_OPTION='x'",
+        );
+        let plan = sync_ddl(DatabaseKind::MySql, "target", &object(), &a, &b).unwrap();
+        assert!(plan.sql.contains("MODIFY COLUMN `id` BIGINT"));
+        assert!(!plan.sql.contains("DROP COLUMN `opaque`"));
+        assert!(!plan.sql.contains("MODIFY COLUMN `opaque`"));
+        assert!(plan.incomplete);
+    }
+    #[test]
+    fn recovered_comment_preservation_keeps_target_comment_and_default_literals() {
+        let a = schema(
+            "CREATE TABLE old(id INT COMMENT 'keep') COMMENT='target table' FUTURE_OPTION='x'",
+        );
+        let b = schema(
+            "CREATE TABLE desired(id BIGINT DEFAULT 'COMMENT text' COMMENT 'replace') COMMENT='source table' FUTURE_OPTION='x'",
+        );
+        let plan = super::super::sync_preserving_comments(
+            DatabaseKind::MySql,
+            "target",
+            &object(),
+            &a,
+            &b,
+        )
+        .unwrap();
+        assert!(
+            plan.sql.contains("DEFAULT 'COMMENT text' COMMENT 'keep'"),
+            "{}",
+            plan.sql
+        );
+        assert!(!plan.sql.contains("COMMENT 'replace'"));
+    }
+    #[test]
+    fn mysql_versioned_fulltext_clause_does_not_block_unrelated_column_alignment() {
+        let a = schema(
+            "CREATE TABLE old(id INT, body TEXT, FULLTEXT KEY idx_body(body) /*!50100 WITH PARSER `ngram` */) ENGINE=InnoDB",
+        );
+        let b = schema(
+            "CREATE TABLE desired(id BIGINT, body TEXT, FULLTEXT KEY idx_body(body) /*!50100 WITH PARSER `ngram` */) ENGINE=InnoDB",
+        );
+        let plan = sync_ddl(DatabaseKind::MySql, "target", &object(), &a, &b).unwrap();
+        assert!(
+            plan.sql.contains("MODIFY COLUMN `id` BIGINT"),
+            "{}",
+            plan.sql
+        );
+        assert!(!plan.sql.contains("DROP INDEX"));
+        assert!(!plan.sql.contains("ADD FULLTEXT"));
     }
 }

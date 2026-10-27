@@ -490,7 +490,11 @@ impl Workspace {
                     &event.database,
                     &event.object.schema,
                     &event.object.name,
-                    format!("{:?}", event.mode),
+                    if event.mode == crate::table_view::Mode::Indexes {
+                        format!("{:?}:{}", event.mode, event.object.parent)
+                    } else {
+                        format!("{:?}", event.mode)
+                    },
                     event.generation,
                 ))
                 .expect("tab identity");
@@ -517,7 +521,10 @@ impl Workspace {
                     })
                     .clone();
                 this.watch_table(&key, &panel, cx);
-                panel.update(cx, |panel, cx| panel.resume_restored(window, cx));
+                panel.update(cx, |panel, cx| {
+                    panel.resume_restored(window, cx);
+                    panel.route_index_request(event, window, cx);
+                });
                 this.leave_focus(window, cx);
                 this.put_center_panel(&key, Arc::new(panel), window, cx);
                 this.center_order.retain(|n| n != &key);

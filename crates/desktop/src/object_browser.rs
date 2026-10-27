@@ -6,6 +6,10 @@ use turbodbn_services::database::{
 };
 #[derive(Clone)]
 pub(super) enum TreeRow {
+    Accounts,
+    Account(Object),
+    AccountsPage,
+    AccountsEmpty,
     Category(&'static str),
     Object(Object),
     Page(String),
@@ -13,6 +17,10 @@ pub(super) enum TreeRow {
 impl TreeRow {
     pub fn key(&self) -> String {
         match self {
+            Self::Accounts => "accounts".into(),
+            Self::Account(o) => format!("account:{}", key(o)),
+            Self::AccountsPage => "accounts-page".into(),
+            Self::AccountsEmpty => "accounts-empty".into(),
             Self::Category(c) => format!("category:{c}"),
             Self::Object(o) => key(o),
             Self::Page(c) => format!("page:{c}"),

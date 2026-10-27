@@ -7,8 +7,10 @@ mod input_geometry_contracts;
 #[path = "../../../vendor/gpui-component/src/input/highlight_map.rs"]
 mod input_highlight_contracts;
 
+mod content_scroll;
 mod ddl_picker;
 mod grid_metrics;
+mod index_workbench;
 mod object_browser;
 mod table_compare;
 mod table_designer;

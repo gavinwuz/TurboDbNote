@@ -17,7 +17,7 @@ fn source(kind: DatabaseKind, version: &str, db: &str, category: &str) -> Result
  let types=match category {"relations"=>"'table','view'","index"=>"'index'","trigger"=>"'trigger'",_=>return Ok("SELECT '' AS name,'' AS kind,'' AS comment,'' AS parent,'' AS scope WHERE 0".into())};
  format!("SELECT name,type AS kind,'' AS comment,CASE WHEN type IN ('table','view') THEN '' ELSE tbl_name END AS parent,'' AS scope FROM sqlite_master WHERE type IN ({types}) AND name NOT LIKE 'sqlite_%'")},
  DatabaseKind::PostgreSql=>match category {
- "relations"|"index"=>format!("SELECT c.relname AS name,CASE WHEN c.relkind IN ('v','m') THEN 'view' WHEN c.relkind='i' THEN 'index' ELSE 'table' END AS kind,COALESCE(obj_description(c.oid),'') AS comment,'' AS parent,n.nspname AS scope FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ({}) AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'",if category=="index" {"'i'"} else {"'r','p','v','m','f'"}),
+ "relations"|"index"=>format!("SELECT c.relname AS name,CASE WHEN c.relkind IN ('v','m') THEN 'view' WHEN c.relkind='i' THEN 'index' ELSE 'table' END AS kind,COALESCE(obj_description(c.oid),'') AS comment,COALESCE((SELECT t.relname FROM pg_index i JOIN pg_class t ON t.oid=i.indrelid WHERE i.indexrelid=c.oid),'') AS parent,n.nspname AS scope FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE c.relkind IN ({}) AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%'",if category=="index" {"'i'"} else {"'r','p','v','m','f'"}),
  "trigger"=>"SELECT t.tgname AS name,'trigger' AS kind,'' AS comment,c.relname AS parent,n.nspname AS scope FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE NOT t.tgisinternal".into(),
  "procedure"|"function"=>format!("SELECT p.proname||'('||pg_get_function_identity_arguments(p.oid)||')' AS name,{} AS kind,COALESCE(obj_description(p.oid),'') AS comment,'' AS parent,n.nspname AS scope FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND p.prokind={}",literal_for(kind,category),if category=="procedure" {"'p'"} else {"'f'"}),
  _=>return Ok("SELECT '' AS name,'' AS kind,'' AS comment,'' AS parent,'' AS scope WHERE false".into())},
@@ -370,20 +370,10 @@ pub async fn section(
     };
     let mut rows = c.query(&sql).await?;
     if kind == DatabaseKind::MySql && section == "dbwork.index" {
-        rows = super::workbench::Rows {
-            columns: vec!["Index".into(), "Column".into(), "Non_unique".into()],
-            values: rows
-                .values
-                .iter()
-                .map(|r| {
-                    vec![
-                        r.get(2).cloned().flatten(),
-                        r.get(4).cloned().flatten(),
-                        r.get(1).cloned().flatten(),
-                    ]
-                })
-                .collect(),
-        };
+        (rows, schema.index_columns) = super::index_design::mysql_metadata(&rows);
+    }
+    if section == "dbwork.index" {
+        rows = super::index_design::compact_rows(&rows);
     }
     if rows.values.len() > 200 {
         return Err("browser.section_limit".into());

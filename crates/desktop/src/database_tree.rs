@@ -1290,7 +1290,10 @@ impl DatabaseView {
                     && profile.is_some_and(|p| {
                         matches!(
                             p.kind,
-                            DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+                            DatabaseKind::MySql
+                                | DatabaseKind::PostgreSql
+                                | DatabaseKind::Sqlite
+                                | DatabaseKind::ClickHouse
                         )
                     });
                 let button = Button::new(SharedString::from(key.clone()))
@@ -1444,6 +1447,19 @@ impl DatabaseView {
                     })
                     .label(label)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        if category == "index" && this.tree_select(&scope, cx) {
+                            this.open_table(
+                                Object {
+                                    schema: String::new(),
+                                    name: String::new(),
+                                    kind: "table".into(),
+                                    comment: String::new(),
+                                    parent: String::new(),
+                                },
+                                crate::table_view::Mode::Indexes,
+                                cx,
+                            );
+                        }
                         if this.tree_toggle_branch(key.clone(), cx)
                             && this.tree_object_query(cx).is_empty()
                             && !this
@@ -1518,7 +1534,15 @@ impl DatabaseView {
                                     if !this.tree_select(&scope, cx) {
                                         return;
                                     }
-                                    if event.click_count() == 2 && table {
+                                    if event.click_count() == 2 && object.kind == "index" {
+                                        let mut parent = object.clone();
+                                        parent.kind = "index".into();
+                                        this.open_table(
+                                            parent,
+                                            crate::table_view::Mode::Indexes,
+                                            cx,
+                                        );
+                                    } else if event.click_count() == 2 && table {
                                         this.tree_action(
                                             scope.clone(),
                                             object.clone(),
@@ -1544,6 +1568,19 @@ impl DatabaseView {
                             )),
                             move |mut menu, _, cx| {
                                 if !table {
+                                    if menu_object.kind == "index" {
+                                        return workbench_ui::index_menu_items(
+                                            menu,
+                                            owner.clone(),
+                                            (
+                                                menu_scope.id,
+                                                menu_scope.database.clone(),
+                                                menu_scope.generation,
+                                            ),
+                                            menu_object.clone(),
+                                            cx,
+                                        );
+                                    }
                                     return menu;
                                 }
                                 for &(label, action, mode) in workbench_ui::TABLE_MENU_ACTIONS {

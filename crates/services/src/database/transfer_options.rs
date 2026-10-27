@@ -10,6 +10,7 @@ pub enum WriteMode {
 }
 #[derive(Clone, Serialize)]
 pub struct Options {
+    pub restore: Option<super::super::mysql_restore::Options>,
     pub collation: Option<String>,
     pub crlf: bool,
     pub excluded_objects: Vec<(String, String)>,
@@ -24,6 +25,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            restore: None,
             collation: None,
             crlf: false,
             excluded_objects: vec![],
@@ -70,11 +72,14 @@ impl Options {
         if !(1..=10000).contains(&self.batch_size) {
             return Err("分批行数须为 1–10000".into());
         }
-        if self.tables.as_ref().is_some_and(Vec::is_empty) {
+        if self.tables.as_ref().is_some_and(|names| {
+            names.is_empty() || names.iter().any(|name| name.trim().is_empty())
+        }) {
             return Err("请选择至少一个表".into());
         }
         if mode == Mode::ImportFile
-            && (self.tables.is_some() || self.write_mode != WriteMode::Append)
+            && ((self.tables.is_some() && profile.kind != DatabaseKind::ClickHouse)
+                || self.write_mode != WriteMode::Append)
         {
             return Err("SQL 文件按原始脚本执行，不支持改写导入模式或筛选表".into());
         }
@@ -82,6 +87,9 @@ impl Options {
             && (mode != Mode::ImportConnection || contents.schema || !contents.data)
         {
             return Err("覆盖或更新插入仅适用于连接间的仅数据导入".into());
+        }
+        if profile.kind == DatabaseKind::ClickHouse && self.write_mode != WriteMode::Append {
+            return Err("clickhouse.transfer.append_only".into());
         }
         if profile.kind == DatabaseKind::PostgreSql && self.write_mode != WriteMode::Append {
             return Err("PostgreSQL 当前仅支持追加；覆盖与主键更新尚未接通".into());
@@ -109,6 +117,9 @@ pub struct Preview {
 }
 
 pub fn preview_grid(endpoint: &Endpoint, table: Option<&str>) -> Result<Preview, String> {
+    if endpoint.profile.kind == DatabaseKind::ClickHouse {
+        return super::clickhouse::preview(endpoint, table);
+    }
     if endpoint.profile.kind == DatabaseKind::Sqlite {
         let control = Control::default();
         let db = sqlite_open(Path::new(&endpoint.profile.sqlite_path), false, &control)?;

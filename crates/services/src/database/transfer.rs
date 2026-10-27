@@ -1,3 +1,5 @@
+#[path = "clickhouse_transfer.rs"]
+mod clickhouse;
 #[path = "transfer_diagnostic.rs"]
 mod diagnostic;
 #[path = "export_text.rs"]
@@ -72,7 +74,7 @@ pub enum Event {
 }
 #[derive(Default)]
 pub struct Control {
-    cancelled: AtomicBool,
+    cancelled: Arc<AtomicBool>,
     sqlite: std::sync::Mutex<Option<rusqlite::InterruptHandle>>,
 }
 impl Control {
@@ -145,6 +147,9 @@ pub fn preflight(
     new_database: &str,
     c: &Control,
 ) -> Result<String, String> {
+    if source.profile.kind == DatabaseKind::ClickHouse {
+        return clickhouse::preflight(source, target, mode, new_database, c);
+    }
     c.check()?;
     if source.profile.mysql_raw_gbk || target.is_some_and(|t| t.profile.mysql_raw_gbk) {
         return Err("mysql.gbk.transfer_disabled".into());
@@ -295,6 +300,54 @@ impl Job {
         control: Arc<Control>,
         tx: &async_channel::Sender<Event>,
     ) -> Result<(), String> {
+        if let Some(options) = &self.options.restore {
+            if self.mode != Mode::ImportFile || self.source.profile.kind != DatabaseKind::MySql {
+                return Err("restore.statement".into());
+            }
+            let mut target = self.target.take().ok_or("restore.target")?;
+            if target.profile.kind != DatabaseKind::MySql {
+                return Err("restore.target".into());
+            }
+            target.profile.database.clear();
+            let snapshot = freeze_file(&self.file, &control)?;
+            if snapshot.as_file().metadata().map_err(io_error)?.len() > 16 * 1024 * 1024 {
+                return Err("restore.limit".into());
+            }
+            let text = std::fs::read_to_string(snapshot.path()).map_err(io_error)?;
+            let preview = super::mysql_restore::adapt(&text, options)?;
+            let names = query(&target, "SHOW DATABASES;")?;
+            if names
+                .lines()
+                .any(|n| n.eq_ignore_ascii_case(&options.database))
+            {
+                return Err("restore.exists".into());
+            }
+            let version = query(&target, "SELECT VERSION();")?;
+            let sql_mode = query(&target, "SELECT @@SESSION.sql_mode;")?;
+            if sql_mode
+                .trim()
+                .split(',')
+                .any(|m| matches!(m, "NO_BACKSLASH_ESCAPES" | "ANSI_QUOTES"))
+            {
+                return Err("script.error.mode".into());
+            }
+
+            if preview.generated_columns
+                && !version.trim().starts_with("8.")
+                && !version.trim().starts_with("5.7.")
+            {
+                return Err("restore.version".into());
+            }
+            let mut adapted = tempfile::NamedTempFile::new().map_err(io_error)?;
+            adapted
+                .write_all(preview.sql.as_bytes())
+                .map_err(io_error)?;
+            adapted.flush().map_err(io_error)?;
+            return mysql_import(&target, adapted.path(), &control, tx);
+        }
+        if self.source.profile.kind == DatabaseKind::ClickHouse {
+            return clickhouse::run(self, &control, tx);
+        }
         supported(&self.source.profile)?;
         self.options
             .validate(self.mode, self.contents, &self.source.profile)?;
@@ -1214,9 +1267,11 @@ fn mysql_import(
     tx: &async_channel::Sender<Event>,
 ) -> Result<(), String> {
     let mut cmd = mysql_command(target, "mysql")?;
-    cmd.args(["--binary-mode", "--local-infile=0"])
-        .arg(format!("--database={}", target.profile.database))
-        .stdin(Stdio::piped())
+    cmd.args(["--binary-mode", "--local-infile=0", "--skip-reconnect"]);
+    if !target.profile.database.is_empty() {
+        cmd.arg(format!("--database={}", target.profile.database));
+    }
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     feed_command(cmd, path, c, tx)
@@ -1296,8 +1351,10 @@ fn query_inner(endpoint: &Endpoint, sql: &str, sample: bool) -> Result<String, S
         cmd
     } else {
         let mut cmd = mysql_command(endpoint, "mysql")?;
-        cmd.args(["--batch", "--skip-column-names", "--local-infile=0"])
-            .arg(format!("--database={}", endpoint.profile.database));
+        cmd.args(["--batch", "--skip-column-names", "--local-infile=0"]);
+        if !endpoint.profile.database.is_empty() {
+            cmd.arg(format!("--database={}", endpoint.profile.database));
+        }
         if crate::mysql::uses_legacy(&endpoint.profile) {
             if sql.contains('\\') {
                 return Err("兼容客户端元数据查询不支持反斜杠标识符".into());
@@ -1847,7 +1904,16 @@ fn pg_import(
 pub fn freeze_file(path: &Path, c: &Control) -> Result<tempfile::NamedTempFile, String> {
     let mut source = File::open(path).map_err(io_error)?;
     let before = source.metadata().map_err(io_error)?;
-    let mut snapshot = tempfile::NamedTempFile::new().map_err(io_error)?;
+    let suffix = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| e.len() <= 16 && e.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    let mut snapshot = tempfile::Builder::new()
+        .suffix(&suffix)
+        .tempfile()
+        .map_err(io_error)?;
     let mut buffer = [0; 65536];
     loop {
         c.check()?;

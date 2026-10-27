@@ -4,6 +4,22 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Unify database difference filters and table/DDL views, deduplicate index/constraint representations, recover supported MySQL synchronization statements from individual DDL components and ordered index metadata, and add a two-step index field designer with generated names and optional database qualification.
+
+- Link index row selection to fresh details and exact context-menu filtering; search all open center tabs with compact ellipsized titles; show attribute-level schema differences and add/modify/remove status, ignoring column order by default.
+
+- Classify database differences by fields, column order, indexes/constraints and table properties, expose optional order ignoring and separate data-sample results; explain permissions and distinguish stored grant scopes; show composite indexes once with ordered column details and guarded context-menu SQL drafts.
+
+- Simplify comparison controls and virtual table/field navigation, page large catalogs with progress and partial previews, add routed index SQL-draft management, expose DDL overflow scrollbars and improve new Note file names.
+
+- Deduplicate generated USE across unchanged Note export scopes, restore after authored/uncertain switches, and select a connection explicitly for mixed-connection Notes with excluded-cell counts and a connection header.
+
+- Separate Note display-title editing from file renaming and Save as; add previewed, scope-aware SQL export, staged MySQL database-wide grants and on-demand users/roles in both database navigation layouts.
+
+- Share previewed MySQL dump adaptation between connection and Note SQL-file imports; add new-database restore, duplicate/definer handling, whole-database structure/data-sample comparison, comment/difference filters, selected-table synchronization drafts and no-overwrite SQL save.
+
+- Add native ClickHouse DBA statement classification and SQL-file/Note execution, isolated HTTP sessions, compact mutation submission status, and streaming SQL/data/Native-bundle transfers with explicit targets and payload verification. Server compatibility remains version-dependent; localhost contract tests are not real-server acceptance.
+
 ## [0.1.4] - 2026-10-23
 
 - Existing installed versions need one manual installation of v0.1.4 to acquire the new helper; this release cannot repair the updater already running in an older executable. Portable editions continue to use manual replacement. No automatic SQL execution or forced shutdown of other instances.

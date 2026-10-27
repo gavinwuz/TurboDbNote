@@ -14,6 +14,7 @@ pub(super) struct HttpDatabase {
     url: reqwest::Url,
     user: String,
     password: String,
+    script_session: String,
 }
 impl HttpDatabase {
     pub async fn open(p: &Profile, password: &str) -> Result<(Self, ServerInfo), String> {
@@ -29,6 +30,7 @@ impl HttpDatabase {
         url.set_port(Some(p.port)).map_err(|_| "端口无效")?;
         let mut builder = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .retry(reqwest::retry::never())
             .connect_timeout(Duration::from_secs(p.timeout_seconds.clamp(1, 60)))
             .timeout(p.execution_timeout())
             .danger_accept_invalid_certs(p.tls == TlsMode::Required);
@@ -51,6 +53,7 @@ impl HttpDatabase {
             url,
             user: p.user.clone(),
             password: password.into(),
+            script_session: uuid::Uuid::new_v4().to_string(),
         };
         let rows = this
             .query(
@@ -143,9 +146,15 @@ impl HttpDatabase {
         match &op.kind {
             OperationKind::CopyDatabase { .. } => Err("当前数据库类型不支持直接复制数据库".into()),
             OperationKind::Workbench(r) => {
+                let script = matches!(
+                    r.action,
+                    super::workbench::Action::ScriptPrepare { .. }
+                        | super::workbench::Action::ScriptExecute { .. }
+                );
                 let mut access = HttpAccess {
                     client: self,
                     database: &r.database,
+                    session: script.then_some(self.script_session.as_str()),
                 };
                 super::workbench::run(&mut access, p.kind, "", r)
                     .await
@@ -614,42 +623,217 @@ impl RedisDatabase {
 struct HttpAccess<'a> {
     client: &'a HttpDatabase,
     database: &'a str,
+    session: Option<&'a str>,
 }
 impl super::workbench::Access for HttpAccess<'_> {
     fn query<'a>(&'a mut self, sql: &'a str) -> super::workbench::Query<'a> {
         Box::pin(async move {
-            let read = sql.trim_start().to_ascii_uppercase();
-            let sql = if read.starts_with("SELECT") || read.starts_with("SHOW") {
-                format!("{sql} FORMAT JSONCompactEachRow")
+            let database = if sql
+                .starts_with("SELECT name, engine FROM system.databases WHERE name=")
+                || super::clickhouse_sql::classify(sql, self.database)
+                    .is_ok_and(|c| c.object_kind == "database")
+            {
+                ""
             } else {
-                sql.into()
+                self.database
             };
-            let rows = self.client.query(&sql, self.database, &[]).await?;
-            Ok(super::workbench::Rows {
-                columns: Vec::new(),
-                values: rows
-                    .into_iter()
-                    .map(|r| {
-                        r.as_array()
-                            .map(|r| {
-                                r.iter()
-                                    .map(|v| {
-                                        if v.is_null() {
-                                            None
-                                        } else {
-                                            Some(
-                                                v.as_str()
-                                                    .map(String::from)
-                                                    .unwrap_or_else(|| v.to_string()),
-                                            )
-                                        }
-                                    })
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .collect(),
-            })
+            let mut params = vec![
+                ("default_format", "JSONCompact"),
+                ("wait_end_of_query", "1"),
+            ];
+            if !database.is_empty() {
+                params.push(("database", database));
+            }
+            if let Some(session) = self.session {
+                params.push(("session_id", session));
+            }
+            let mut response = self
+                .client
+                .client
+                .post(self.client.url.clone())
+                .basic_auth(&self.client.user, Some(&self.client.password))
+                .query(&params)
+                .body(sql.to_owned())
+                .send()
+                .await
+                .map_err(network)?;
+            if !response.status().is_success()
+                || response
+                    .headers()
+                    .contains_key("X-ClickHouse-Exception-Code")
+            {
+                return Err(super::clickhouse_sql::http_error(
+                    response.status().as_u16(),
+                    response
+                        .headers()
+                        .get("X-ClickHouse-Exception-Code")
+                        .and_then(|h| h.to_str().ok()),
+                ));
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(network)? {
+                if bytes.len() + chunk.len() > super::workbench::MAX_BYTES {
+                    return Err("notes.metadata.limit".into());
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            if bytes.iter().all(u8::is_ascii_whitespace) {
+                return Ok(super::workbench::Rows::default());
+            }
+            let json: Value =
+                serde_json::from_slice(&bytes).map_err(|_| "clickhouse.http.response")?;
+            let meta = json["meta"].as_array().ok_or("clickhouse.http.response")?;
+            if meta.len() > 512 {
+                return Err("notes.metadata.limit".into());
+            }
+            let columns = meta
+                .iter()
+                .map(|m| {
+                    m["name"]
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or("clickhouse.http.response")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let values = json["data"]
+                .as_array()
+                .ok_or("clickhouse.http.response")?
+                .iter()
+                .map(|r| {
+                    meta.iter()
+                        .enumerate()
+                        .map(|(index, m)| {
+                            let v = if r.is_array() {
+                                &r[index]
+                            } else {
+                                &r[m["name"].as_str().unwrap_or_default()]
+                            };
+                            if v.is_null() {
+                                None
+                            } else {
+                                Some(
+                                    v.as_str()
+                                        .map(str::to_owned)
+                                        .unwrap_or_else(|| v.to_string()),
+                                )
+                            }
+                        })
+                        .collect()
+                })
+                .collect();
+            Ok(super::workbench::Rows { columns, values })
         })
+    }
+}
+
+#[cfg(test)]
+mod clickhouse_tests {
+    use super::*;
+    use crate::database::{clickhouse_fixture::Fixture, notebook_query as note, workbench::Access};
+    #[tokio::test]
+    async fn clickhouse_note_queries_have_metadata_no_transactions_and_guard_mutations() {
+        let fixture = Fixture::new();
+        let (client, _) = HttpDatabase::open(&fixture.profile, "").await.unwrap();
+        let mut c = HttpAccess {
+            client: &client,
+            database: "fixture",
+            session: Some("owned-fixture-session"),
+        };
+        let plan = note::prepare(
+            &mut c,
+            DatabaseKind::ClickHouse,
+            "fixture",
+            "24.8",
+            "SELECT id,label FROM items",
+        )
+        .await
+        .unwrap();
+        let result = note::execute(
+            &mut c,
+            DatabaseKind::ClickHouse,
+            "fixture",
+            "24.8",
+            &plan,
+            false,
+            (0, 20),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.rows.columns, vec!["id", "label"]);
+        assert_eq!(result.rows.values.len(), 20);
+        assert!(result.more);
+        let sql = "ALTER TABLE fixture.items UPDATE label='x' WHERE id=1";
+        let plan = note::prepare_script(&mut c, DatabaseKind::ClickHouse, "fixture", "24.8", sql)
+            .await
+            .unwrap();
+        assert_eq!(plan.guards.len(), 1);
+        assert!(
+            note::execute_script(
+                &mut c,
+                DatabaseKind::ClickHouse,
+                "fixture",
+                "24.8",
+                &plan,
+                false
+            )
+            .await
+            .is_err()
+        );
+        let result = note::execute_script(
+            &mut c,
+            DatabaseKind::ClickHouse,
+            "fixture",
+            "24.8",
+            &plan,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.execution.unwrap().status, "submitted");
+        assert_eq!(result.affected_rows, None);
+        let mut changed = plan.clone();
+        changed.guards[0].stamp = Some("stale".into());
+        assert!(
+            note::execute_script(
+                &mut c,
+                DatabaseKind::ClickHouse,
+                "fixture",
+                "24.8",
+                &changed,
+                true
+            )
+            .await
+            .is_err()
+        );
+        let seen = fixture.seen.lock().unwrap();
+        assert_eq!(seen.iter().filter(|r| r.sql == sql).count(), 1);
+        assert!(
+            !seen
+                .iter()
+                .any(|r| r.sql.contains("TRANSACTION") || r.sql == "ROLLBACK")
+        );
+        assert!(seen.iter().skip(1).all(|r| {
+            r.params
+                .get("session_id")
+                .is_some_and(|s| s == "owned-fixture-session")
+        }));
+    }
+    #[tokio::test]
+    async fn clickhouse_http_errors_are_sanitized_including_late_errors() {
+        let fixture = Fixture::new();
+        let (client, _) = HttpDatabase::open(&fixture.profile, "").await.unwrap();
+        let mut c = HttpAccess {
+            client: &client,
+            database: "fixture",
+            session: None,
+        };
+        assert_eq!(
+            c.query("SELECT fixture_denied").await.unwrap_err(),
+            "clickhouse.http.permission"
+        );
+        assert_eq!(
+            c.query("SELECT fixture_late_error").await.unwrap_err(),
+            "clickhouse.http.syntax"
+        );
     }
 }

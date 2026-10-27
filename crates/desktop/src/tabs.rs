@@ -51,6 +51,7 @@ impl EventEmitter<NewNote> for TabEvents {}
 impl EventEmitter<CloseTabs> for TabEvents {}
 #[derive(Clone)]
 pub struct OpenNote {
+    pub icon: IconName,
     pub key: String,
     pub title: String,
     pub project: String,
@@ -97,6 +98,13 @@ pub fn editor_menu(menu: PopupMenu, name: impl Into<String>, cx: &App) -> PopupM
             .on_click(move |_, _, cx| send(name.clone(), CloseMode::All, cx)),
     )
 }
+pub(crate) fn title_width(cx: &App) -> f32 {
+    let count = cx
+        .try_global::<TabRouter>()
+        .map(|r| r.2.len().div_ceil(r.1.max(1)))
+        .unwrap_or(1);
+    (880. / count.max(1) as f32 - 60.).clamp(64., 220.)
+}
 pub fn title(
     name: impl Into<String>,
     icon: IconName,
@@ -113,7 +121,17 @@ pub fn title(
         .h_flex()
         .gap_2()
         .child(Icon::new(icon))
-        .child(label.clone());
+        .child(
+            div()
+                .max_w(px(title_width(cx)))
+                .min_w_0()
+                .truncate()
+                .child(label.clone()),
+        )
+        .tooltip({
+            let label = label.clone();
+            move |window, cx| gpui_component::tooltip::Tooltip::new(label.clone()).build(window, cx)
+        });
     if is_fixed(&name) {
         return title.into_any_element();
     }
@@ -362,6 +380,7 @@ pub(crate) fn opened_notes(
                     .w(px(520.))
                     .min_w_0()
                     .text_sm()
+                    .child(Icon::new(note.icon.clone()))
                     .child(div().flex_1().min_w_0().truncate().child(format!(
                         "{}{}",
                         if note.dirty { "● " } else { "" },
@@ -393,7 +412,7 @@ pub(crate) fn opened_notes(
     menu.min_w(px(360.))
         .max_w(px(640.))
         .max_h(px(420.))
-        .searchable(t(cx, "notes.opened.search"), terms, window, cx)
+        .searchable(t(cx, "tabs.opened.search"), terms, window, cx)
 }
 
 #[cfg(test)]

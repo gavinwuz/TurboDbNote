@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sqlparser::ast::Spanned;
 use sqlparser::{
     ast::{self, Expr, LimitClause, Statement, Value, Visit, Visitor},
-    dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
+    dialect::{ClickHouseDialect, Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
     parser::Parser,
 };
 use std::{collections::BTreeSet, ops::ControlFlow, time::Instant};
@@ -188,10 +188,14 @@ fn parse_for(kind: DatabaseKind, sql: &str, script: bool) -> Result<Statement, S
     {
         return Err("SQL 为空、超过 60 KB 或包含不支持的执行注释".into());
     }
+    if kind == DatabaseKind::ClickHouse {
+        return super::clickhouse_sql::parse(sql);
+    }
     let dialect: Box<dyn Dialect> = match kind {
         DatabaseKind::MySql => Box::new(MySqlDialect {}),
         DatabaseKind::PostgreSql => Box::new(PostgreSqlDialect {}),
         DatabaseKind::Sqlite => Box::new(SQLiteDialect {}),
+        DatabaseKind::ClickHouse => Box::new(ClickHouseDialect {}),
         _ => return Err("笔记 SQL 当前支持 MySQL、PostgreSQL 与 SQLite".into()),
     };
     let mut statements = Parser::new(dialect.as_ref())
@@ -339,7 +343,7 @@ fn inspect(s: &Statement, kind: DatabaseKind) -> Result<Inspection, String> {
                 ..
             }
     );
-    if !supported || info.blocked || info.tables.len() > 16 {
+    if !supported || (info.blocked && kind != DatabaseKind::ClickHouse) || info.tables.len() > 16 {
         return Err("notes.sql_scope_unsupported".into());
     }
     if matches!(s, Statement::Query(_)) && info.writes {
@@ -348,6 +352,9 @@ fn inspect(s: &Statement, kind: DatabaseKind) -> Result<Inspection, String> {
     Ok(info)
 }
 pub fn validate_script_statement(kind: DatabaseKind, sql: &str) -> Result<bool, String> {
+    if kind == DatabaseKind::ClickHouse {
+        return super::clickhouse_sql::classify(sql, "").map(|c| c.read);
+    }
     let expanded;
     let sql = if kind == DatabaseKind::MySql {
         expanded = workbench::script_context::expand(sql, None)?;
@@ -406,6 +413,10 @@ pub fn script_requires_confirmation(
     Ok(false)
 }
 pub fn validate_script_target(kind: DatabaseKind, sql: &str, database: &str) -> Result<(), String> {
+    if kind == DatabaseKind::ClickHouse {
+        super::clickhouse_sql::classify(sql, database)?;
+        return Ok(());
+    }
     workbench::script_context::validate_target(kind, sql, database)?;
     if kind == DatabaseKind::MySql {
         let expanded = workbench::script_context::expand(sql, None)?;
@@ -555,6 +566,11 @@ pub const COMMANDS: &[(&str, &str, bool)] = &[
 pub const SCRIPT_COMMANDS: &[(&str, &str, bool)] = &[
     ("script_session", "USE / SET SESSION", true),
     (
+        "clickhouse_admin",
+        "ClickHouse DBA / ON CLUSTER / BACKUP / RESTORE / RBAC",
+        false,
+    ),
+    (
         "script_transaction",
         "BEGIN / COMMIT / ROLLBACK / SET TRANSACTION",
         true,
@@ -641,6 +657,9 @@ pub fn script_command_required(kind: DatabaseKind, sql: &str) -> Option<&'static
     script_sql_command(kind, sql)
 }
 fn script_sql_command(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
+    if kind == DatabaseKind::ClickHouse {
+        return command_required(kind, sql);
+    }
     if sql.len() <= 60_000 {
         return command_required(kind, sql);
     }
@@ -682,6 +701,11 @@ pub fn note_mode_allows(
     true
 }
 pub fn command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
+    if kind == DatabaseKind::ClickHouse {
+        return super::clickhouse_sql::classify(sql, "")
+            .ok()
+            .map(|c| c.permission);
+    }
     if let Some(key) = extension_required(kind, sql) {
         return Some(key);
     }
@@ -862,6 +886,9 @@ async fn prepare_inner(
     sql: &str,
     script: bool,
 ) -> Result<Plan, String> {
+    if kind == DatabaseKind::ClickHouse {
+        return super::clickhouse_sql::prepare(c, database, sql).await;
+    }
     if mysql_metadata(kind, sql) {
         return Ok(Plan {
             sql: sql.trim().into(),
@@ -900,6 +927,9 @@ pub async fn prepare_script(
     sql: &str,
 ) -> Result<Plan, String> {
     validate_script_target(kind, sql, database)?;
+    if kind == DatabaseKind::ClickHouse {
+        return super::clickhouse_sql::prepare(c, database, sql).await;
+    }
     let expanded = if kind == DatabaseKind::MySql {
         workbench::script_context::expand(
             sql,
@@ -1085,6 +1115,29 @@ pub fn page_sql(
         _ => return Err("当前 LIMIT 形式不支持分页".into()),
     };
     let take = limit.map_or(size + 1, |n| n.saturating_sub(offset).min(size + 1));
+    if kind == DatabaseKind::ClickHouse {
+        if q.format_clause.is_some() {
+            return Err("clickhouse.sql.result_format".into());
+        }
+        q.limit_clause = Some(LimitClause::LimitOffset {
+            limit: Some(Expr::Value(Value::Number(take.to_string(), false).into())),
+            offset: Some(ast::Offset {
+                value: Expr::Value(
+                    Value::Number(
+                        base.checked_add(offset)
+                            .ok_or("notes.metadata.invalid")?
+                            .to_string(),
+                        false,
+                    )
+                    .into(),
+                ),
+                rows: ast::OffsetRows::None,
+            }),
+            limit_by: vec![],
+        });
+        return Ok(stmt.to_string());
+    }
+
     use sqlparser::tokenizer::{Token, Tokenizer};
     let dialect: Box<dyn Dialect> = match kind {
         DatabaseKind::MySql => Box::new(MySqlDialect {}),
@@ -1182,6 +1235,9 @@ pub async fn execute_script(
     plan: &Plan,
     confirmed: bool,
 ) -> Result<ResultPage, String> {
+    if kind == DatabaseKind::ClickHouse {
+        return super::clickhouse_sql::execute(c, database, plan, confirmed, (0, 20)).await;
+    }
     let expected = prepare_script(c, kind, database, version, &plan.sql).await?;
     if expected.read_only != plan.read_only
         || expected.confirm != plan.confirm
@@ -1318,6 +1374,9 @@ async fn execute_inner(
     script: bool,
 ) -> Result<ResultPage, String> {
     let (offset, size) = page;
+    if kind == DatabaseKind::ClickHouse {
+        return super::clickhouse_sql::execute(c, database, plan, confirmed, page).await;
+    }
     if mysql_metadata(kind, &plan.sql) {
         if !plan.read_only || !plan.guards.is_empty() || offset != 0 {
             return Err("notes.metadata.invalid".into());

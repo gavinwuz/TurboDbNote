@@ -33,13 +33,22 @@ impl DatabaseView {
         object: Object,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.tree_user_row_at(scope, object, 60., cx)
+    }
+    pub(super) fn tree_user_row_at(
+        &self,
+        scope: Scope,
+        object: Object,
+        indent: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let row = Button::new(SharedString::from(
             scope.key(&format!("account-{}", Self::object_key(&object))),
         ))
         .ghost()
         .w_full()
         .justify_start()
-        .pl(px(60.))
+        .pl(px(indent))
         .icon(IconName::User)
         .label(object.name.clone())
         .tooltip(object.name.clone())
@@ -417,8 +426,12 @@ impl Privileges {
         Self {
             key,
             focus: cx.focus_handle(),
-            selected_db: String::new(),
-            selected_target: ("global".into(), "*".into(), "*".into(), String::new()),
+            selected_db: scope.database.clone(),
+            selected_target: if scope.database.is_empty() {
+                ("global".into(), "*".into(), "*".into(), String::new())
+            } else {
+                grants_ui::database_target(&scope.database)
+            },
             object_filter,
             only_granted: false,
             narrow: false,
@@ -572,6 +585,25 @@ impl Focusable for Privileges {
         self.focus.clone()
     }
 }
+impl Privileges {
+    pub(crate) fn tab_identity(&self, cx: &App) -> (String, String, String, bool) {
+        let profile = self
+            .source
+            .upgrade()
+            .and_then(|source| source.read(cx).note_profile(self.scope.id).cloned());
+        (
+            format!("{} · {}", t(cx, "accounts.permissions"), self.account.name),
+            profile
+                .as_ref()
+                .map(|p| p.group.clone())
+                .unwrap_or_default(),
+            profile
+                .map(|p| format!("{} · {}:{}", p.name, p.host, p.port))
+                .unwrap_or_default(),
+            self.dirty(),
+        )
+    }
+}
 impl gpui_component::dock::Panel for Privileges {
     fn panel_name(&self) -> &'static str {
         "account-permissions"
@@ -598,9 +630,9 @@ impl gpui_component::dock::Panel for Privileges {
     fn dropdown_menu(
         &mut self,
         menu: gpui_component::menu::PopupMenu,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui_component::menu::PopupMenu {
-        crate::tabs::editor_menu(menu, self.key.clone(), cx)
+        crate::tabs::opened_notes(menu, &self.key, window, cx)
     }
 }

@@ -1723,7 +1723,12 @@ impl CellView {
     pub(super) fn assist_execution_supported(&self, cx: &App) -> bool {
         matches!(
             self.assist_context(cx).0,
-            Some(DatabaseKind::MySql | DatabaseKind::Sqlite | DatabaseKind::PostgreSql)
+            Some(
+                DatabaseKind::MySql
+                    | DatabaseKind::Sqlite
+                    | DatabaseKind::PostgreSql
+                    | DatabaseKind::ClickHouse
+            )
         )
     }
     pub(super) fn assist_key(

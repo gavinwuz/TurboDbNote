@@ -710,6 +710,48 @@ impl Workspace {
                 .cloned()
                 .or_else(|| self.note_views.get(name).map(|v| v.read(cx).owner.clone()));
             let Some(owner) = owner else {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let (title, project, connection, dirty, icon) =
+                    if let Some(panel) = self.table_panels.get(name) {
+                        let (title, project, connection) = panel.read(cx).tab_identity(cx);
+                        (
+                            title,
+                            project,
+                            connection,
+                            false,
+                            IconName::GalleryVerticalEnd,
+                        )
+                    } else if let Some(panel) = self.permission_panels.get(name) {
+                        let (title, project, connection, dirty) = panel.read(cx).tab_identity(cx);
+                        (title, project, connection, dirty, IconName::User)
+                    } else {
+                        (
+                            t(
+                                cx,
+                                if name == "settings" {
+                                    "settings.title"
+                                } else {
+                                    "notes.title"
+                                },
+                            )
+                            .to_string(),
+                            String::new(),
+                            String::new(),
+                            false,
+                            IconName::BookOpen,
+                        )
+                    };
+                notes.push(crate::tabs::OpenNote {
+                    key: name.clone(),
+                    title,
+                    project,
+                    connection,
+                    dirty,
+                    icon,
+                    position: String::new(),
+                });
                 continue;
             };
             let note = owner.read(cx);
@@ -755,6 +797,7 @@ impl Workspace {
             };
             notes.push(crate::tabs::OpenNote {
                 key: note.key.clone(),
+                icon: IconName::BookOpen,
                 title,
                 project,
                 connection,

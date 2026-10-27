@@ -53,7 +53,7 @@ if args.http_contract:
   def do_POST(self):
    sql=self.rfile.read(int(self.headers['Content-Length'])).decode();params=parse_qs(urlparse(self.path).query);seen.append((sql,params))
    assert self.headers.get('Authorization','').startswith('Basic ')
-   if sql.endswith('FORMAT JSONCompactEachRow'):
+   if sql.endswith('FORMAT JSONCompactEachRow') or params.get('default_format') in [['JSON'],['JSONCompact']]:
     assert params.get('database')==['fixture']
     if sql.startswith('SELECT name,if('):rows=[['items','table','Fixture comment','']]
     elif sql.startswith("SELECT name,'index'"):rows=[['items_idx','index','id','items']]
@@ -69,7 +69,11 @@ if args.http_contract:
    elif sql.startswith('SELECT name,expr,type'):rows=[]
    elif sql.startswith('CREATE DATABASE {new_database:Identifier}'):assert params['param_new_database'][0].startswith('probe_');rows=[]
    else:raise AssertionError(sql)
-   body=''.join(json.dumps(row)+'\n' for row in rows).encode();self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
+   if params.get('default_format') in [['JSON'],['JSONCompact']]:
+    names=['c'+str(i) for i in range(len(rows[0]) if rows else 0)]
+    body=json.dumps({'meta':[{'name':n,'type':'String'} for n in names],'data':[dict(zip(names,row)) for row in rows]}).encode()
+   else:body=''.join(json.dumps(row)+'\n' for row in rows).encode()
+   self.send_response(200);self.send_header('Content-Length',str(len(body)));self.end_headers();self.wfile.write(body)
  server=ThreadingHTTPServer(('127.0.0.1',0),Handler);thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
  try:run_probe('clickhouse',server.server_port,'fixture');assert len(seen)>=5;print('PASS: ClickHouse HTTP contract (not a real ClickHouse server)')
  finally:server.shutdown();server.server_close()

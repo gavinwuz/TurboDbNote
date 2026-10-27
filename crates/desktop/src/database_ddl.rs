@@ -118,6 +118,7 @@ impl DatabaseView {
                 .v_flex()
                 .size_full()
                 .min_w_0()
+                .min_h_0()
                 .child(
                     div()
                         .text_xs()
@@ -127,11 +128,13 @@ impl DatabaseView {
                 )
                 .child(self.ddl_selector(cx))
                 .child(
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .min_w_0()
-                        .child(self.ddl.designer.as_ref().unwrap().clone()),
+                    div().flex_1().min_h_0().min_w_0().child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .child(self.ddl.designer.as_ref().unwrap().clone()),
+                    ),
                 )
                 .into_any_element();
         }

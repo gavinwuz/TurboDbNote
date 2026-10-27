@@ -279,6 +279,46 @@ fn grant_scope(grant: &Grant) -> Result<String, String> {
         _ => Err("accounts.grants.invalid".into()),
     }
 }
+/// MySQL database-level grants use LIKE patterns even inside backticks.
+/// Keep this escaped representation in Grant so previews and subsequent REVOKE agree.
+pub fn literal_database_scope(database: &str) -> String {
+    database
+        .replace('\\', "\\\\")
+        .replace('_', "\\_")
+        .replace('%', "\\%")
+}
+fn literal_pattern(database: &str) -> bool {
+    let mut chars = database.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '_' | '%' => return false,
+            '\\' => {
+                if !matches!(chars.next(), Some('\\' | '_' | '%')) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+pub fn database_scope_label(database: &str) -> String {
+    if !literal_pattern(database) {
+        return database.to_owned();
+    }
+    let mut chars = database.chars();
+    let mut out = String::new();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
 pub fn grant_sql(plan: &GrantPlan) -> Result<Vec<String>, String> {
     if !valid_identity(&plan.user, &plan.host)
         || plan.before.len() > 2000
@@ -289,7 +329,7 @@ pub fn grant_sql(plan: &GrantPlan) -> Result<Vec<String>, String> {
     // New schema-pattern grants must not silently widen literal names containing LIKE wildcards.
     for grant in &plan.after {
         if grant.scope == "database"
-            && grant.database.contains(['%', '_', '\\'])
+            && !literal_pattern(&grant.database)
             && !plan
                 .before
                 .iter()

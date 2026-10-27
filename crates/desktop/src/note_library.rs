@@ -915,6 +915,16 @@ impl Render for NoteLibrary {
                         .context_menu(move |mut menu, _, cx| {
                             for (action, key, icon) in [
                                 (
+                                    crate::notebook::FileAction::RenameFile,
+                                    "notes.rename_file",
+                                    IconName::File,
+                                ),
+                                (
+                                    crate::notebook::FileAction::ExportSql,
+                                    "notes.export_sql",
+                                    IconName::ExternalLink,
+                                ),
+                                (
                                     crate::notebook::FileAction::Rename,
                                     "notes.rename",
                                     IconName::ALargeSmall,

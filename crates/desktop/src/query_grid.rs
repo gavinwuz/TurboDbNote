@@ -13,6 +13,7 @@ pub struct QueryGrid {
     row_numbers: bool,
     pub selected: Option<(usize, usize)>,
     difference_side: Option<usize>,
+    status_labels: bool,
     pub scroll_link: Option<(std::rc::Rc<ScrollLink>, usize)>,
 }
 impl QueryGrid {
@@ -34,16 +35,37 @@ impl QueryGrid {
             row_numbers: true,
             selected: None,
             difference_side: None,
+            status_labels: false,
             scroll_link: None,
         }
+    }
+    pub fn with_status_labels(mut self) -> Self {
+        self.status_labels = true;
+        self
     }
     pub fn with_differences(mut self, side: usize) -> Self {
         self.difference_side = Some(side);
         self
     }
     pub fn with_column_widths(mut self, widths: &[f32]) -> Self {
-        for (column, width) in self.columns.iter_mut().skip(1).zip(widths) {
+        for (column, width) in self
+            .columns
+            .iter_mut()
+            .skip(usize::from(self.row_numbers))
+            .zip(widths)
+        {
             column.width = px(*width);
+        }
+        self
+    }
+    pub fn fixed_columns(mut self, count: usize) -> Self {
+        for column in self
+            .columns
+            .iter_mut()
+            .skip(usize::from(self.row_numbers))
+            .take(count)
+        {
+            *column = column.clone().fixed_left();
         }
         self
     }
@@ -90,7 +112,7 @@ impl TableDelegate for QueryGrid {
             .get(row)
             .and_then(|r| r.get(col))
             .and_then(|v| v.as_deref())
-            .unwrap_or("NULL");
+            .unwrap_or(if self.status_labels { "—" } else { "NULL" });
         let marker = self
             .rows
             .values
@@ -103,6 +125,7 @@ impl TableDelegate for QueryGrid {
             "∅" => Some(cx.theme().muted_foreground),
             "-" => Some(cx.theme().danger),
             "+" => Some(cx.theme().success),
+            "≠" => Some(cx.theme().warning),
             _ => Some(if side == 0 {
                 cx.theme().danger
             } else {
@@ -111,6 +134,21 @@ impl TableDelegate for QueryGrid {
         });
         let value = if self.difference_side.is_some() && marker == "∅" && col > 0 {
             ""
+        } else {
+            value
+        };
+        let translated;
+        let value = if self.status_labels && col == 0 {
+            translated = crate::locale::t(
+                cx,
+                match marker {
+                    "+" => "compare.status.added",
+                    "-" => "compare.status.removed",
+                    "≠" => "compare.status.modified",
+                    _ => "compare.status.same",
+                },
+            );
+            translated.as_ref()
         } else {
             value
         };
@@ -142,6 +180,9 @@ impl TableDelegate for QueryGrid {
             )
             .on_click(cx.listener(move |table, _, window, cx| {
                 table.delegate_mut().selected = Some((row, col));
+                if table.selected_row() != Some(row) {
+                    table.set_selected_row(row, cx);
+                }
                 window.focus(&table.focus_handle(cx));
                 cx.notify();
             }));
@@ -299,6 +340,21 @@ impl<H: gpui_component::scroll::ScrollbarHandle + Clone> gpui_component::scroll:
 mod scroll_tests {
     use super::*;
     use gpui_component::scroll::ScrollbarHandle;
+    #[::core::prelude::v1::test]
+    fn attribute_grid_without_row_numbers_keeps_field_width_and_fixed_identity_columns() {
+        let rows = Rows {
+            columns: vec!["Δ".into(), "field".into(), "attribute".into()],
+            values: vec![],
+        };
+        let grid = QueryGrid::new(rows, 0)
+            .without_row_numbers()
+            .fixed_columns(2)
+            .with_column_widths(&[40., 160., 130.]);
+        assert_eq!(grid.columns[0].width, px(40.));
+        assert_eq!(grid.columns[1].width, px(160.));
+        assert!(grid.columns[1].fixed.is_some());
+        assert!(grid.columns[2].fixed.is_none());
+    }
     #[::core::prelude::v1::test]
     fn comparison_handles_sync_both_directions_and_unlock_independently() {
         let link = ScrollLink {

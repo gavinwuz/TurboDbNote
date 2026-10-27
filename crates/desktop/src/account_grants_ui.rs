@@ -1,5 +1,4 @@
 use super::*;
-use gpui_component::scroll::{Scrollbar, ScrollbarShow};
 type Target = (String, String, String, String);
 fn target(grant: &Grant) -> Target {
     (
@@ -46,6 +45,62 @@ fn change_scope(draft: &mut Vec<Grant>, key: &Target, enable: bool) {
                 grantable,
             });
         }
+    }
+}
+pub(super) fn database_target(database: &str) -> Target {
+    (
+        "database".into(),
+        account_admin::literal_database_scope(database),
+        "*".into(),
+        String::new(),
+    )
+}
+fn grant_database(draft: &mut Vec<Grant>, database: &str) -> Target {
+    let key = database_target(database);
+    let before = draft.len();
+    change_scope(draft, &key, true);
+    for grant in &mut draft[before..] {
+        grant.grantable = false;
+    }
+    key
+}
+fn grant_database_label(grant: &Grant) -> String {
+    if grant.scope == "database" {
+        account_admin::database_scope_label(&grant.database)
+    } else {
+        grant.database.clone()
+    }
+}
+fn permission_description(privilege: &str) -> &'static str {
+    match privilege {
+        "ALTER" => "accounts.description.alter",
+        "ALTER ROUTINE" => "accounts.description.alter_routine",
+        "CREATE" => "accounts.description.create",
+        "CREATE ROUTINE" => "accounts.description.create_routine",
+        "CREATE TEMPORARY TABLES" => "accounts.description.create_temporary_tables",
+        "CREATE USER" => "accounts.description.create_user",
+        "CREATE VIEW" => "accounts.description.create_view",
+        "DELETE" => "accounts.description.delete",
+        "DROP" => "accounts.description.drop",
+        "EVENT" => "accounts.description.event",
+        "EXECUTE" => "accounts.description.execute",
+        "FILE" => "accounts.description.file",
+        "INDEX" => "accounts.description.index",
+        "INSERT" => "accounts.description.insert",
+        "LOCK TABLES" => "accounts.description.lock_tables",
+        "PROCESS" => "accounts.description.process",
+        "REFERENCES" => "accounts.description.references",
+        "RELOAD" => "accounts.description.reload",
+        "REPLICATION CLIENT" => "accounts.description.replication_client",
+        "REPLICATION SLAVE" => "accounts.description.replication_slave",
+        "SELECT" => "accounts.description.select",
+        "SHOW DATABASES" => "accounts.description.show_databases",
+        "SHOW VIEW" => "accounts.description.show_view",
+        "SHUTDOWN" => "accounts.description.shutdown",
+        "SUPER" => "accounts.description.super",
+        "TRIGGER" => "accounts.description.trigger",
+        "UPDATE" => "accounts.description.update",
+        _ => "accounts.description.other",
     }
 }
 impl Privileges {
@@ -318,6 +373,9 @@ impl Privileges {
             self.load_local_objects(false, window, cx);
         }
         let writable = self.writable(cx) && !self.error && !self.busy;
+        if self.selected_target.0 == "database" && self.selected_target.1 == self.selected_db {
+            self.selected_target = database_target(&self.selected_db);
+        }
         let query = self.filter.read(cx).value().to_lowercase();
         let object_query = self.object_filter.read(cx).value().to_lowercase();
         let values = self.draft.as_ref().unwrap_or(&self.grants);
@@ -330,7 +388,7 @@ impl Privileges {
                 .iter()
                 .chain(values)
                 .filter(|g| g.scope != "global")
-                .map(|g| g.database.clone()),
+                .map(grant_database_label),
         );
         if !self.selected_db.is_empty() {
             directories.push(self.selected_db.clone());
@@ -340,7 +398,7 @@ impl Privileges {
         let mut dirs = div()
             .v_flex()
             .gap_1()
-            .child(Input::new(&self.filter).cleanable(true));
+            .child(Input::new(&self.filter).cleanable(true).w_full());
         dirs = dirs.child(
             Button::new("grant-global")
                 .ghost()
@@ -375,8 +433,7 @@ impl Privileges {
                     .selected(selected)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_db = db.clone();
-                        this.selected_target =
-                            ("database".into(), db.clone(), "*".into(), String::new());
+                        this.selected_target = database_target(&db);
                         cx.notify();
                     })),
             );
@@ -397,17 +454,12 @@ impl Privileges {
             targets.insert(("global".into(), "*".into(), "*".into(), String::new()));
         }
         if !self.selected_db.is_empty() {
-            targets.insert((
-                "database".into(),
-                self.selected_db.clone(),
-                "*".into(),
-                String::new(),
-            ));
+            targets.insert(database_target(&self.selected_db));
             for g in self
                 .grants
                 .iter()
                 .chain(values)
-                .filter(|g| g.database == self.selected_db)
+                .filter(|g| grant_database_label(g) == self.selected_db)
             {
                 targets.insert(target(g));
             }
@@ -429,7 +481,7 @@ impl Privileges {
         let mut objects = div()
             .v_flex()
             .gap_1()
-            .child(Input::new(&self.object_filter).cleanable(true));
+            .child(Input::new(&self.object_filter).cleanable(true).w_full());
         for (i, key) in targets
             .into_iter()
             .filter(|k| {
@@ -441,7 +493,16 @@ impl Privileges {
             })
             .enumerate()
         {
-            let label = if key.2 == "*" {
+            let label = if key.0 == "database"
+                && key.1 != account_admin::literal_database_scope(&self.selected_db)
+            {
+                tr(
+                    cx,
+                    "accounts.workbench.existing_pattern",
+                    &[("pattern", &key.1)],
+                )
+                .to_string()
+            } else if key.2 == "*" {
                 t(cx, "accounts.workbench.all_objects").to_string()
             } else if key.3.is_empty() {
                 key.2.clone()
@@ -492,7 +553,18 @@ impl Privileges {
             div()
                 .h_flex()
                 .gap_3()
-                .child(div().flex_1().child(t(cx, "accounts.privilege")))
+                .child(
+                    div()
+                        .w(px(170.))
+                        .flex_shrink_0()
+                        .child(t(cx, "accounts.privilege")),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(160.))
+                        .child(t(cx, "accounts.workbench.description")),
+                )
                 .child(
                     div()
                         .w(px(if self.narrow { 56. } else { 80. }))
@@ -522,6 +594,7 @@ impl Privileges {
             let k = key.clone();
             let p = privilege.clone();
             let opt = key.clone();
+            let description = t(cx, permission_description(&privilege));
             rows = rows.child(
                 div()
                     .h_flex()
@@ -532,8 +605,8 @@ impl Privileges {
                     .border_color(cx.theme().border)
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .w(px(170.))
+                            .flex_shrink_0()
                             .child(privilege)
                             .when(changed, |el| {
                                 el.child(div().text_xs().child(t(
@@ -547,6 +620,14 @@ impl Privileges {
                                     },
                                 )))
                             }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(160.))
+                            .text_xs()
+                            .whitespace_normal()
+                            .child(description),
                     )
                     .child(
                         div().w(px(if self.narrow { 56. } else { 80. })).child(
@@ -580,7 +661,11 @@ impl Privileges {
         } else {
             format!(
                 "{} / {}{}",
-                key.1,
+                if key.0 == "database" {
+                    account_admin::database_scope_label(&key.1)
+                } else {
+                    key.1.clone()
+                },
                 key.2,
                 if key.3.is_empty() {
                     String::new()
@@ -589,23 +674,37 @@ impl Privileges {
                 }
             )
         };
-        let mut permissions = div()
-            .v_flex()
-            .gap_3()
-            .child(label.clone())
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(t(cx, "accounts.workbench.option_hint")),
-            )
-            .child(rows);
+        let mut permissions = div().v_flex().gap_3().child(label.clone()).child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(t(cx, "accounts.workbench.option_hint")),
+        );
+        if !self.selected_db.is_empty() {
+            permissions = permissions.child(
+                Button::new("grant-database-all-tables")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Check)
+                    .label(t(cx, "accounts.workbench.grant_database_all"))
+                    .tooltip(t(cx, "accounts.workbench.grant_database_hint"))
+                    .disabled(!writable)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.begin_edit();
+                        let key = grant_database(this.draft.as_mut().unwrap(), &this.selected_db);
+                        this.selected_target = key;
+                        feedback::success(t(cx, "accounts.workbench.bulk_staged"), cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        permissions = permissions.child(rows);
         let bulk = key.clone();
         permissions = permissions.child(
             div().h_flex().gap_2().children(
                 [
-                    (true, "accounts.workbench.grant_all"),
-                    (false, "accounts.grants.revoke_scope"),
+                    (true, "accounts.workbench.select_all"),
+                    (false, "accounts.workbench.clear_all"),
                 ]
                 .into_iter()
                 .map(|(enable, label)| {
@@ -630,7 +729,7 @@ impl Privileges {
             permissions = div()
                 .v_flex()
                 .gap_2()
-                .child(Input::new(&self.object_filter).cleanable(true))
+                .child(Input::new(&self.object_filter).cleanable(true).w_full())
                 .child(
                     Button::new("permission-select-object")
                         .ghost()
@@ -937,32 +1036,8 @@ impl Privileges {
             .into_any_element()
     }
 }
-fn grant_scroll(id: &'static str, content: impl IntoElement, handle: &ScrollHandle) -> AnyElement {
-    div()
-        .id(id)
-        .size_full()
-        .min_h_0()
-        .min_w_0()
-        .relative()
-        .child(
-            div()
-                .id(SharedString::from(format!("{id}-content")))
-                .size_full()
-                .overflow_y_scroll()
-                .track_scroll(handle)
-                .pr_4()
-                .child(content),
-        )
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .right_0()
-                .w(px(12.))
-                .child(Scrollbar::vertical(handle).scrollbar_show(ScrollbarShow::Always)),
-        )
-        .into_any_element()
+fn grant_scroll(id: &'static str, content: Div, handle: &ScrollHandle) -> AnyElement {
+    crate::content_scroll::view(id, handle, content.w_full())
 }
 
 #[cfg(test)]
@@ -977,6 +1052,38 @@ mod tests {
             privilege: privilege.into(),
             grantable,
         }
+    }
+    #[::core::prelude::v1::test]
+    fn database_shortcut_is_literal_and_preserves_existing_grants() {
+        let mut before = vec![grant("other", "SELECT", true)];
+        let existing = grant("account\\_center", "SELECT", true);
+        before.push(existing.clone());
+        let mut after = before.clone();
+        let key = grant_database(&mut after, "account_center");
+        assert_eq!(key.1, "account\\_center");
+        assert!(before.iter().all(|g| after.contains(g)));
+        assert!(after.iter().skip(before.len()).all(|g| !g.grantable));
+        let sql = account_admin::grant_sql(&GrantPlan {
+            user: "fixture".into(),
+            host: "localhost".into(),
+            before: before.clone(),
+            after,
+        })
+        .unwrap();
+        assert!(sql.iter().all(
+            |sql| sql.contains("ON `account\\_center`.*") && !sql.contains("WITH GRANT OPTION")
+        ));
+        let mut draft = vec![];
+        grant_database(&mut draft, "account_center");
+        assert!(
+            account_admin::grant_sql(&GrantPlan {
+                user: "fixture".into(),
+                host: "localhost".into(),
+                before: vec![],
+                after: draft
+            })
+            .is_ok()
+        );
     }
     #[::core::prelude::v1::test]
     fn scope_bulk_preserves_unknown_privileges_options_and_other_scopes() {

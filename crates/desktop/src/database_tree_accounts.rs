@@ -11,6 +11,97 @@ pub(super) fn supported(profile: &Profile) -> bool {
     }
 }
 impl DatabaseView {
+    fn objects_account_scope(&self) -> Option<Scope> {
+        let (id, database) = self.selected_database.as_ref()?;
+        let profile = self.profiles.iter().find(|p| p.id == *id)?;
+        (supported(profile) && self.note_connection_state(*id) == Some(true)).then(|| Scope {
+            id: *id,
+            database: database.clone(),
+            generation: self.note_generation(*id),
+        })
+    }
+    pub(in crate::database) fn objects_accounts_need_load(&self) -> bool {
+        self.objects_account_scope().is_some_and(|scope| {
+            self.navigation.tree_nodes.contains(&scope.key("users"))
+                && !self.tree.pages.contains_key(&page_key(&scope, "user"))
+        })
+    }
+    pub(in crate::database) fn objects_accounts_supported(&self) -> bool {
+        self.objects_account_scope().is_some()
+    }
+    pub(in crate::database) fn objects_accounts_revision(&self) -> (u64, bool) {
+        (
+            self.tree.revision,
+            self.objects_account_scope()
+                .is_some_and(|scope| self.navigation.tree_nodes.contains(&scope.key("users"))),
+        )
+    }
+    pub(in crate::database) fn objects_account_rows(&self) -> Vec<crate::object_browser::TreeRow> {
+        use crate::object_browser::TreeRow;
+        let Some(scope) = self.objects_account_scope() else {
+            return vec![];
+        };
+        let mut rows = vec![TreeRow::Accounts];
+        if self.navigation.tree_nodes.contains(&scope.key("users")) {
+            if let Some(page) = self.tree.pages.get(&page_key(&scope, "user")) {
+                rows.extend(page.objects.iter().cloned().map(TreeRow::Account));
+                if page.loaded
+                    && page.objects.is_empty()
+                    && page.error.is_none()
+                    && page.busy.is_empty()
+                {
+                    rows.push(TreeRow::AccountsEmpty);
+                }
+                if !page.loaded || page.more || page.error.is_some() || !page.busy.is_empty() {
+                    rows.push(TreeRow::AccountsPage);
+                }
+            } else {
+                rows.push(TreeRow::AccountsPage);
+            }
+        }
+        rows
+    }
+    pub(in crate::database) fn objects_account_row(
+        &self,
+        row: crate::object_browser::TreeRow,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::object_browser::TreeRow;
+        let Some(scope) = self.objects_account_scope() else {
+            return div().into_any_element();
+        };
+        match row {
+            TreeRow::Accounts => self.tree_users_row_at(scope, 15., cx),
+            TreeRow::Account(object) => self.tree_user_row_at(scope, object, 35., cx),
+            TreeRow::AccountsEmpty => div()
+                .pl(px(20.))
+                .text_xs()
+                .child(t(cx, "database.users.empty"))
+                .into_any_element(),
+            _ => self.tree_users_page_row(scope, cx),
+        }
+    }
+    pub(in crate::database) fn objects_show_accounts(&mut self, cx: &mut Context<Self>) {
+        if let Some(scope) = self.objects_account_scope() {
+            let key = scope.key("users");
+            if !self.navigation.tree_nodes.contains(&key) && !self.tree_toggle(key, cx) {
+                return;
+            }
+            self.tree.revision += 1;
+            if let Some(index) = self.browser.layout.iter().position(|key| key == "accounts") {
+                self.browser.list.scroll_to_reveal_item(index);
+            }
+            if self
+                .tree
+                .pages
+                .get(&page_key(&scope, "user"))
+                .is_none_or(|p| !p.loaded)
+            {
+                self.tree_users_load(scope, false, cx);
+            }
+            cx.notify();
+        }
+    }
     pub(super) fn tree_databases_row(&self, scope: Scope, cx: &mut Context<Self>) -> AnyElement {
         let key = scope.key("databases-closed");
         let open = if self.tree_object_query(cx).is_empty() {
@@ -49,6 +140,9 @@ impl DatabaseView {
             .into_any_element()
     }
     pub(super) fn tree_users_row(&self, scope: Scope, cx: &mut Context<Self>) -> AnyElement {
+        self.tree_users_row_at(scope, 26., cx)
+    }
+    fn tree_users_row_at(&self, scope: Scope, indent: f32, cx: &mut Context<Self>) -> AnyElement {
         let menu_scope = scope.clone();
         let key = scope.key("users");
         let open = self.navigation.tree_nodes.contains(&key);
@@ -67,7 +161,7 @@ impl DatabaseView {
                     .flex_1()
                     .min_w_0()
                     .justify_start()
-                    .pl(px(26.))
+                    .pl(px(indent))
                     .icon(if open {
                         IconName::ChevronDown
                     } else {

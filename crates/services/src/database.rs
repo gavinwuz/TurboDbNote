@@ -10,9 +10,14 @@ use std::{
     time::{Duration, Instant},
 };
 pub mod catalog_browser;
+#[cfg(test)]
+mod clickhouse_fixture;
+pub mod clickhouse_sql;
 pub mod comparison;
 pub mod connection_import;
 pub mod copy;
+pub mod index_design;
+pub mod mysql_restore;
 pub mod notebook_query;
 pub mod redis_value;
 mod remote;

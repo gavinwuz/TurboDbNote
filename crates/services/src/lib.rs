@@ -143,6 +143,7 @@ pub trait AiService: Send + Sync {
     fn start(&self, prompt: String, context: AiContext) -> ServiceFuture<'_, Box<dyn AiSession>>;
 }
 
+pub mod note_sql_export;
 pub mod note_store;
 pub mod sql_script;
 

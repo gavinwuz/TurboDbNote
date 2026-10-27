@@ -300,6 +300,7 @@ impl Render for ImportView {
             (SqlDialect::MySql, "MySQL"),
             (SqlDialect::PostgreSql, "PostgreSQL"),
             (SqlDialect::Sqlite, "SQLite"),
+            (SqlDialect::ClickHouse, "ClickHouse"),
         ] {
             dialects = dialects.child(
                 Button::new(SharedString::from(format!("script-dialect-{name}")))

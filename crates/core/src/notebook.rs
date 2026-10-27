@@ -83,8 +83,16 @@ pub enum SqlDialect {
     MySql,
     PostgreSql,
     Sqlite,
+    ClickHouse,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RestoreOptions {
+    pub database: String,
+    pub data: bool,
+    pub triggers: bool,
+    pub current_definer: bool,
+}
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SqlScript {
     pub name: String,
@@ -95,6 +103,8 @@ pub struct SqlScript {
     pub unsupported: u64,
     pub writes: u64,
     pub dialect: SqlDialect,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore: Option<RestoreOptions>,
 }
 impl SqlScript {
     pub fn valid(&self) -> bool {
@@ -104,7 +114,11 @@ impl SqlScript {
                     .bytes()
                     .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         };
-        hash(&self.source_hash)
+        self.restore.as_ref().is_none_or(|r| {
+            !r.database.is_empty()
+                && r.database.len() <= 64
+                && !r.database.chars().any(char::is_control)
+        }) && hash(&self.source_hash)
             && hash(&self.index_hash)
             && !self.name.is_empty()
             && self.name.len() <= 1024
@@ -420,6 +434,12 @@ mod tests {
             unsupported: 0,
             writes: 10,
             dialect: SqlDialect::Sqlite,
+            restore: Some(RestoreOptions {
+                database: "local_copy".into(),
+                data: false,
+                triggers: false,
+                current_definer: true,
+            }),
         };
         note.cells.push(Cell {
             id: Uuid::new_v4(),

@@ -451,6 +451,14 @@ impl CellView {
                         cx.notify();
                     }
                 }
+                crate::script_cell::ScriptEvent::RestoreOptions(options) => {
+                    if let CellContent::SqlScript { script, .. } = &mut this.cell.content {
+                        script.restore = Some(options.clone());
+                        this.revision += 1;
+                        cx.emit(CellEvent::Changed);
+                        cx.notify();
+                    }
+                }
                 crate::script_cell::ScriptEvent::PermissionBlocked(advice) => {
                     cx.emit(CellEvent::PermissionBlocked(advice.clone()))
                 }
@@ -816,6 +824,8 @@ impl CellView {
                                 move |mut menu, _, cx| {
                                     for (key, action) in [
                                         ("notes.file.replace", 0),
+                                        ("restore.open", 5),
+                                        ("clickhouse.sql.reanalyze", 4),
                                         ("script.copy_path", 1),
                                         ("notes.cell_copy", 2),
                                         ("notes.remove_cell", 3),
@@ -827,9 +837,9 @@ impl CellView {
                                         menu = menu.item(
                                             PopupMenuItem::new(t(cx, key))
                                                 .disabled(locked && action != 1)
-                                                .on_click(move |_, _, cx| {
+                                                .on_click(move |_, window, cx| {
                                                     let target = target.clone();
-                                                    cx.defer(move |cx| {
+                                                    window.defer(cx,move |window,cx| {
                                                         let _ = target.update(cx, |this, cx| {
                                                             match action {
                                                                 0 => cx.emit(
@@ -851,6 +861,26 @@ impl CellView {
                                                                     after: true,
                                                                     copy: true,
                                                                 }),
+                                                                5=>{
+                                                                    if let Ok((saved,database))=this.binding(cx) {
+                                                                        if let Some(script)=&this.script {
+                                                                            let script=script.read(cx);
+                                                                            if let Some(parent)=script.path.parent(){
+                                                                                let file=parent.join(".turbodbnote-scripts").join(format!("{}.sql",script.script.source_hash));
+                                                                                let options=script.script.restore.clone();
+                                                                                let weak=this.script.as_ref().unwrap().downgrade();
+                                                                                let callback=std::rc::Rc::new(move|options:turbodbn_core::notebook::RestoreOptions,cx:&mut App|{let _=weak.update(cx,|script,cx|{script.script.restore=Some(options.clone());cx.emit(crate::script_cell::ScriptEvent::RestoreOptions(options));});});
+                                                                                let connections=this.connections.clone();let id=saved.profile.id;
+                                                                                cx.defer_in(window,move|_,window,cx|connections.update(cx,|db,cx|db.transfer_restore_dialog(id,database,file,(options,callback),window,cx)));
+                                                                            }
+                                                                        }
+                                                                    }else{feedback::error(t(cx,"notes.choose_connection"),cx);}
+                                                                }
+                                                                4=>{
+                                                                    if let Some(kind)=this.assist_context(cx).0.and_then(turbodbn_services::sql_script::dialect) {
+                                                                        if let Some(script)=&this.script {script.update(cx,|script,cx|script.reanalyze(kind,cx));}
+                                                                    }else{feedback::error(t(cx,"notes.choose_connection"),cx);}
+                                                                }
                                                                 _ => cx.emit(CellEvent::Remove),
                                                             }
                                                         });
@@ -1500,7 +1530,10 @@ impl CellView {
         let saved = self.connections.read(cx).saved_connection(id, cx)?;
         if !matches!(
             saved.profile.kind,
-            DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+            DatabaseKind::MySql
+                | DatabaseKind::PostgreSql
+                | DatabaseKind::Sqlite
+                | DatabaseKind::ClickHouse
         ) {
             return Err(t(cx, "notes.sql_driver").to_string());
         }
@@ -2108,6 +2141,8 @@ impl CellView {
                             cx,
                             if summary.status == "succeeded" {
                                 "output.operation.succeeded"
+                            } else if summary.status == "submitted" {
+                                "clickhouse.execution.submitted"
                             } else if summary.status == "cancelled" {
                                 "result.execution.cancelled"
                             } else {
@@ -2958,12 +2993,7 @@ impl Render for CellView {
 
         if editing {
             body = body.child(self.toolbar(window, cx));
-            if sql
-                && matches!(
-                    self.assist_context(cx).0,
-                    Some(DatabaseKind::ClickHouse | DatabaseKind::Redis)
-                )
-            {
+            if sql && matches!(self.assist_context(cx).0, Some(DatabaseKind::Redis)) {
                 body = body.child(
                     div()
                         .text_xs()

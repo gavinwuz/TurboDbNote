@@ -78,7 +78,17 @@ pub struct Column {
     pub primary: bool,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IndexColumn {
+    pub name: String,
+    pub position: usize,
+    pub descending: Option<bool>,
+    pub nullable: Option<bool>,
+    pub prefix: Option<u64>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Schema {
+    #[serde(default)]
+    pub index_columns: std::collections::BTreeMap<String, Vec<IndexColumn>>,
     pub columns: Vec<Column>,
     pub indexes: Rows,
     pub foreign_keys: Rows,
@@ -242,7 +252,12 @@ pub fn quote(kind: DatabaseKind, name: &str) -> String {
     } else {
         '"'
     };
-    format!("{ch}{}{ch}", name.replace(ch, &format!("{ch}{ch}")))
+    let escaped = if kind == DatabaseKind::ClickHouse {
+        name.replace('\\', "\\\\")
+    } else {
+        name.to_owned()
+    };
+    format!("{ch}{}{ch}", escaped.replace(ch, &format!("{ch}{ch}")))
 }
 pub fn literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -394,14 +409,7 @@ pub(super) async fn schema(
                 return Ok(s);
             }
             let indexes = c.query(&format!("SHOW INDEX FROM {name}")).await?;
-            s.indexes = Rows {
-                columns: vec!["Index".into(), "Column".into(), "Non_unique".into()],
-                values: indexes
-                    .values
-                    .iter()
-                    .map(|r| vec![Some(value(r, 2)), Some(value(r, 4)), Some(value(r, 1))])
-                    .collect(),
-            };
+            (s.indexes, s.index_columns) = super::index_design::mysql_metadata(&indexes);
             s.ddl = c
                 .query(&format!("SHOW CREATE TABLE {name}"))
                 .await?
@@ -448,6 +456,32 @@ pub(super) async fn schema(
                     literal_for(kind, &object.name)
                 ))
                 .await?;
+            for index in s.indexes.values.iter().take(200) {
+                let name = value(index, 0);
+                let details=c.query(&format!("SELECT seqno,name,desc FROM pragma_index_xinfo({}) WHERE key=1 ORDER BY seqno",literal_for(kind,&name))).await?;
+                let columns = details
+                    .values
+                    .iter()
+                    .take(32)
+                    .map(|row| {
+                        let name = value(row, 1);
+                        let nullable = s
+                            .columns
+                            .iter()
+                            .find(|column| column.name == name)
+                            .and_then(|column| column.not_null)
+                            .map(|not_null| !not_null);
+                        IndexColumn {
+                            name,
+                            position: value(row, 0).parse::<usize>().unwrap_or(0) + 1,
+                            descending: Some(value(row, 2) == "1"),
+                            nullable,
+                            prefix: None,
+                        }
+                    })
+                    .collect();
+                s.index_columns.insert(name, columns);
+            }
             s.foreign_keys = c
                 .query(&format!(
                     "SELECT \"table\",\"from\",\"to\" FROM pragma_foreign_key_list({})",
@@ -529,6 +563,7 @@ pub(super) async fn schema(
         }
         DatabaseKind::Redis => return Err("Redis 不支持关系表操作".into()),
     }
+    s.indexes = super::index_design::compact_rows(&s.indexes);
     Ok(s)
 }
 pub async fn run(
@@ -1311,12 +1346,20 @@ pub(super) fn comment_clause(sql: &str) -> Result<Option<(usize, usize)>, String
             && bytes
                 .get(i..i + 7)
                 .is_some_and(|s| s.eq_ignore_ascii_case(b"COMMENT"))
-            && bytes.get(i + 7).is_some_and(u8::is_ascii_whitespace)
+            && bytes
+                .get(i + 7)
+                .is_some_and(|byte| byte.is_ascii_whitespace() || *byte == b'=')
         {
             let start = i;
             i += 7;
             while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
                 i += 1;
+            }
+            if bytes.get(i) == Some(&b'=') {
+                i += 1;
+                while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                    i += 1;
+                }
             }
             if bytes.get(i) != Some(&b'\'') {
                 return Err("未知的 COMMENT 定义".into());

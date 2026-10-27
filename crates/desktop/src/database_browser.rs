@@ -461,12 +461,17 @@ impl DatabaseView {
         {
             cx.defer_in(_window, |this, _, cx| this.pump_browser(cx));
         }
+        if self.objects_accounts_need_load() {
+            cx.defer_in(_window, |this, _, cx| this.objects_show_accounts(cx));
+        }
         let query = self.object_filter.read(cx).value().trim().to_lowercase();
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         for key in &self.expanded_objects {
             key.hash(&mut hasher);
         }
+        self.objects_accounts_revision().hash(&mut hasher);
+        self.selected_database.hash(&mut hasher);
         let fingerprint = (self.browser.revision, query.clone(), hasher.finish());
         if self.browser.fingerprint.as_ref() != Some(&fingerprint) {
             self.browser.counts.clear();
@@ -519,6 +524,7 @@ impl DatabaseView {
                     }
                 }
             }
+            rows.extend(self.objects_account_rows());
             let keys = rows.iter().map(TreeRow::key).collect::<Vec<_>>();
             if self.browser.layout != keys {
                 let prefix = self
@@ -597,6 +603,10 @@ impl DatabaseView {
                         state,
                         cx.processor(move |this, index: usize, window, cx| {
                             match rows[index].clone() {
+                                row @ (TreeRow::Accounts
+                                | TreeRow::Account(_)
+                                | TreeRow::AccountsPage
+                                | TreeRow::AccountsEmpty) => this.objects_account_row(row, cx),
                                 TreeRow::Object(object) => {
                                     this.render_browser_object(object, window, cx)
                                 }
@@ -663,6 +673,19 @@ impl DatabaseView {
                                     .w_full()
                                     .h(px(30.))
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        if category == "index" {
+                                            this.open_table(
+                                                Object {
+                                                    schema: String::new(),
+                                                    name: String::new(),
+                                                    kind: "table".into(),
+                                                    comment: String::new(),
+                                                    parent: String::new(),
+                                                },
+                                                crate::table_view::Mode::Indexes,
+                                                cx,
+                                            );
+                                        }
                                         let key = if category == "table" {
                                             category.into()
                                         } else {

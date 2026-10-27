@@ -371,6 +371,7 @@ impl Render for Designer {
         let mut body = div()
             .v_flex()
             .size_full()
+            .min_h_0()
             .min_w_0()
             .gap_2()
             .p_2()
@@ -500,23 +501,27 @@ impl Render for Designer {
         }
         if self.text_mode {
             if let Some(schema) = schema {
-                body = body.child(
-                    div()
-                        .id("design-ddl")
-                        .flex_1()
-                        .min_h_0()
-                        .overflow_scroll()
-                        .track_scroll(&self.scroll)
-                        .child(
-                            gpui_component::text::TextView::markdown(
-                                "design-sql",
-                                crate::cell::sql_reading(&schema.ddl, target.kind),
-                                window,
-                                cx,
-                            )
-                            .selectable(true),
-                        ),
-                );
+                let width = schema
+                    .ddl
+                    .lines()
+                    .map(|line| line.chars().count())
+                    .max()
+                    .unwrap_or(0) as f32
+                    * 8.5
+                    + 40.;
+                body = body.child(crate::content_scroll::view(
+                    "design-ddl",
+                    &self.scroll,
+                    div().min_w_full().w(px(width)).child(
+                        gpui_component::text::TextView::markdown(
+                            "design-sql",
+                            crate::cell::sql_reading(&schema.ddl, target.kind),
+                            window,
+                            cx,
+                        )
+                        .selectable(true),
+                    ),
+                ));
             }
         } else if let Some(grid) = &self.grid {
             body = body.child(

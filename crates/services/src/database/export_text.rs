@@ -156,9 +156,11 @@ pub(super) fn write_sql(
             {
                 quote = Some(if byte == b'[' { b']' } else { byte });
                 backslash = byte == b'\''
-                    && (kind == crate::DatabaseKind::MySql
-                        || (kind == crate::DatabaseKind::PostgreSql
-                            && matches!(previous, b'E' | b'e')));
+                    && (matches!(
+                        kind,
+                        crate::DatabaseKind::MySql | crate::DatabaseKind::ClickHouse
+                    ) || (kind == crate::DatabaseKind::PostgreSql
+                        && matches!(previous, b'E' | b'e')));
             }
             out.write_all(&[byte])?;
         }

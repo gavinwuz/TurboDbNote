@@ -188,7 +188,31 @@ pub fn create_dated(
         return Err("Invalid note date".into());
     }
     fs::create_dir_all(directory).map_err(io_error)?;
-    let prefix = format!("note-{date}-");
+    let readable = note
+        .title
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || "<>:\"/\\|?*".contains(ch) {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .take(60)
+        .collect::<String>()
+        .trim_matches(['.', ' ', '-'])
+        .to_owned();
+    let mut readable = readable;
+    while readable.len() > 160 {
+        readable.pop();
+    }
+    let readable = if readable.is_empty() {
+        "笔记".to_owned()
+    } else {
+        readable
+    };
+    let prefix = format!("{readable}-{date}-");
     let mut next = 1u64;
     for item in fs::read_dir(directory).map_err(io_error)? {
         let path = item.map_err(io_error)?.path();
@@ -198,7 +222,10 @@ pub fn create_dated(
             && let Some(n) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
-                .and_then(|s| s.strip_prefix(&prefix))
+                .and_then(|s| {
+                    s.rsplit_once(&format!("-{date}-"))
+                        .map(|(_, number)| number)
+                })
                 .and_then(|s| s.parse::<u64>().ok())
         {
             next = next.max(n.saturating_add(1));
@@ -209,7 +236,7 @@ pub fn create_dated(
         let name = format!("{prefix}{next}");
         let path = directory.join(format!("{name}.note"));
         if generated {
-            note.title = name;
+            note.title = format!("笔记-{date}-{next}");
         }
         match save(&path, &note, None) {
             Ok(hash) => return Ok((path, Loaded { note, hash })),
@@ -278,17 +305,31 @@ mod tests {
     fn daily_names_are_monotonic_preserve_titles_and_never_overwrite() {
         let root = tempfile::tempdir().unwrap();
         let (first, loaded) = create_dated(root.path(), "261022", Note::new("")).unwrap();
-        assert_eq!(first.file_name().unwrap(), "note-261022-1.note");
-        assert_eq!(loaded.note.title, "note-261022-1");
+        assert_eq!(first.file_name().unwrap(), "笔记-261022-1.note");
+        assert_eq!(loaded.note.title, "笔记-261022-1");
         let before = fs::read(&first).unwrap();
         let (table, loaded) = create_dated(root.path(), "261022", Note::new("cq_user")).unwrap();
-        assert_eq!(table.file_name().unwrap(), "note-261022-2.note");
+        assert_eq!(table.file_name().unwrap(), "cq_user-261022-2.note");
         assert_eq!(loaded.note.title, "cq_user");
         fs::remove_file(table).unwrap();
         let (next, _) = create_dated(root.path(), "261023", Note::new("")).unwrap();
-        assert_eq!(next.file_name().unwrap(), "note-261023-1.note");
+        assert_eq!(next.file_name().unwrap(), "笔记-261023-1.note");
         assert_eq!(fs::read(first).unwrap(), before);
         assert!(create_dated(root.path(), "../bad", Note::new("")).is_err());
+    }
+    #[test]
+    fn readable_title_names_preserve_title_and_remove_windows_path_punctuation() {
+        let root = tempfile::tempdir().unwrap();
+        let title = "师徒 · 131.165:3306 / 查询";
+        let (path, loaded) = create_dated(root.path(), "261026", Note::new(title)).unwrap();
+        assert!(
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("师徒 · 131.165-3306 - 查询-261026-")
+        );
+        assert_eq!(loaded.note.title, title);
+        assert_eq!(path.parent().unwrap(), root.path());
     }
     #[test]
     fn simultaneous_daily_note_creation_uses_distinct_files() {

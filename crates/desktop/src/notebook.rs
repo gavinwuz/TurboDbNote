@@ -1,5 +1,7 @@
 #[path = "note_batch.rs"]
 mod batch_ui;
+#[path = "note_export.rs"]
+mod export_ui;
 #[path = "note_query.rs"]
 mod query_ui;
 #[path = "note_toolbar.rs"]
@@ -786,21 +788,13 @@ impl NoteView {
         } else {
             self.note.title.clone()
         };
-        let automatic = self.note.title.trim().is_empty()
-            || self.note.title.starts_with("note-")
-            || self
-                .note
-                .table_query
-                .as_ref()
-                .is_some_and(|(_, table)| table == &self.note.title);
-        if automatic
-            && let Some(profile) = self
-                .note
-                .default_connection_id
-                .and_then(|id| self.connections.read(cx).note_profile(id))
+        if let Some(profile) = self
+            .note
+            .default_connection_id
+            .and_then(|id| self.connections.read(cx).note_profile(id))
         {
             let address = short_address(&profile.host, profile.port);
-            if !address.is_empty() {
+            if !address.is_empty() && !title.ends_with(&format!(" · {address}")) {
                 return format!("{title} · {address}").into();
             }
         }
@@ -1080,12 +1074,6 @@ impl NoteView {
                     if path.extension().is_none() {
                         path.set_extension("note");
                     }
-                    this.note.title = path
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned();
-                    this.changed(cx);
                     this.debounce = None;
                     this.save_to(path, true, false, cx);
                 } else if this.flush_again {

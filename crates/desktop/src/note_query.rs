@@ -57,7 +57,10 @@ impl NoteView {
         };
         if !matches!(
             profile.kind,
-            DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+            DatabaseKind::MySql
+                | DatabaseKind::PostgreSql
+                | DatabaseKind::Sqlite
+                | DatabaseKind::ClickHouse
         ) {
             feedback::error(t(cx, "query_note.unsupported"), cx);
             return;

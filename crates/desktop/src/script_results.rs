@@ -128,6 +128,7 @@ pub struct ScriptResults {
     show_details: bool,
     details_rowset: Option<u64>,
     success: u64,
+    submitted: u64,
     failed: u64,
     total: u64,
     shown: bool,
@@ -175,6 +176,7 @@ impl ScriptResults {
             show_details: false,
             details_rowset: None,
             success: 0,
+            submitted: 0,
             failed: 0,
             total: 0,
             shown: false,
@@ -264,6 +266,16 @@ impl ScriptResults {
                 ],
             )
         } else {
+            if self.submitted > 0 {
+                return tr(
+                    cx,
+                    "clickhouse.execution.batch_submitted",
+                    &[
+                        ("count", &self.success.to_string()),
+                        ("submitted", &self.submitted.to_string()),
+                    ],
+                );
+            }
             let counts = [
                 &self.stats.inserted,
                 &self.stats.updated,
@@ -335,6 +347,7 @@ impl ScriptResults {
         self.binding = Some((saved, database));
         self.stats = Stats::default();
         self.success = 0;
+        self.submitted = 0;
         self.failed = 0;
         self.total = total;
         self.tab = 0;
@@ -347,6 +360,9 @@ impl ScriptResults {
     }
     pub fn register_targets(&mut self, objects: impl IntoIterator<Item = Object>) {
         for object in objects {
+            if object.kind == "database" {
+                continue;
+            }
             if self.objects.len() < MAX_TABLES && !self.objects.contains(&object) {
                 self.objects.push(object);
             }
@@ -389,6 +405,8 @@ impl ScriptResults {
         self.elapsed = self.elapsed.saturating_add(result.elapsed_ms);
         self.stats.add(&result);
         let summary = result.execution.as_deref();
+        let submitted = summary.is_some_and(|s| s.status == "submitted");
+        self.submitted += u64::from(submitted);
         if let Some(summary) = summary {
             self.register_targets(summary.objects.iter().cloned());
         }
@@ -418,7 +436,11 @@ impl ScriptResults {
             target: target.chars().take(512).collect(),
             rows: result.affected_rows,
             elapsed: Some(result.elapsed_ms),
-            status: "script.report.success",
+            status: if submitted {
+                "clickhouse.execution.submitted"
+            } else {
+                "script.report.success"
+            },
         });
         if self.details.len() > MAX_DETAILS {
             self.details.pop_front();
@@ -782,6 +804,100 @@ impl ScriptResults {
         }));
         cx.notify();
     }
+    fn load_mutations(&mut self, cx: &mut Context<Self>) {
+        if self.running || self.loading {
+            return;
+        }
+        let Some((saved, database)) = self.binding.clone() else {
+            return;
+        };
+        if !self
+            .connections
+            .read(cx)
+            .connection_snapshot_current(&saved)
+        {
+            feedback::error(t(cx, "notes.preview_changed"), cx);
+            return;
+        }
+        if !cx
+            .global::<crate::preferences::Preferences>()
+            .database
+            .command_enabled("select")
+        {
+            feedback::error(t(cx, "clickhouse.execution.select_disabled"), cx);
+            return;
+        }
+        self.cancel_metadata(cx);
+        self.loading = true;
+        self.show_details = true;
+        self.active_rowset = None;
+        self.tab = 1;
+        self.query = Rows::default();
+        self.query_label = t(cx, "clickhouse.execution.status");
+        self.sync_grid(cx);
+        let revision = self.revision;
+        let control = Arc::new(Control::default());
+        self.control = Some(control.clone());
+        let job = uuid::Uuid::new_v4();
+        let started = Instant::now();
+        self.metadata_job = Some((job, started));
+        self.schema_log(job, crate::operation_log::Phase::Started, 0, None, cx);
+        let work=cx.background_executor().spawn(async move{
+            let endpoint=saved.endpoint(database.clone())?;
+            let sql=format!("SELECT table, mutation_id, create_time, parts_to_do, is_done FROM system.mutations WHERE database={} ORDER BY create_time DESC LIMIT 50",turbodbn_services::database::workbench::literal_for(turbodbn_services::DatabaseKind::ClickHouse,&database));
+            let plan=turbodbn_services::database::notebook_query::Plan{sql,read_only:true,confirm:false,guards:vec![]};
+            let reply=transfer::service_operation(&endpoint,turbodbn_services::database::OperationKind::Workbench(Box::new(Request{database,action:Action::NoteExecute{plan,confirmed:false,offset:0,page_size:50}})),&control)?;
+            match reply {turbodbn_services::database::OperationResult::Workbench(reply)=>match *reply{Reply::NoteResult(page)=>Ok(page.rows),_=>Err("script.error.execution".into())},_=>Err("script.error.execution".into())}
+        });
+        self.metadata_task = Some(cx.spawn(async move |owner, cx| {
+            let result: Result<Rows, String> = work.await;
+            let _ = owner.update(cx, |this, cx| {
+                if this.revision != revision {
+                    return;
+                }
+                this.loading = false;
+                this.control = None;
+                this.metadata_job = None;
+                if !this.binding.as_ref().is_some_and(|(saved, _)| {
+                    this.connections.read(cx).connection_snapshot_current(saved)
+                }) {
+                    this.schema_log(
+                        job,
+                        crate::operation_log::Phase::Cancelled,
+                        started.elapsed().as_millis() as u64,
+                        None,
+                        cx,
+                    );
+                    return;
+                }
+                match result {
+                    Ok(rows) => {
+                        this.query = rows;
+                        this.sync_grid(cx);
+                        this.schema_log(
+                            job,
+                            crate::operation_log::Phase::Succeeded,
+                            started.elapsed().as_millis() as u64,
+                            None,
+                            cx,
+                        );
+                    }
+                    Err(error) => {
+                        this.schema_log(
+                            job,
+                            crate::operation_log::Phase::Failed,
+                            started.elapsed().as_millis() as u64,
+                            Some(&error),
+                            cx,
+                        );
+                        feedback::error(crate::locale::message(cx, &error), cx);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+        cx.notify();
+    }
 }
 impl Drop for ScriptResults {
     fn drop(&mut self) {
@@ -816,6 +932,22 @@ impl Render for ScriptResults {
             ],
         );
         let mut body = div().v_flex().gap_1().min_w_0();
+        if self.show_details
+            && self.submitted > 0
+            && self.binding.as_ref().is_some_and(|(saved, _)| {
+                saved.profile.kind == turbodbn_services::DatabaseKind::ClickHouse
+            })
+        {
+            body = body.child(
+                Button::new("clickhouse-mutations-status")
+                    .ghost()
+                    .icon(gpui_component::Icon::default().path("icons/refresh.svg"))
+                    .label(t(cx, "clickhouse.execution.status"))
+                    .disabled(self.running || self.loading)
+                    .on_click(cx.listener(|this, _, _, cx| this.load_mutations(cx))),
+            );
+        }
+
         if self.show_details {
             body = body.child(summary).child(
                 div()

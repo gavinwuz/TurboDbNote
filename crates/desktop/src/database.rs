@@ -1818,6 +1818,7 @@ impl DatabaseView {
                 IconName::ArrowRight,
                 "connect",
             ),
+            ("restore.open", IconName::ArrowDown, "import-script"),
             ("dbwork.connection.edit", IconName::Settings2, "edit"),
             ("dbwork.connection.copy", IconName::Copy, "copy"),
             ("feedback.storage.title", IconName::Info, "records"),
@@ -1846,6 +1847,19 @@ impl DatabaseView {
                                         );
                                     } else {
                                         this.connect_saved(id, window, cx);
+                                    }
+                                }
+                                "import-script" => {
+                                    if let Some(p) = this.profiles.iter().find(|p| p.id == id) {
+                                        let database = p.database.clone();
+                                        this.transfer_file_dialog(
+                                            crate::transfer::Mode::ImportFile,
+                                            id,
+                                            database,
+                                            None,
+                                            window,
+                                            cx,
+                                        );
                                     }
                                 }
                                 "edit" => this.select(id, true, window, cx),

@@ -21,6 +21,7 @@ pub fn kind(dialect: SqlDialect) -> DatabaseKind {
         SqlDialect::MySql => DatabaseKind::MySql,
         SqlDialect::PostgreSql => DatabaseKind::PostgreSql,
         SqlDialect::Sqlite => DatabaseKind::Sqlite,
+        SqlDialect::ClickHouse => DatabaseKind::ClickHouse,
     }
 }
 pub fn dialect(kind: DatabaseKind) -> Option<SqlDialect> {
@@ -28,6 +29,7 @@ pub fn dialect(kind: DatabaseKind) -> Option<SqlDialect> {
         DatabaseKind::MySql => Some(SqlDialect::MySql),
         DatabaseKind::PostgreSql => Some(SqlDialect::PostgreSql),
         DatabaseKind::Sqlite => Some(SqlDialect::Sqlite),
+        DatabaseKind::ClickHouse => Some(SqlDialect::ClickHouse),
         _ => None,
     }
 }
@@ -36,6 +38,7 @@ fn code(dialect: SqlDialect) -> u8 {
         SqlDialect::MySql => 0,
         SqlDialect::PostgreSql => 1,
         SqlDialect::Sqlite => 2,
+        SqlDialect::ClickHouse => 3,
     }
 }
 fn disk(_: impl std::fmt::Display) -> String {
@@ -198,6 +201,23 @@ impl AuthorizationSummary {
     }
 }
 impl Reader {
+    /// Original, hash-verified frozen attachment, bounded for combined Note export.
+    pub fn export_source(&mut self, limit: u64) -> Result<String, String> {
+        if self.script.bytes > limit {
+            return Err("notes.export_limit".into());
+        }
+        self.source.seek(SeekFrom::Start(0)).map_err(disk)?;
+        let mut bytes = Vec::new();
+        (&mut self.source)
+            .take(limit + 1)
+            .read_to_end(&mut bytes)
+            .map_err(disk)?;
+        if bytes.len() as u64 > limit {
+            return Err("notes.export_limit".into());
+        }
+        String::from_utf8(bytes).map_err(|_| "script.error.encoding".into())
+    }
+
     pub fn database_kind(&self) -> DatabaseKind {
         kind(self.script.dialect)
     }
@@ -301,6 +321,9 @@ pub struct Prepared {
     pub script: SqlScript,
 }
 impl Prepared {
+    pub fn reader(&self) -> Result<Reader, String> {
+        Reader::from_root(self.directory.path(), &self.script)
+    }
     pub fn page(&self) -> Result<Vec<Entry>, String> {
         Reader::from_root(self.directory.path(), &self.script)?.page(0)
     }
@@ -546,11 +569,27 @@ pub fn prepare(
         unsupported: scan.unsupported,
         writes: scan.writes,
         dialect,
+        restore: None,
     };
     if !script.valid() {
         return Err("script.error.resource".into());
     }
     Ok(Prepared { directory, script })
+}
+/// Validate a bounded export without the editor's 1 MiB total-buffer restriction.
+pub fn validate_export_source(source: &str, dialect: SqlDialect) -> Result<(), String> {
+    if source.contains('\0') {
+        return Err("notes.sql_range_invalid".into());
+    }
+    let mut scanner = Scanner::new(dialect, 0);
+    let mut sink = std::io::sink();
+    for byte in source.bytes() {
+        scanner.push(byte, &mut sink)?;
+    }
+    if !scanner.finished() {
+        return Err("script.error.unterminated".into());
+    }
+    scanner.emit(&mut sink)
 }
 /// Bounded editor segmentation reuses the script lexer and its byte-exact records.
 pub fn editor_ranges(
@@ -773,7 +812,9 @@ impl Scanner {
                     *end = true;
                 } else if b == b'\\' && self.dialect != SqlDialect::Sqlite {
                     *escape = true;
-                    self.unsafe_quote |= self.dialect != SqlDialect::MySql || *q == b'`';
+                    self.unsafe_quote |=
+                        !matches!(self.dialect, SqlDialect::MySql | SqlDialect::ClickHouse)
+                            || (self.dialect == SqlDialect::MySql && *q == b'`');
                 }
             }
             Mode::DollarOpen(tag) => {
@@ -1092,12 +1133,23 @@ pub fn refresh(note: &Path, script: &SqlScript, cancel: &AtomicBool) -> Result<S
         return Err("script.error.resource".into());
     }
     drop(index);
+    reparse(note, script, script.dialect, cancel)
+}
+/// Rebuild only derived classification; original attachment bytes and name stay unchanged.
+pub fn reparse(
+    note: &Path,
+    script: &SqlScript,
+    dialect: SqlDialect,
+    cancel: &AtomicBool,
+) -> Result<SqlScript, String> {
+    let root = folder(note)?;
     let source = root.join(format!("{}.sql", script.source_hash));
-    let mut prepared = prepare(&source, script.dialect, cancel, |_, _| {})?;
+    let mut prepared = prepare(&source, dialect, cancel, |_, _| {})?;
     if prepared.script.source_hash != script.source_hash {
         return Err("script.error.changed".into());
     }
     prepared.script.name = script.name.clone();
+    prepared.script.restore = script.restore.clone();
     prepared.publish(note, cancel)?;
     Ok(prepared.script)
 }

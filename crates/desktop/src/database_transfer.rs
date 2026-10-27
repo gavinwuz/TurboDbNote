@@ -41,6 +41,10 @@ impl Connection {
         Ok(Endpoint { profile, password })
     }
 }
+pub(crate) type RestoreReview = (
+    Option<turbodbn_core::notebook::RestoreOptions>,
+    std::rc::Rc<dyn Fn(turbodbn_core::notebook::RestoreOptions, &mut App)>,
+);
 struct TransferView {
     owner: WeakEntity<DatabaseView>,
     mode: Mode,
@@ -73,6 +77,12 @@ struct TransferView {
     options: Options,
     batch: Entity<InputState>,
     table_filter: Entity<InputState>,
+    data_table: Entity<InputState>,
+    restore_database: Entity<InputState>,
+    restore_new: bool,
+    restore_triggers: bool,
+    restore_definer: bool,
+    restore_review: Option<RestoreReview>,
     table_scroll: ScrollHandle,
     dialog_scroll: ScrollHandle,
     sample_table: Option<String>,
@@ -144,13 +154,53 @@ impl DatabaseView {
         let Some((id, database)) = self.selected_database.clone() else {
             return;
         };
+        self.transfer_file_dialog(mode, id, database, None, window, cx);
+    }
+    pub(crate) fn transfer_file_dialog(
+        &mut self,
+        mode: Mode,
+        id: Uuid,
+        database: String,
+        file: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_transfer((mode, id, database, file), None, window, cx);
+    }
+    pub(crate) fn transfer_restore_dialog(
+        &mut self,
+        id: Uuid,
+        database: String,
+        file: PathBuf,
+        review: RestoreReview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_transfer(
+            (Mode::ImportFile, id, database, Some(file)),
+            Some(review),
+            window,
+            cx,
+        );
+    }
+    fn open_transfer(
+        &mut self,
+        request: (Mode, Uuid, String, Option<PathBuf>),
+        review: Option<RestoreReview>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (mode, id, database, file) = request;
         let Some(profile) = self.profiles.iter().find(|p| p.id == id) else {
             return;
         };
         if profile.driver_id == "doris"
             || !matches!(
                 profile.kind,
-                DatabaseKind::MySql | DatabaseKind::PostgreSql | DatabaseKind::Sqlite
+                DatabaseKind::MySql
+                    | DatabaseKind::PostgreSql
+                    | DatabaseKind::Sqlite
+                    | DatabaseKind::ClickHouse
             )
         {
             feedback::error(crate::locale::t(cx, "transfer.unsupported"), cx);
@@ -166,6 +216,28 @@ impl DatabaseView {
         let owner = cx.entity().downgrade();
         let view =
             cx.new(|cx| TransferView::new(mode, choices, current, database, owner, window, cx));
+        if let Some(file) = file {
+            view.update(cx, |view, cx| {
+                view.file.update(cx, |input, cx| {
+                    input.set_value(file.display().to_string(), window, cx)
+                })
+            });
+        }
+        if let Some(review) = review {
+            view.update(cx, |view, cx| {
+                if let Some(options) = &review.0 {
+                    view.restore_new = true;
+                    view.schema = true;
+                    view.data = options.data;
+                    view.restore_triggers = options.triggers;
+                    view.restore_definer = options.current_definer;
+                    view.restore_database.update(cx, |input, cx| {
+                        input.set_value(options.database.clone(), window, cx)
+                    });
+                }
+                view.restore_review = Some(review);
+            });
+        }
         let observer = std::rc::Rc::new(cx.observe(&view, |_, _, cx| cx.refresh_windows()));
         window.open_dialog(cx, move |dialog, _, cx| {
             let _keep = &observer;
@@ -296,6 +368,13 @@ impl TransferView {
         let target_db = cx.new(|cx| InputState::new(window, cx).default_value(target));
         let file = cx.new(|cx| InputState::new(window, cx));
         let batch = cx.new(|cx| InputState::new(window, cx).default_value("1000"));
+        let restore_database = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::locale::t(cx, "restore.database"))
+        });
+        let data_table = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::locale::t(cx, "clickhouse.transfer.target_table"))
+        });
         let table_filter = cx.new(|cx| {
             InputState::new(window, cx).placeholder(crate::locale::t(cx, "transfer.filter_objects"))
         });
@@ -309,6 +388,8 @@ impl TransferView {
             file.clone(),
             batch.clone(),
             collation.clone(),
+            data_table.clone(),
+            restore_database.clone(),
         ]
         .into_iter()
         .map(|input| {
@@ -330,7 +411,9 @@ impl TransferView {
         }));
         cx.defer_in(window, |this, _, cx| {
             this.load_catalog(cx);
-            this.load_source_databases(cx);
+            if this.mode != Mode::ImportFile {
+                this.load_source_databases(cx);
+            }
             if this.mode == Mode::ImportConnection
                 && this.choices[this.target].profile.kind != DatabaseKind::Sqlite
             {
@@ -382,6 +465,12 @@ impl TransferView {
             },
             batch,
             table_filter,
+            data_table,
+            restore_database,
+            restore_new: false,
+            restore_triggers: false,
+            restore_definer: true,
+            restore_review: None,
             table_scroll: ScrollHandle::new(),
             dialog_scroll: ScrollHandle::new(),
             sample_table: None,
@@ -565,6 +654,12 @@ impl TransferView {
             .update(cx, |input, cx| input.set_value(value, window, cx));
         cx.notify();
     }
+    fn clickhouse_data_file(&self, cx: &App) -> bool {
+        self.choices[self.source].profile.kind == DatabaseKind::ClickHouse
+            && std::path::Path::new(self.file.read(cx).value().as_str())
+                .extension()
+                .is_some_and(|e| !e.eq_ignore_ascii_case("sql") && !e.eq_ignore_ascii_case("zip"))
+    }
     fn signature(&self, cx: &App) -> String {
         serde_json::to_string(&(
             self.mode as u8,
@@ -578,6 +673,11 @@ impl TransferView {
             self.data,
             &self.options,
             self.batch.read(cx).value().as_str(),
+            self.data_table.read(cx).value().as_str(),
+            self.restore_new,
+            self.restore_triggers,
+            self.restore_definer,
+            self.restore_database.read(cx).value().as_str(),
         ))
         .unwrap_or_default()
     }
@@ -732,7 +832,12 @@ impl TransferView {
         let export = self.mode == Mode::Export;
         let sqlite = self.choices[self.source].profile.kind == DatabaseKind::Sqlite;
         let pick = if export {
-            let ext = if sqlite
+            let ext = if self.choices[self.source].profile.kind == DatabaseKind::ClickHouse
+                && self.schema
+                && self.data
+            {
+                "zip"
+            } else if sqlite
                 && self.schema
                 && self.data
                 && self.options.tables.is_none()
@@ -838,6 +943,18 @@ impl TransferView {
         self.control = Arc::default();
         let control = self.control.clone();
         let mut options = self.options.clone();
+        if self.restore_new {
+            options.restore = Some(turbodbn_services::database::mysql_restore::Options {
+                database: self.restore_database.read(cx).value().trim().to_string(),
+                data: self.data,
+                triggers: self.restore_triggers,
+                current_definer: self.restore_definer,
+            });
+        }
+
+        if self.mode == Mode::ImportFile && self.clickhouse_data_file(cx) {
+            options.tables = Some(vec![self.data_table.read(cx).value().trim().to_string()]);
+        }
         options.batch_size = if self.uses_page_backup(cx) {
             1000
         } else {
@@ -847,6 +964,11 @@ impl TransferView {
             schema: self.schema,
             data: self.data,
         };
+        let restore_preview_label = crate::locale::t(cx, "restore.preview").to_string();
+        let data_headers = vec![
+            crate::locale::t(cx, "clickhouse.transfer.file_format").to_string(),
+            crate::locale::t(cx, "transfer.unit.bytes").to_string(),
+        ];
         let work = cx.background_executor().spawn(async move {
             let source_endpoint = if mode == Mode::ImportFile {
                 Endpoint {
@@ -893,7 +1015,71 @@ impl TransferView {
                     .take(32768)
                     .read_to_end(&mut bytes)
                     .map_err(|_| "无法读取导入文件")?;
-                if bytes.starts_with(b"SQLite format 3\0") {
+                if let Some(restore) = &options.restore {
+                    let text =
+                        std::fs::read_to_string(snapshot.path()).map_err(|_| "restore.limit")?;
+                    let adapted =
+                        turbodbn_services::database::mysql_restore::adapt(&text, restore)?;
+                    Ok((
+                        Preview {
+                            table: format!(
+                                "{} → {} · {}",
+                                adapted.source_databases.join(", "),
+                                restore.database,
+                                restore_preview_label
+                            ),
+                            columns: vec!["#".into(), "SQL".into()],
+                            rows: std::iter::once(vec![
+                                adapted.tables.to_string(),
+                                adapted.duplicates.to_string(),
+                                adapted.removed_drops.to_string(),
+                                adapted.skipped_data.to_string(),
+                                adapted.skipped_triggers.to_string(),
+                                adapted.changed_definers.to_string(),
+                            ])
+                            .chain(
+                                adapted
+                                    .sql
+                                    .lines()
+                                    .take(200)
+                                    .enumerate()
+                                    .map(|(i, l)| vec![(i + 1).to_string(), l.to_string()]),
+                            )
+                            .collect(),
+                            ..Default::default()
+                        },
+                        Some(snapshot),
+                    ))
+                } else if source.profile.kind == DatabaseKind::ClickHouse
+                    && file
+                        .extension()
+                        .is_some_and(|e| !e.eq_ignore_ascii_case("sql"))
+                {
+                    Ok((
+                        Preview {
+                            table: file
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                            columns: data_headers,
+                            rows: vec![vec![
+                                file.extension()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned(),
+                                snapshot
+                                    .as_file()
+                                    .metadata()
+                                    .map_err(|_| "clickhouse.http.response")?
+                                    .len()
+                                    .to_string(),
+                            ]],
+                            ..Default::default()
+                        },
+                        Some(snapshot),
+                    ))
+                } else if bytes.starts_with(b"SQLite format 3\0") {
                     if source.profile.kind != DatabaseKind::Sqlite {
                         return Err("SQLite 文件只能恢复到 SQLite 连接".into());
                     }
@@ -931,7 +1117,45 @@ impl TransferView {
             let _ = view.update(cx, |this, cx| {
                 this.previewing = false;
                 match result {
-                    Ok((preview, file, charset)) if this.signature(cx) == signature => {
+                    Ok((mut preview, file, charset)) if this.signature(cx) == signature => {
+                        if this.restore_new
+                            && let Some(row) = preview.rows.first_mut()
+                            && row.len() == 6
+                        {
+                            let summary = crate::locale::tr(
+                                cx,
+                                "restore.summary",
+                                &[
+                                    ("tables", &row[0]),
+                                    ("duplicates", &row[1]),
+                                    ("drops", &row[2]),
+                                    ("data", &row[3]),
+                                    ("triggers", &row[4]),
+                                    ("definers", &row[5]),
+                                ],
+                            )
+                            .to_string();
+                            *row = vec![String::new(), summary];
+                        }
+
+                        if this.restore_new
+                            && let Some((_, callback)) = &this.restore_review
+                        {
+                            callback(
+                                turbodbn_core::notebook::RestoreOptions {
+                                    database: this
+                                        .restore_database
+                                        .read(cx)
+                                        .value()
+                                        .trim()
+                                        .to_string(),
+                                    data: this.data,
+                                    triggers: this.restore_triggers,
+                                    current_definer: this.restore_definer,
+                                },
+                                cx,
+                            );
+                        }
                         this.source_charset = charset;
                         this.write_log(crate::operation_log::Phase::Succeeded, None, cx);
                         this.preview = preview;
@@ -949,8 +1173,64 @@ impl TransferView {
         }));
         cx.notify();
     }
+    fn save_restore(&mut self, cx: &mut Context<Self>) {
+        if self.reviewed.as_ref() != Some(&self.signature(cx)) {
+            feedback::error(crate::locale::t(cx, "restore.preview_required"), cx);
+            return;
+        }
+        let Some(snapshot) = self.preview_file.clone() else {
+            return;
+        };
+        let options = turbodbn_services::database::mysql_restore::Options {
+            database: self.restore_database.read(cx).value().trim().to_string(),
+            data: self.data,
+            triggers: self.restore_triggers,
+            current_definer: self.restore_definer,
+        };
+        let directory = dirs::document_dir().unwrap_or_else(|| PathBuf::from("."));
+        let name = format!(
+            "restore_{}_{}.sql",
+            options.database,
+            chrono::Local::now().format("%Y%m%d_%H%M%S")
+        );
+        let pick = cx.prompt_for_new_path(&directory, Some(&name));
+        cx.spawn(async move |_, cx| {
+            if let Ok(Ok(Some(path))) = pick.await {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        use std::io::Write;
+                        let source = std::fs::read_to_string(snapshot.path())
+                            .map_err(|_| "restore.limit")?;
+                        let preview =
+                            turbodbn_services::database::mysql_restore::adapt(&source, &options)?;
+                        let mut staged = tempfile::NamedTempFile::new_in(
+                            path.parent().ok_or("compare.save_failed")?,
+                        )
+                        .map_err(|_| "compare.save_failed")?;
+                        staged
+                            .write_all(preview.sql.as_bytes())
+                            .map_err(|_| "compare.save_failed")?;
+                        staged
+                            .persist_noclobber(path)
+                            .map_err(|_| "compare.save_failed")?;
+                        Ok::<_, String>(())
+                    })
+                    .await;
+                let _ = cx.update(|cx| match result {
+                    Ok(()) => feedback::success(crate::locale::t(cx, "feedback.saved"), cx),
+                    Err(error) => feedback::error(crate::locale::message(cx, &error), cx),
+                });
+            }
+        })
+        .detach();
+    }
     fn confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.running || self.previewing {
+            return;
+        }
+        if self.restore_new && self.reviewed.as_ref() != Some(&self.signature(cx)) {
+            feedback::error(crate::locale::t(cx, "restore.preview_required"), cx);
             return;
         }
         if self.schema && self.permissions.blocks(&self.options) {
@@ -1040,6 +1320,13 @@ impl TransferView {
                 }
             )
         );
+        if self.mode == Mode::ImportFile && self.clickhouse_data_file(cx) {
+            body.push_str(&crate::locale::tr(
+                cx,
+                "clickhouse.transfer.confirm_table",
+                &[("table", self.data_table.read(cx).value().trim())],
+            ));
+        }
         if self.mode != Mode::ImportFile {
             let tables = self
                 .options
@@ -1052,6 +1339,13 @@ impl TransferView {
                 cx,
                 "transfer.confirm_tables",
                 &[("tables", &tables)],
+            ));
+        }
+        if self.restore_new {
+            body.push_str(&crate::locale::tr(
+                cx,
+                "restore.confirm",
+                &[("database", self.restore_database.read(cx).value().trim())],
             ));
         }
         if self.mode == Mode::ImportConnection {
@@ -1122,6 +1416,18 @@ impl TransferView {
         };
         let mode = self.mode;
         let mut options = self.options.clone();
+        if self.restore_new {
+            options.restore = Some(turbodbn_services::database::mysql_restore::Options {
+                database: self.restore_database.read(cx).value().trim().to_string(),
+                data: self.data,
+                triggers: self.restore_triggers,
+                current_definer: self.restore_definer,
+            });
+        }
+
+        if self.mode == Mode::ImportFile && self.clickhouse_data_file(cx) {
+            options.tables = Some(vec![self.data_table.read(cx).value().trim().to_string()]);
+        }
         options.batch_size = self.batch.read(cx).value().parse().unwrap_or(1000);
         options.collation = (self.mode == Mode::Copy
             && self.choices[self.target].profile.kind == DatabaseKind::MySql)
@@ -1326,7 +1632,9 @@ impl TransferView {
                     ("bytes", &self.progress.bytes.to_string()),
                     (
                         "rows",
-                        &if matches!(self.progress.unit, transfer::Unit::Tables) {
+                        &if matches!(self.progress.unit, transfer::Unit::Tables)
+                            && self.choices[self.source].profile.kind != DatabaseKind::ClickHouse
+                        {
                             self.progress.rows.to_string()
                         } else {
                             "—".into()
@@ -1371,6 +1679,10 @@ impl TransferView {
                                 cx,
                                 if self.mode == Mode::Export {
                                     "transfer.export_done"
+                                } else if self.choices[self.source].profile.kind
+                                    == DatabaseKind::ClickHouse
+                                {
+                                    "clickhouse.transfer.submitted"
                                 } else {
                                     "transfer.done"
                                 },
@@ -1399,9 +1711,72 @@ impl TransferView {
                     .disabled(locked)
                     .on_click(cx.listener(|this, _, window, cx| this.browse(window, cx))),
             )
+            .when(
+                self.mode == Mode::Export
+                    && self.choices[self.source].profile.kind == DatabaseKind::ClickHouse,
+                |el| {
+                    let owner = cx.entity().downgrade();
+                    let extension = std::path::Path::new(self.file.read(cx).value().as_str())
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("sql")
+                        .to_ascii_uppercase();
+                    el.child(
+                        Button::new("clickhouse-export-format")
+                            .label(extension)
+                            .disabled(locked)
+                            .dropdown_menu(move |mut menu, _, _| {
+                                for ext in
+                                    ["sql", "zip", "csv", "tsv", "jsonl", "parquet", "native"]
+                                {
+                                    let owner = owner.clone();
+                                    menu = menu.item(
+                                        gpui_component::menu::PopupMenuItem::new(
+                                            ext.to_ascii_uppercase(),
+                                        )
+                                        .on_click(
+                                            move |_, window, cx| {
+                                                let _ = owner.update(cx, |this, cx| {
+                                                    let mut path = PathBuf::from(
+                                                        this.file.read(cx).value().as_str(),
+                                                    );
+                                                    if path.as_os_str().is_empty() {
+                                                        path = dirs::document_dir()
+                                                            .unwrap_or_else(|| PathBuf::from("."))
+                                                            .join("clickhouse-export.sql");
+                                                    }
+                                                    path.set_extension(ext);
+                                                    this.file.update(cx, |input, cx| {
+                                                        input.set_value(
+                                                            path.display().to_string(),
+                                                            window,
+                                                            cx,
+                                                        )
+                                                    });
+                                                    if !matches!(ext, "sql" | "zip") {
+                                                        this.schema = false;
+                                                        this.data = true;
+                                                    }
+                                                    this.reviewed = None;
+                                                    cx.notify();
+                                                });
+                                            },
+                                        ),
+                                    );
+                                }
+                                menu
+                            }),
+                    )
+                },
+            )
     }
     fn render_preview(&self, cx: &Context<Self>) -> Div {
-        let sql = self.mode == Mode::ImportFile && self.preview.objects.is_empty();
+        let sql = self.mode == Mode::ImportFile
+            && self.preview.objects.is_empty()
+            && (self.choices[self.source].profile.kind != DatabaseKind::ClickHouse
+                || std::path::Path::new(self.file.read(cx).value().as_str())
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("sql")));
         let width = if sql { px(680.) } else { px(150.) };
         let mut grid = div().v_flex().gap_1().child(self.preview.table.clone());
         let mut rows = div().v_flex().min_w_full();
@@ -1787,6 +2162,84 @@ impl Render for TransferView {
             body = body.child(destinations);
         }
         body = body.child(endpoints);
+        if file_import && kind == DatabaseKind::MySql {
+            body = body.child(
+                gpui_component::checkbox::Checkbox::new("restore-new-database")
+                    .label(crate::locale::t(cx, "restore.new"))
+                    .checked(self.restore_new)
+                    .disabled(locked)
+                    .on_click(cx.listener(|this, value, _, cx| {
+                        this.restore_new = *value;
+                        this.schema = true;
+                        this.data = false;
+                        this.reviewed = None;
+                        cx.notify();
+                    })),
+            );
+            if self.restore_new {
+                body = body
+                    .child(
+                        Input::new(&self.restore_database)
+                            .cleanable(true)
+                            .disabled(locked),
+                    )
+                    .child(
+                        div()
+                            .h_flex()
+                            .flex_wrap()
+                            .gap_3()
+                            .child(
+                                gpui_component::checkbox::Checkbox::new("restore-data")
+                                    .label(crate::locale::t(cx, "transfer.data"))
+                                    .checked(self.data)
+                                    .disabled(locked)
+                                    .on_click(cx.listener(|this, v, _, cx| {
+                                        this.data = *v;
+                                        this.reviewed = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                gpui_component::checkbox::Checkbox::new("restore-triggers")
+                                    .label(crate::locale::t(cx, "restore.triggers"))
+                                    .checked(self.restore_triggers)
+                                    .disabled(locked)
+                                    .on_click(cx.listener(|this, v, _, cx| {
+                                        this.restore_triggers = *v;
+                                        this.reviewed = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                gpui_component::checkbox::Checkbox::new("restore-definer")
+                                    .label(crate::locale::t(cx, "restore.current_definer"))
+                                    .checked(self.restore_definer)
+                                    .disabled(locked)
+                                    .on_click(cx.listener(|this, v, _, cx| {
+                                        this.restore_definer = *v;
+                                        this.reviewed = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    );
+            }
+        }
+
+        if kind == DatabaseKind::ClickHouse {
+            body = body.child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(crate::locale::t(cx, "clickhouse.transfer.help")),
+            );
+            if file_import && self.clickhouse_data_file(cx) {
+                body = body.child(
+                    Input::new(&self.data_table)
+                        .cleanable(true)
+                        .disabled(locked),
+                );
+            }
+        }
         if self.mode == Mode::Export {
             body = body.child(
                 div()
@@ -2299,7 +2752,9 @@ impl Render for TransferView {
                     .text_color(cx.theme().muted_foreground)
                     .child(crate::locale::t(
                         cx,
-                        if file_import {
+                        if self.restore_new {
+                            "restore.hint"
+                        } else if file_import {
                             "transfer.file_scope"
                         } else {
                             "transfer.scope"
@@ -2315,6 +2770,18 @@ impl Render for TransferView {
                         .on_click(cx.listener(|this, _, _, cx| this.preview(cx))),
                 )
             })
+            .when(
+                self.restore_new && self.reviewed.as_ref() == Some(&self.signature(cx)),
+                |el| {
+                    el.child(
+                        Button::new("save-restore-sql")
+                            .icon(IconName::FolderOpen)
+                            .label(crate::locale::t(cx, "compare.save_sql"))
+                            .disabled(locked)
+                            .on_click(cx.listener(|this, _, _, cx| this.save_restore(cx))),
+                    )
+                },
+            )
             .when(!self.preview.columns.is_empty(), |el| {
                 el.child(self.render_preview(cx))
             });
