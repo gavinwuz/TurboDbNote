@@ -12,7 +12,7 @@ Note 显示标题与文件名独立：修改标题保留 `.note` 路径，重命
 
 基于 Rust 与 GPUI 的原生 SQL Notebook 和数据库工作台，将 SQL、Markdown、任务笔记、数据库浏览及 AI 对话放在一起。
 
-**版本 0.1.4 · Windows 与 Linux x64**
+**版本 0.1.5 · Windows 与 Linux x64**
 
 [下载](https://github.com/gavinwuz/TurboDbNote/releases) · [更新日志](CHANGELOG.zh-CN.md) · [发布流程](docs/releasing.zh-CN.md)
 

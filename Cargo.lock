@@ -7827,7 +7827,7 @@ dependencies = [
 
 [[package]]
 name = "turbodbn-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
@@ -7837,7 +7837,7 @@ dependencies = [
 
 [[package]]
 name = "turbodbn-diagnostics"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "libloading",
  "reqwest",
@@ -7850,7 +7850,7 @@ dependencies = [
 
 [[package]]
 name = "turbodbn-services"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "async-channel 2.5.0",
  "csv",
@@ -7885,7 +7885,7 @@ dependencies = [
 
 [[package]]
 name = "turbodbnote"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -7917,7 +7917,7 @@ dependencies = [
 
 [[package]]
 name = "turbodbnote-driver-host"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "futures-util",
@@ -7940,7 +7940,7 @@ dependencies = [
 
 [[package]]
 name = "turbodbnote-tools"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "chrono",
  "regex",

@@ -12,7 +12,7 @@ The single-pane database tree persists target-scoped directory snapshots in conn
 
 A native SQL Notebook and database workbench built with Rust and GPUI. Write SQL, Markdown and task notes alongside database browsing and AI chat.
 
-**Version 0.1.4 · Windows and Linux x64**
+**Version 0.1.5 · Windows and Linux x64**
 
 [Download](https://github.com/gavinwuz/TurboDbNote/releases) · [Changelog](CHANGELOG.md) · [Release workflow](docs/releasing.md)
 

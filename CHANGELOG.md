@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-10-27
+
 - Unify database difference filters and table/DDL views, deduplicate index/constraint representations, recover supported MySQL synchronization statements from individual DDL components and ordered index metadata, and add a two-step index field designer with generated names and optional database qualification.
 
 - Link index row selection to fresh details and exact context-menu filtering; search all open center tabs with compact ellipsized titles; show attribute-level schema differences and add/modify/remove status, ignoring column order by default.
