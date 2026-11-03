@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-11-03
+
 - Unify Note cell action alignment across reading, editing and collapsed states. Show secondary actions as a complete group when space permits, overflow them together on narrow views, and prevent long collapsed summaries from overlapping controls.
 - Replace the fixed bottom creation bar with four direct document-end actions shown on hover or keyboard focus. Keep Top navigation in a separate lane and retain its state across window maximization and restoration.
 - Control SQL permissions through Read only, Read/write and DBA modes instead of per-command checkboxes. Preserve connection/server restrictions; use one frozen-target confirmation for risky Note statements and one confirmation for each frozen script batch, without repeated mode authorization.
