@@ -9,7 +9,7 @@ use gpui_component::{
     ActiveTheme, Disableable, IconName, RopeExt, Selectable, Sizable, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
     input::{Input, InputEvent, InputState},
-    menu::{DropdownMenu, PopupMenuItem},
+    menu::{DropdownMenu, PopupMenu, PopupMenuItem},
     scroll::{Scrollbar, ScrollbarShow},
     select::{SearchableVec, Select, SelectEvent, SelectState},
     table::{Table, TableState},
@@ -83,6 +83,7 @@ pub struct CellView {
     editor_content_height: f32,
     toolbar_scroll: ScrollHandle,
     toolbar_compact: bool,
+    toolbar_width: f32,
     split_view: bool,
     completion: std::rc::Rc<assist::SqlCompletion>,
     assistance_paused: bool,
@@ -480,6 +481,9 @@ impl CellView {
                 }
             })
         });
+        let focus = cx.focus_handle();
+        subscriptions.push(cx.on_focus_in(&focus, window, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.on_focus_out(&focus, window, |_, _, _, cx| cx.notify()));
         Self {
             query_only: false,
             note_path,
@@ -490,6 +494,7 @@ impl CellView {
             editor_content_height: 0.,
             toolbar_scroll: ScrollHandle::new(),
             toolbar_compact: false,
+            toolbar_width: 0.,
             split_view: false,
             script,
             script_running: false,
@@ -519,7 +524,7 @@ impl CellView {
             batch_token: None,
             awaiting_preview: false,
             preview_task: None,
-            focus: cx.focus_handle(),
+            focus,
             position: (0, 1),
             database_picker,
             database_names: vec![],
@@ -815,20 +820,19 @@ impl CellView {
                             }),
                     )
                     .child(self.scope_controls(window, cx))
+                    .child(self.cell_actions(true, window, cx))
                     .child(
                         crate::assets::note_tool("sql-file-more")
                             .icon(IconName::Ellipsis)
                             .tooltip(t(cx, "notes.cell_more"))
                             .dropdown_menu({
                                 let owner = cx.entity().downgrade();
-                                move |mut menu, _, cx| {
+                                move |mut menu, window, cx| {
                                     for (key, action) in [
                                         ("notes.file.replace", 0),
                                         ("restore.open", 5),
                                         ("clickhouse.sql.reanalyze", 4),
                                         ("script.copy_path", 1),
-                                        ("notes.cell_copy", 2),
-                                        ("notes.remove_cell", 3),
                                     ] {
                                         let target = owner.clone();
                                         let locked = owner
@@ -857,10 +861,6 @@ impl CellView {
                                                                         );
                                                                     }
                                                                 }
-                                                                2 => cx.emit(CellEvent::Insert {
-                                                                    after: true,
-                                                                    copy: true,
-                                                                }),
                                                                 5=>{
                                                                     if let Ok((saved,database))=this.binding(cx) {
                                                                         if let Some(script)=&this.script {
@@ -881,14 +881,14 @@ impl CellView {
                                                                         if let Some(script)=&this.script {script.update(cx,|script,cx|script.reanalyze(kind,cx));}
                                                                     }else{feedback::error(t(cx,"notes.choose_connection"),cx);}
                                                                 }
-                                                                _ => cx.emit(CellEvent::Remove),
+                                                                _ => {},
                                                             }
                                                         });
                                                     });
                                                 }),
                                         );
                                     }
-                                    menu
+                                    Self::cell_action_menu(menu.separator(), owner.clone(), window, cx)
                                 }
                             }),
                     ),
@@ -2014,7 +2014,7 @@ impl CellView {
                 saved.profile.name, database, saved.profile.environment
             );
             self.awaiting_preview = true;
-            let outcome = feedback::sql_preview_observed(
+            let outcome = feedback::note_sql_confirmation(
                 plan.sql.clone(),
                 target,
                 window,
@@ -2438,16 +2438,19 @@ impl CellView {
         let owner = cx.entity().downgrade();
         canvas(
             move |bounds, _, cx| {
-                let compact = owner.read_with(cx, |v, _| v.split_view).unwrap_or(false)
-                    || f32::from(bounds.size.width) < 820.;
+                let width = f32::from(bounds.size.width);
+                let compact = width < 820.;
                 if owner
-                    .read_with(cx, |v, _| v.toolbar_compact != compact)
+                    .read_with(cx, |v, _| {
+                        v.toolbar_compact != compact || (v.toolbar_width - width).abs() > 1.
+                    })
                     .unwrap_or(false)
                 {
                     let owner = owner.clone();
                     cx.defer(move |cx| {
                         let _ = owner.update(cx, |v, cx| {
                             v.toolbar_compact = compact;
+                            v.toolbar_width = width;
                             cx.notify();
                         });
                     });
@@ -2468,6 +2471,7 @@ impl CellView {
             .gap_1()
             .flex_1()
             .min_w_0()
+            .overflow_hidden()
             .child(self.mode_button(cx))
             .when(
                 sql || matches!(self.cell.content, CellContent::Markdown { .. }),
@@ -2488,87 +2492,36 @@ impl CellView {
         }
         let mut right = div().h_flex().gap_1().flex_shrink_0();
         if sql {
-            right =
-                right.child(
-                    crate::assets::note_tool("note-tables")
-                        .icon(
-                            gpui_component::Icon::default()
-                                .path("icons/note-tables.svg")
-                                .text_color(crate::assets::note_color(0, cx)),
-                        )
-                        .tooltip(t(cx, "sql_tables.caret"))
-                        .disabled(
-                            locked
-                                || self.connection_id().is_none()
-                                || matches!(
-                                    self.assist_context(cx).0,
-                                    None | Some(DatabaseKind::Redis | DatabaseKind::External)
-                                ),
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.trigger_table_completion(window, cx)
-                        })),
-                );
-            right = right.child(
-                crate::assets::note_tool("load-note-columns")
-                    .icon(
-                        gpui_component::Icon::default()
-                            .path("icons/note-columns.svg")
-                            .text_color(crate::assets::note_color(0, cx)),
-                    )
-                    .tooltip(t(cx, "sql_columns.open"))
-                    .disabled(locked || self.connection_id().is_none())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.trigger_column_completion(window, cx)
-                    })),
-            );
-        }
-
-        if sql && !self.toolbar_compact {
-            right = right.child(
-                crate::assets::note_tool("format-note-sql")
-                    .icon(
-                        gpui_component::Icon::default()
-                            .path("icons/note-format.svg")
-                            .text_color(crate::assets::note_color(2, cx)),
-                    )
-                    .tooltip(t(cx, "sql_assist.format"))
-                    .disabled(
-                        locked
-                            || self.formatting.is_some()
-                            || self.assist_context(cx).0 == Some(DatabaseKind::Redis),
-                    )
-                    .on_click(cx.listener(|this, _, window, cx| this.format_sql(window, cx))),
-            );
-        }
-        if sql {
             right = right.child(self.run_button(cx));
         }
-        if sql && !self.toolbar_compact {
+        if sql {
             right = right.child(self.plan_button(cx));
         }
         if sql && !self.toolbar_compact {
-            right = right
-                .child(
-                    crate::assets::note_tool("note-ddl")
-                        .icon(
-                            gpui_component::Icon::default()
-                                .path("icons/note-ddl.svg")
-                                .text_color(crate::assets::note_color(0, cx)),
-                        )
-                        .tooltip(t(cx, "ddl.open"))
-                        .on_click(cx.listener(|this, _, _, cx| this.publish_ddl_context(true, cx))),
-                )
-                .child(self.ai_button(cx));
+            right = right.child(
+                crate::assets::note_tool("note-ddl")
+                    .icon(
+                        gpui_component::Icon::default()
+                            .path("icons/note-ddl.svg")
+                            .text_color(crate::assets::note_color(0, cx)),
+                    )
+                    .tooltip(t(cx, "ddl.open"))
+                    .on_click(cx.listener(|this, _, _, cx| this.publish_ddl_context(true, cx))),
+            );
         }
+        if sql {
+            right = right.child(self.ai_button(cx));
+        }
+        right = right.child(self.copy_source_button(cx));
         if !self.query_only {
+            right = right.child(self.cell_actions(true, window, cx));
             right = right.child(
                 crate::assets::note_tool("note-cell-more")
                     .icon(IconName::Ellipsis)
                     .tooltip(t(cx, "notes.cell_more"))
                     .dropdown_menu({
                         let owner = cx.entity().downgrade();
-                        move |mut menu, _, cx| {
+                        move |mut menu, window, cx| {
                             let Some(view) = owner.upgrade() else {
                                 return menu;
                             };
@@ -2597,12 +2550,7 @@ impl CellView {
                                         }),
                                 );
 
-                                for (key, action) in [
-                                    ("sql_assist.format", 0),
-                                    ("notes.explain", 1),
-                                    ("ddl.open", 2),
-                                    ("notes.ai_draft", 3),
-                                ] {
+                                for (key, action) in [("ddl.open", 2), ("notes.ai_draft", 3)] {
                                     let target = view.downgrade();
                                     menu =
                                         menu.item(
@@ -2666,30 +2614,7 @@ impl CellView {
                                     ),
                                 );
                             }
-                            for (icon, key, action) in [
-                                (IconName::Copy, "notes.cell_copy", 0),
-                                (IconName::Plus, "notes.cell_before", 3),
-                                (IconName::Plus, "notes.cell_after", 4),
-                                (IconName::ArrowUp, "notes.cell_up", 1),
-                                (IconName::ArrowDown, "notes.cell_down", 2),
-                                (IconName::Delete, "notes.cell_remove", 5),
-                            ] {
-                                let owner = owner.clone();
-                                menu = menu.item(
-                                    PopupMenuItem::new(t(cx, key))
-                                        .icon(icon)
-                                        .disabled(view.read(cx).cell_action_disabled(action, cx))
-                                        .on_click(move |_, _, cx| {
-                                            let owner = owner.clone();
-                                            cx.defer(move |cx| {
-                                                let _ = owner.update(cx, |this, cx| {
-                                                    this.cell_action(action, cx)
-                                                });
-                                            });
-                                        }),
-                                );
-                            }
-                            menu
+                            Self::cell_action_menu(menu, owner.clone(), window, cx)
                         }
                     }),
             );
@@ -2712,11 +2637,7 @@ impl CellView {
                     .items_center()
                     .h(px(24.))
                     .w_full()
-                    .min_w(px(if sql {
-                        if self.toolbar_compact { 400. } else { 650. }
-                    } else {
-                        240.
-                    }))
+                    .min_w_0()
                     .gap_2()
                     .child(left)
                     .child(right),
@@ -2735,6 +2656,100 @@ impl CellView {
             )
             .child(self.toolbar_measure(cx))
             .into_any_element()
+    }
+    fn visible_cell_actions(&self) -> Vec<usize> {
+        cell_action_layout(
+            self.toolbar_width,
+            if self.editing {
+                // Mode/clear, title, connection, database picker/refresh and gaps.
+                if self.toolbar_compact { 340. } else { 550. }
+            } else {
+                160.
+            },
+            self.cell.content.is_editable_sql(),
+            self.query_only,
+        )
+    }
+
+    fn cell_actions(&self, editing: bool, _window: &Window, cx: &Context<Self>) -> AnyElement {
+        let mut bar = div().h_flex().gap_1().flex_shrink_0();
+        let mut extra = div().h_flex().gap_1().flex_shrink_0();
+        let actions = self.visible_cell_actions();
+        let show_extra = !actions.is_empty();
+        for action in actions {
+            let (path, key) = match action {
+                0 => ("icons/note-copy-insert.svg", "notes.cell_copy"),
+                3 => ("icons/note-insert-before.svg", "notes.cell_before"),
+                4 => ("icons/note-insert-after.svg", "notes.cell_after"),
+                1 => ("", "notes.cell_up"),
+                _ => ("", "notes.cell_down"),
+            };
+            let icon = match action {
+                1 => gpui_component::Icon::new(IconName::ArrowUp),
+                2 => gpui_component::Icon::new(IconName::ArrowDown),
+                _ => gpui_component::Icon::default().path(path),
+            };
+            extra = extra.child(
+                crate::assets::note_tool(SharedString::from(format!("cell-action-{action}")))
+                    .icon(icon)
+                    .tooltip(t(cx, key))
+                    .disabled(self.cell_action_disabled(action, cx))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.cell_action(action, cx);
+                    })),
+            );
+        }
+        if show_extra {
+            bar = bar.child(extra);
+        }
+        if !editing && !self.query_only {
+            let owner = cx.entity().downgrade();
+            bar = bar.child(
+                crate::assets::note_tool("reading-cell-more")
+                    .icon(IconName::Ellipsis)
+                    .tooltip(t(cx, "notes.cell_more"))
+                    .dropdown_menu(move |menu, window, cx| {
+                        Self::cell_action_menu(menu, owner.clone(), window, cx)
+                    }),
+            );
+        }
+        bar.into_any_element()
+    }
+    fn cell_action_menu(
+        mut menu: PopupMenu,
+        owner: WeakEntity<Self>,
+        _window: &mut Window,
+        cx: &mut Context<PopupMenu>,
+    ) -> PopupMenu {
+        let Some(view) = owner.upgrade() else {
+            return menu;
+        };
+        for (icon, key, action) in [
+            (IconName::Copy, "notes.cell_copy", 0),
+            (IconName::Plus, "notes.cell_before", 3),
+            (IconName::Plus, "notes.cell_after", 4),
+            (IconName::ArrowUp, "notes.cell_up", 1),
+            (IconName::ArrowDown, "notes.cell_down", 2),
+            (IconName::Delete, "notes.cell_remove", 5),
+        ] {
+            if view.read(cx).visible_cell_actions().contains(&action) {
+                continue;
+            }
+            let target = owner.clone();
+            menu = menu.item(
+                PopupMenuItem::new(t(cx, key))
+                    .icon(icon)
+                    .disabled(view.read(cx).cell_action_disabled(action, cx))
+                    .on_click(move |_, _, cx| {
+                        let target = target.clone();
+                        cx.defer(move |cx| {
+                            let _ = target.update(cx, |this, cx| this.cell_action(action, cx));
+                        });
+                    }),
+            );
+        }
+        menu
     }
     fn cell_action_disabled(&self, action: usize, cx: &App) -> bool {
         self.batch_locked
@@ -2765,6 +2780,39 @@ impl CellView {
             },
             _ => CellEvent::Remove,
         });
+    }
+}
+// Keep a useful summary/scope width and the core execution commands before
+// admitting the complete secondary command group.
+fn cell_action_layout(width: f32, context_width: f32, sql: bool, query_only: bool) -> Vec<usize> {
+    // Five secondary buttons plus gaps; execution/plan/AI/copy/more stay visible.
+    let core_width = if sql { 140. } else { 56. };
+    if query_only || width - context_width - core_width < 148. {
+        vec![]
+    } else {
+        vec![0, 3, 4, 1, 2]
+    }
+}
+#[cfg(test)]
+mod toolbar_layout_tests {
+    use super::cell_action_layout;
+    #[test]
+    fn secondary_actions_use_available_width_as_a_complete_group() {
+        assert!(cell_action_layout(600., 340., true, false).is_empty());
+        assert_eq!(
+            cell_action_layout(640., 340., true, false),
+            vec![0, 3, 4, 1, 2]
+        );
+        assert_eq!(
+            cell_action_layout(500., 160., true, false),
+            vec![0, 3, 4, 1, 2]
+        );
+        assert!(cell_action_layout(400., 160., true, false).is_empty());
+        assert_eq!(
+            cell_action_layout(800., 550., false, false),
+            vec![0, 3, 4, 1, 2]
+        );
+        assert!(cell_action_layout(1400., 160., true, true).is_empty());
     }
 }
 impl Render for CellView {
@@ -2943,26 +2991,57 @@ impl Render for CellView {
                     div()
                         .h_flex()
                         .gap_2()
+                        .min_w_0()
+                        .relative()
                         .child(
-                            Button::new("expand-note-cell")
-                                .ghost()
-                                .small()
-                                .justify_start()
-                                .icon(gpui_component::Icon::default().path("icons/note-expand.svg"))
-                                .flex_1()
-                                .min_w_0()
-                                .label(if label.is_empty() {
-                                    t(cx, "notes.empty_cell")
-                                } else {
-                                    label.into()
-                                })
-                                .tooltip(t(cx, "notes.expand_cell"))
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.set_collapsed(false, cx)),
-                                ),
+                            div().flex_1().min_w_0().overflow_hidden().child(
+                                Button::new("expand-note-cell")
+                                    .ghost()
+                                    .small()
+                                    .justify_start()
+                                    .w_full()
+                                    .icon(
+                                        gpui_component::Icon::default()
+                                            .path("icons/note-expand.svg"),
+                                    )
+                                    .child(
+                                        div()
+                                            .w(px((self.toolbar_width
+                                                - if sql { 140. } else { 56. }
+                                                - self.visible_cell_actions().len() as f32 * 28.
+                                                - 48.)
+                                                .max(0.)))
+                                            .truncate()
+                                            .child(if label.is_empty() {
+                                                t(cx, "notes.empty_cell")
+                                            } else {
+                                                label.clone().into()
+                                            }),
+                                    )
+                                    .tooltip(if label.is_empty() {
+                                        t(cx, "notes.expand_cell")
+                                    } else {
+                                        label.into()
+                                    })
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.set_collapsed(false, cx)),
+                                    ),
+                            ),
                         )
-                        .when(sql, |bar| bar.child(self.ai_button(cx)))
-                        .child(self.copy_source_button(cx)),
+                        .child(
+                            div()
+                                .h_flex()
+                                .gap_1()
+                                .flex_shrink_0()
+                                .when(sql, |bar| {
+                                    bar.child(self.run_button(cx))
+                                        .child(self.plan_button(cx))
+                                        .child(self.ai_button(cx))
+                                })
+                                .child(self.copy_source_button(cx))
+                                .child(self.cell_actions(false, window, cx)),
+                        )
+                        .child(self.toolbar_measure(cx)),
                 )
                 .into_any_element();
         }
@@ -2985,7 +3064,9 @@ impl Render for CellView {
                                 .overflow_hidden()
                                 .child(self.title.read(cx).value()),
                         )
-                        .child(self.copy_source_button(cx)),
+                        .child(self.copy_source_button(cx))
+                        .child(self.cell_actions(false, window, cx))
+                        .child(self.toolbar_measure(cx)),
                 );
             }
             return body.child(task).into_any_element();
@@ -3001,24 +3082,65 @@ impl Render for CellView {
                         .child(t(cx, "sql_assist.edit_only")),
                 );
             }
-        } else if !sql || !self.title.read(cx).value().is_empty() {
+        } else if !self.title.read(cx).value().is_empty() {
             body = body.child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(cx.theme().muted_foreground)
-                            .overflow_hidden()
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .child(self.title.read(cx).value()),
-                    )
-                    .when(!sql, |row| row.child(self.copy_source_button(cx))),
+                div().h_flex().gap_2().child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .whitespace_nowrap()
+                        .child(self.title.read(cx).value()),
+                ),
             );
+        }
+        if editing && sql {
+            let owner = cx.entity().downgrade();
+            self.editor.update(cx, |input, _| {
+                input.set_context_menu_extension(move |mut menu, _, cx| {
+                    let Some(view) = owner.upgrade() else {
+                        return menu;
+                    };
+                    menu = menu.separator();
+                    for (action, key) in [
+                        (0, "sql_tables.caret"),
+                        (1, "sql_columns.open"),
+                        (2, "sql_assist.format"),
+                    ] {
+                        let cell = view.read(cx);
+                        let disabled = cell.working(cx)
+                            || cell.batch_locked
+                            || if action == 2 {
+                                cell.formatting.is_some()
+                                    || cell.assist_context(cx).0 == Some(DatabaseKind::Redis)
+                            } else {
+                                cell.connection_id().is_none()
+                                    || matches!(
+                                        cell.assist_context(cx).0,
+                                        None | Some(DatabaseKind::Redis | DatabaseKind::External)
+                                    )
+                            };
+                        let target = owner.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(t(cx, key)).disabled(disabled).on_click(
+                                move |_, window, cx| {
+                                    let target = target.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        let _ = target.update(cx, |this, cx| match action {
+                                            0 => this.trigger_table_completion(window, cx),
+                                            1 => this.trigger_column_completion(window, cx),
+                                            _ => this.format_sql(window, cx),
+                                        });
+                                    });
+                                },
+                            ));
+                    }
+                    menu
+                });
+            });
         }
         if editing {
             let max_lines = if sql { self.editor_max_lines() } else { 12 };
@@ -3113,12 +3235,6 @@ impl Render for CellView {
                     cx,
                 )
                 .selectable(true)
-                .when(sql, |view| {
-                    view.style(
-                        gpui_component::text::TextViewStyle::default()
-                            .code_block(StyleRefinement::default().pr(px(144.)).pl(px(76.))),
-                    )
-                })
                 .into_any_element()
             } else {
                 div().whitespace_normal().child(source).into_any_element()
@@ -3138,41 +3254,34 @@ impl Render for CellView {
                         this.focus.focus(window);
                     }
                 }))
-                .when(sql && empty, |el| el.pr(px(144.)))
-                .when(!sql || empty, |el| el.pl(px(76.)))
                 .child(content);
             body = body.child(
                 div()
                     .relative()
-                    .child(reading)
                     .child(
                         div()
-                            .id("reading-mode-toggle")
-                            .occlude()
-                            .absolute()
-                            .top_2()
-                            .left_1()
                             .h_flex()
                             .gap_1()
+                            .items_center()
                             .child(self.mode_button(cx))
-                            .child(self.collapse_button(cx)),
+                            .child(self.collapse_button(cx))
+                            .child(div().flex_1().min_w_0())
+                            .child(
+                                div()
+                                    .h_flex()
+                                    .gap_1()
+                                    .flex_shrink_0()
+                                    .when(sql, |bar| {
+                                        bar.child(self.run_button(cx))
+                                            .child(self.plan_button(cx))
+                                            .child(self.ai_button(cx))
+                                    })
+                                    .child(self.copy_source_button(cx))
+                                    .child(self.cell_actions(false, window, cx)),
+                            ),
                     )
-                    .when(sql, |el| {
-                        el.child(
-                            div()
-                                .id("note-reading-copy")
-                                .occlude()
-                                .absolute()
-                                .top_2()
-                                .right_2()
-                                .h_flex()
-                                .gap_1()
-                                .child(self.run_button(cx))
-                                .child(self.plan_button(cx))
-                                .child(self.ai_button(cx))
-                                .child(self.copy_source_button(cx)),
-                        )
-                    }),
+                    .child(reading)
+                    .child(self.toolbar_measure(cx)),
             );
         }
         if let Some(results) = &self.results {

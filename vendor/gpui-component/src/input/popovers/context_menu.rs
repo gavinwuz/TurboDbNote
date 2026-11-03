@@ -48,6 +48,7 @@ impl InputState {
         let has_paste = is_enable && cx.read_from_clipboard().is_some();
 
         let action_context = self.focus_handle.clone();
+        let extension = self.menu_extension.clone();
         self.mouse_context_menu.update(cx, |this, cx| {
             this.mouse_position = event.position;
             this.menu.update(cx, |menu, cx| {
@@ -75,6 +76,11 @@ impl InputState {
                     .separator()
                     .menu(t!("Input.Select All"), Box::new(input::SelectAll));
 
+                let new_menu = if let Some(extension) = &extension {
+                    extension(new_menu, window, cx)
+                } else {
+                    new_menu
+                };
                 menu.menu_items = new_menu.menu_items;
                 menu.action_context = Some(action_context);
                 cx.notify();

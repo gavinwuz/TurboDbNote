@@ -212,6 +212,27 @@ pub fn sql_preview_observed(
     cx: &mut App,
     execute: impl Fn(String, &mut Window, &mut App) -> bool + 'static,
 ) -> async_channel::Receiver<bool> {
+    sql_preview_confirmation(sql, target, false, window, cx, execute)
+}
+
+/// One frozen preview/confirmation for Note execution; no second authorization dialog.
+pub fn note_sql_confirmation(
+    sql: String,
+    target: String,
+    window: &mut Window,
+    cx: &mut App,
+    execute: impl Fn(String, &mut Window, &mut App) -> bool + 'static,
+) -> async_channel::Receiver<bool> {
+    sql_preview_confirmation(sql, target, true, window, cx, execute)
+}
+fn sql_preview_confirmation(
+    sql: String,
+    target: String,
+    one_confirmation: bool,
+    window: &mut Window,
+    cx: &mut App,
+    execute: impl Fn(String, &mut Window, &mut App) -> bool + 'static,
+) -> async_channel::Receiver<bool> {
     let (sender, receiver) = async_channel::bounded(1);
     let lifecycle = std::rc::Rc::new(PreviewOutcome(sender));
     use gpui_component::input::InputState;
@@ -288,6 +309,13 @@ pub fn sql_preview_observed(
                                     }
                                     let execute = execute.clone();
                                     let lifecycle = lifecycle.clone();
+                                    if one_confirmation {
+                                        if execute(sql, window, cx) {
+                                            let _ = lifecycle.0.try_send(true);
+                                            window.close_dialog(cx);
+                                        }
+                                        return;
+                                    }
                                     confirm(
                                         crate::locale::t(cx, "feedback.sql.confirm"),
                                         format!(

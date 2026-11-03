@@ -113,11 +113,11 @@ Imported MySQL scripts can execute `DROP TRIGGER [IF EXISTS]` after enabling the
 
 MySQL scripts additionally support transaction isolation and bounded SET user-variable / SELECT INTO forms; locking SELECT uses the script lock permission. These remain unavailable to ordinary SQL cells.
 
-Note connection selectors show environment, driver and address. Each open Note has independent Read only / Read-write / DBA restrictions beneath global SQL settings. Script previews separate leading comments and actual SQL; failures offer explicit, read-only MySQL diagnostics without changing server policy.
+Note connection selectors show environment, driver and address. Each open Note has independent Read only / Read-write / DBA restrictions controlled by the selected mode and server/connection permissions. Script previews separate leading comments and actual SQL; failures offer explicit, read-only MySQL diagnostics without changing server policy.
 
 Connection timeout and per-operation timeout are independent (existing connection value retained; execution defaults to 300 seconds). Note Read/write permits INSERT/UPDATE; DELETE requires DBA. Elapsed UI values adapt between ms, seconds and minutes; journals retain milliseconds. External components now require protocol 5.
 
-Global default timeouts are available under Settings → Database → Query. New connections inherit them; existing custom values are retained. Note permission messages provide scoped actions to switch mode, open global SQL settings or choose a writable connection, without running SQL automatically.
+Global default timeouts are available under Settings → Database → Query. New connections inherit them; existing custom values are retained. Note permission messages provide scoped actions to switch mode or choose a writable connection, without running SQL automatically.
 
 The center tab bar provides a fixed new-Note button. Table definitions use compact field/type/not-null/auto-increment/primary-key/extra/comment columns with a DDL toggle; unavailable metadata remains explicitly unknown.
 
@@ -154,7 +154,7 @@ Direct MySQL grants use a resizable directory/object/privilege workbench with in
 
 SQL editors prioritize character input: highlighting runs after word boundaries or idle time on a coalescing background worker. Completion uses scoped memory/SQLite caches; T offers up to eight cached table names at the caret, and automatic column hints never fetch remote metadata.
 
-SQL caret movement reuses a bounded shaped viewport and paints visible wrapped lines. Alias-dot completion uses cached columns; missing columns expose an explicit load action at the caret, with no automatic remote metadata read. The whole-file Top button shares the bottom SQL/MD/task strip. Batch rowsets retain independent pages and scroll positions; session-dependent results keep only their returned page. Up to 50 rowsets and approximately 16 MiB of returned text are retained (an individual rowset remains subject to adapter response limits).
+SQL caret movement reuses a bounded shaped viewport and paints visible wrapped lines. Alias-dot completion uses cached columns; missing columns expose an explicit load action at the caret, with no automatic remote metadata read. The document-end hover strip directly exposes SQL Query, SQL File, MD and Task actions. Top navigation appears once the outer document scroll leaves the top in a separate 32px lane between cells and the scrollbar. Batch rowsets retain independent pages and scroll positions; session-dependent results keep only their returned page. Up to 50 rowsets and approximately 16 MiB of returned text are retained (an individual rowset remains subject to adapter response limits).
 
 Both Note add menus offer SQL Query and SQL File. F5 runs selected complete SQL or the entire query unit, directly for read-only batches and with batch authorization otherwise. SQL File imports a managed copy without executing, supports guarded replacement, and collapses source preview by default. Both use one-line result status, named tabs and expandable details. Query batches are limited to 1 MiB; larger files retain the attachment workflow. Cached T suggestions show table comments; Col suggestions show type and comment without inserting this metadata. Automatic assistance can be paused without changing native editing.
 

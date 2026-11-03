@@ -311,6 +311,7 @@ pub struct InputState {
     /// Completion/CodeAction context menu
     pub(super) context_menu: Option<ContextMenu>,
     pub(super) mouse_context_menu: Entity<MouseContextMenu>,
+    pub(super) menu_extension: Option<Rc<InputMenuExtension>>,
     /// A flag to indicate if we are currently inserting a completion item.
     pub(super) completion_inserting: bool,
     pub(super) hover_popover: Option<Entity<HoverPopover>>,
@@ -339,7 +340,19 @@ pub struct InputState {
 
 impl EventEmitter<InputEvent> for InputState {}
 
+type InputMenuExtension =
+    dyn Fn(crate::menu::PopupMenu, &mut Window, &mut App) -> crate::menu::PopupMenu;
+
 impl InputState {
+    /// Append application-specific commands while retaining standard input actions.
+    pub fn set_context_menu_extension(
+        &mut self,
+        extension: impl Fn(crate::menu::PopupMenu, &mut Window, &mut App) -> crate::menu::PopupMenu
+        + 'static,
+    ) {
+        self.menu_extension = Some(Rc::new(extension));
+    }
+
     /// Create a Input state with default [`InputMode::SingleLine`] mode.
     ///
     /// See also: [`Self::multi_line`], [`Self::auto_grow`] to set other mode.
@@ -408,6 +421,7 @@ impl InputState {
             diagnostic_popover: None,
             context_menu: None,
             mouse_context_menu,
+            menu_extension: None,
             completion_inserting: false,
             hover_popover: None,
             hover_definition: HoverDefinition::default(),

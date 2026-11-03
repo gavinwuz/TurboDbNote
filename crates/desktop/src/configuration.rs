@@ -676,32 +676,7 @@ impl Configuration {
         }
 
         if self.database_tab == 1 {
-            body = body.child(t(cx, "settings.sql_policy_default"));
-            for &(key, label, _) in turbodbn_services::database::notebook_query::COMMANDS
-                .iter()
-                .chain(turbodbn_services::database::notebook_query::SCRIPT_COMMANDS)
-            {
-                if key == "script_session" {
-                    body = body.child(t(cx, "script.permissions_hint"));
-                }
-                body = body.child(
-                    gpui_component::checkbox::Checkbox::new(key)
-                        .label(if key == "script_drop_trigger" {
-                            t(cx, "script.drop_trigger.permission")
-                        } else if key == "script_variables" {
-                            t(cx, "script.variables.permission")
-                        } else {
-                            label.into()
-                        })
-                        .checked(self.database.command_enabled(key))
-                        .disabled(self.locked)
-                        .on_click(cx.listener(move |this, checked: &bool, _, cx| {
-                            this.database.set_command(key, *checked);
-                            cx.notify();
-                        })),
-                );
-            }
-            body = body.child(t(cx, "settings.sql_policy_hint"));
+            body = body.child(t(cx, "settings.sql_modes_hint"));
         }
         body.into_any_element()
     }

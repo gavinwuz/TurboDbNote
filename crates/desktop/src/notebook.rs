@@ -60,6 +60,8 @@ pub struct NoteView {
     connections: Entity<DatabaseView>,
     focus: FocusHandle,
     add_focus: FocusHandle,
+    top_visible: std::collections::HashSet<String>,
+    append_hovered: std::collections::HashSet<String>,
     toolbar_scroll: ScrollHandle,
     cell_list: ListState,
     view_lists: std::collections::HashMap<String, ListState>,
@@ -226,6 +228,9 @@ impl Focusable for NoteView {
     }
 }
 impl NoteView {
+    fn list_item_count(&self) -> usize {
+        self.cells.len() + usize::from(!self.single_sql())
+    }
     fn single_sql(&self) -> bool {
         self.note.table_query.is_some() && self.cells.len() == 1
     }
@@ -550,6 +555,8 @@ impl NoteView {
             connections,
             focus: cx.focus_handle(),
             add_focus,
+            top_visible: Default::default(),
+            append_hovered: Default::default(),
             toolbar_scroll: ScrollHandle::new(),
             cell_list: ListState::new(0, ListAlignment::Top, px(200.)).measure_all(),
             view_lists: Default::default(),
@@ -738,7 +745,13 @@ impl NoteView {
         }
         for list in self.view_lists.values() {
             let top = list.logical_scroll_top();
-            list.splice_focusable(0..list.item_count(), self.cells.iter().map(|_| None));
+            list.splice_focusable(
+                0..list.item_count(),
+                self.cells
+                    .iter()
+                    .map(|_| None)
+                    .chain((!self.single_sql()).then(|| Some(self.add_focus.clone()))),
+            );
             list.scroll_to(top);
         }
     }
@@ -753,7 +766,7 @@ impl NoteView {
         cell
     }
     fn activate_cell(&mut self, id: EntityId, window: &mut Window, cx: &mut Context<Self>) {
-        let structure_changed = self.cell_list.item_count() != self.cells.len();
+        let structure_changed = self.cell_list.item_count() != self.list_item_count();
         if structure_changed {
             self.sync_cell_list(cx);
         }
@@ -1157,21 +1170,19 @@ impl Panel for NoteView {
 impl NoteView {
     fn render_add_cells(
         &mut self,
-        list: ListState,
-        _window: &mut Window,
+        key: String,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let visible = self.cells.is_empty()
+            || self.append_hovered.contains(&key)
+            || self.add_focus.contains_focused(window, cx);
         let mut actions = div()
-            .id("note-add-cells")
             .h_flex()
             .justify_center()
-            .w_full()
-            .min_w_0()
-            .flex_shrink_0()
+            .items_center()
             .gap_1()
-            .h(px(32.))
-            .track_focus(&self.add_focus)
-            .tab_index(0);
+            .opacity(if visible { 1. } else { 0. });
         for (kind, key) in toolbar::cell_types() {
             actions = actions.child(
                 Button::new(("add-note-cell", kind))
@@ -1189,28 +1200,124 @@ impl NoteView {
                     ))
                     .tooltip(t(cx, key))
                     .disabled(self.batch.is_some() || self.cells.len() >= note_store::MAX_CELLS)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.add_cell(kind, window, cx);
-                    })),
+                    .on_click(
+                        cx.listener(move |this, _, window, cx| this.add_cell(kind, window, cx)),
+                    ),
             );
         }
-        actions
-            .child(div().w(px(8.)))
+        div()
+            .id("note-add-cells")
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                let changed = if *hovered {
+                    this.append_hovered.insert(key.clone())
+                } else {
+                    this.append_hovered.remove(&key)
+                };
+                if changed {
+                    cx.notify();
+                }
+            }))
+            .h(px(28.))
+            .w_full()
+            .min_w_0()
+            .relative()
+            .track_focus(&self.add_focus)
+            .tab_index(0)
             .child(
-                Button::new("note-scroll-top")
-                    .ghost()
-                    .small()
-                    .icon(IconName::ArrowUp)
-                    .tooltip(t(cx, "notes.scroll_top"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        list.scroll_to(ListOffset {
-                            item_ix: 0,
-                            offset_in_item: px(0.),
-                        });
-                        this.focus.focus(window);
-                        cx.notify();
-                    })),
+                div()
+                    .h_flex()
+                    .items_center()
+                    .justify_center()
+                    .size_full()
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(1.))
+                            .bg(cx.theme().border)
+                            .opacity(if visible { 1. } else { 0. }),
+                    )
+                    .child(actions)
+                    .child(
+                        div()
+                            .flex_1()
+                            .h(px(1.))
+                            .bg(cx.theme().border)
+                            .opacity(if visible { 1. } else { 0. }),
+                    ),
             )
+            .into_any_element()
+    }
+    fn render_top_navigation(
+        &self,
+        key: String,
+        list: ListState,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let visible = self.top_visible.contains(&key);
+        let owner = cx.entity().downgrade();
+        let measured = list.clone();
+        div()
+            .absolute()
+            .top_0()
+            .bottom_0()
+            .right(px(12.))
+            .w(px(32.))
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, _, cx| {
+                        let top = measured.logical_scroll_top();
+                        let show = top.item_ix > 0
+                            || note_top_visible(
+                                f32::from(measured.scroll_px_offset_for_scrollbar().y),
+                                f32::from(measured.viewport_bounds().size.height),
+                            );
+                        if show != visible {
+                            let owner = owner.clone();
+                            let key = key.clone();
+                            let measured = measured.clone();
+                            cx.defer(move |cx| {
+                                let top = measured.logical_scroll_top();
+                                let show = top.item_ix > 0
+                                    || note_top_visible(
+                                        f32::from(measured.scroll_px_offset_for_scrollbar().y),
+                                        f32::from(measured.viewport_bounds().size.height),
+                                    );
+                                let _ = owner.update(cx, |this, cx| {
+                                    if !this.view_lists.contains_key(&key) {
+                                        return;
+                                    }
+                                    if show {
+                                        this.top_visible.insert(key);
+                                    } else {
+                                        this.top_visible.remove(&key);
+                                    }
+                                    cx.notify();
+                                });
+                            });
+                        }
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
+            .when(visible, |lane| {
+                lane.child(
+                    div().absolute().bottom(px(8.)).left(px(4.)).child(
+                        crate::assets::note_tool("note-scroll-top")
+                            .icon(IconName::ArrowUp)
+                            .tooltip(t(cx, "notes.scroll_top"))
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                list.scroll_to(ListOffset {
+                                    item_ix: 0,
+                                    offset_in_item: px(0.),
+                                });
+                                cx.stop_propagation();
+                                cx.notify();
+                            })),
+                    ),
+                )
+            })
             .into_any_element()
     }
 }
@@ -1229,6 +1336,7 @@ impl NoteView {
                 .child(t(cx, "notes.deleting"))
                 .into_any_element();
         }
+        let append_key = view_key.clone();
         let content = if self.single_sql() {
             div()
                 .v_flex()
@@ -1241,7 +1349,10 @@ impl NoteView {
             // items are reused, so normal input still lays out only visible cells.
             gpui::list(
                 list.clone().measure_all(),
-                cx.processor(|this, index, _window, cx| {
+                cx.processor(move |this, index, window, cx| {
+                    if index == this.cells.len() {
+                        return this.render_add_cells(append_key.clone(), window, cx);
+                    }
                     div()
                         .pb_3()
                         .w_full()
@@ -1267,6 +1378,7 @@ impl NoteView {
                 MouseButton::Left,
                 cx.listener({
                     let list = list.clone();
+                    let view_key = view_key.clone();
                     move |this, _, _, cx| {
                         this.cell_list = list.clone();
                         crate::tabs::layout(
@@ -1307,7 +1419,7 @@ impl NoteView {
                     .min_h_0()
                     .min_w_0()
                     .pl_3()
-                    .pr_3()
+                    .pr(px(if self.single_sql() { 12. } else { 44. }))
                     .relative()
                     .child({
                         let owner = cx.entity().downgrade();
@@ -1347,28 +1459,44 @@ impl NoteView {
                         nested_scroll(content, list.clone(), cx)
                     })
                     .when(!self.single_sql(), |body| {
-                        body.child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .bottom_0()
-                                .right_0()
-                                .w(px(12.))
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, window, _| this.focus.focus(window)),
-                                )
-                                .child(
-                                    Scrollbar::vertical(&list)
-                                        .scrollbar_show(ScrollbarShow::Always),
-                                ),
-                        )
+                        body.child(self.render_top_navigation(view_key.clone(), list.clone(), cx))
+                            .child(
+                                div()
+                                    .absolute()
+                                    .top_0()
+                                    .bottom_0()
+                                    .right_0()
+                                    .w(px(12.))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _, window, _| this.focus.focus(window)),
+                                    )
+                                    .child(
+                                        Scrollbar::vertical(&list)
+                                            .scrollbar_show(ScrollbarShow::Always),
+                                    ),
+                            )
                     }),
             )
-            .when(!self.single_sql(), |body| {
-                body.child(self.render_add_cells(list.clone(), window, cx))
-            })
             .into_any_element()
+    }
+}
+
+fn note_top_visible(offset: f32, viewport_height: f32) -> bool {
+    viewport_height > 0. && offset < -1.
+}
+#[cfg(test)]
+mod navigation_tests {
+    use super::note_top_visible;
+    #[test]
+    fn top_navigation_appears_as_soon_as_outer_scroll_leaves_top() {
+        assert!(!note_top_visible(0., 600.));
+        assert!(note_top_visible(-599., 600.));
+        assert!(note_top_visible(-2., 600.));
+        assert!(!note_top_visible(-1., 600.));
+        assert!(note_top_visible(-601., 600.));
+        assert!(!note_top_visible(-601., 0.));
+        assert!(!note_top_visible(25., 600.));
     }
 }
 
@@ -1415,7 +1543,8 @@ pub(crate) struct NotePane {
 impl NotePane {
     pub fn new(key: String, owner: Entity<NoteView>, cx: &mut Context<Self>) -> Self {
         let list = owner.update(cx, |note, _| {
-            let list = ListState::new(note.cells.len(), ListAlignment::Top, px(200.)).measure_all();
+            let list =
+                ListState::new(note.list_item_count(), ListAlignment::Top, px(200.)).measure_all();
             list.scroll_to(note.cell_list.logical_scroll_top());
             note.view_lists.insert(key.clone(), list.clone());
             note.active_views.insert(key.clone());
@@ -1486,6 +1615,8 @@ impl Render for NotePane {
 impl NoteView {
     pub(crate) fn remove_view(&mut self, key: &str, cx: &mut Context<Self>) {
         self.view_lists.remove(key);
+        self.top_visible.remove(key);
+        self.append_hovered.remove(key);
         if let Some(primary) = self.view_lists.get(&self.key) {
             self.cell_list = primary.clone();
         }
@@ -1509,6 +1640,10 @@ impl NoteView {
 
 impl NoteView {
     pub(crate) fn promote_view(&mut self, key: &str, cx: &mut Context<Self>) {
+        if self.top_visible.remove(key) {
+            self.top_visible.insert(self.key.clone());
+        }
+        self.append_hovered.remove(key);
         if let Some(list) = self.view_lists.remove(key) {
             self.cell_list = list.clone();
             self.view_lists.insert(self.key.clone(), list);

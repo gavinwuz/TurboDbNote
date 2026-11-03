@@ -10,30 +10,13 @@ impl DatabasePreferences {
             execution: self.execution_timeout_seconds,
         }
     }
+    // Legacy per-command lists remain deserializable but no longer form a second
+    // capability ceiling. Runtime access modes and adapter/server checks apply.
     pub fn command_enabled(&self, key: &str) -> bool {
-        self.sql_commands.as_ref().map_or_else(
-            || {
-                self.sql_extensions.iter().any(|v| v == key)
-                    || turbodbn_services::database::notebook_query::COMMANDS
-                        .iter()
-                        .chain(turbodbn_services::database::notebook_query::SCRIPT_COMMANDS)
-                        .any(|(id, _, enabled)| *id == key && *enabled)
-            },
-            |commands| commands.iter().any(|v| v == key),
-        )
-    }
-    pub fn set_command(&mut self, key: &str, enabled: bool) {
-        let mut commands = turbodbn_services::database::notebook_query::COMMANDS
+        turbodbn_services::database::notebook_query::COMMANDS
             .iter()
             .chain(turbodbn_services::database::notebook_query::SCRIPT_COMMANDS)
-            .filter(|(id, _, _)| self.command_enabled(id))
-            .map(|(id, _, _)| (*id).to_owned())
-            .collect::<Vec<_>>();
-        commands.retain(|v| v != key);
-        if enabled {
-            commands.push(key.into());
-        }
-        self.sql_commands = Some(commands);
+            .any(|(id, _, _)| *id == key)
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -508,21 +491,30 @@ mod database_preferences_tests {
 #[cfg(test)]
 mod command_permissions_tests {
     #[test]
-    fn safe_defaults_and_explicit_choices_round_trip() {
-        let mut prefs = super::DatabasePreferences::default();
-        assert!(prefs.command_enabled("select"));
-        assert!(prefs.command_enabled("show_create"));
-        assert!(prefs.command_enabled("show_databases"));
-        assert!(!prefs.command_enabled("delete"));
-        prefs.set_command("select", false);
-        prefs.set_command("update", true);
-        prefs.set_command("show_databases", false);
-        let saved = serde_json::to_string(&prefs).unwrap();
-        let loaded: super::DatabasePreferences = serde_json::from_str(&saved).unwrap();
-        assert!(!loaded.command_enabled("select"));
-        assert!(loaded.command_enabled("update"));
-        assert!(!loaded.command_enabled("delete"));
-        assert!(!loaded.command_enabled("show_databases"));
+    fn known_commands_follow_modes_instead_of_legacy_checkboxes() {
+        let prefs: super::DatabasePreferences =
+            serde_json::from_str(r#"{"sql_commands":["select"],"sql_extensions":[]}"#).unwrap();
+        let loaded: super::DatabasePreferences =
+            serde_json::from_str(&serde_json::to_string(&prefs).unwrap()).unwrap();
+        for key in [
+            "select",
+            "insert",
+            "update",
+            "delete",
+            "alter",
+            "show_databases",
+        ] {
+            assert!(loaded.command_enabled(key));
+        }
+        assert!(!loaded.command_enabled("unknown_command"));
+        use turbodbn_services::access_mode::AccessMode;
+        assert!(
+            !AccessMode::ReadOnly.allows_note_effective("update", loaded.command_enabled("update"))
+        );
+        assert!(
+            !AccessMode::ReadWrite.allows_note_effective("drop", loaded.command_enabled("drop"))
+        );
+        assert!(AccessMode::Admin.allows_note_effective("drop", loaded.command_enabled("drop")));
     }
 }
 

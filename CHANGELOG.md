@@ -4,6 +4,12 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Unify Note cell action alignment across reading, editing and collapsed states. Show secondary actions as a complete group when space permits, overflow them together on narrow views, and prevent long collapsed summaries from overlapping controls.
+- Replace the fixed bottom creation bar with four direct document-end actions shown on hover or keyboard focus. Keep Top navigation in a separate lane and retain its state across window maximization and restoration.
+- Control SQL permissions through Read only, Read/write and DBA modes instead of per-command checkboxes. Preserve connection/server restrictions; use one frozen-target confirmation for risky Note statements and one confirmation for each frozen script batch, without repeated mode authorization.
+- Move SQL table/column completion and formatting into the editor context menu while retaining standard clipboard actions. Keep execution and execution-plan controls visible ahead of secondary actions.
+- Validate the Windows layouts in isolated light/dark windows and run workspace tests. Live external-server permissions and Linux desktop behavior are not inferred from these local checks; platform release packages are verified separately by CI.
+
 ## [0.1.5] - 2026-10-27
 
 - Unify database difference filters and table/DDL views, deduplicate index/constraint representations, recover supported MySQL synchronization statements from individual DDL components and ordered index metadata, and add a two-step index field designer with generated names and optional database qualification.
