@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-05
+
 - Create a new Note from a project context menu and persist the clicked project before the first file save.
 
 - Unify Note names with file stems and merge rename actions; keep existing files intact until normal save. Compact center tabs from measured pane width, emphasize active selection, and add in-place context-menu ordering with preserved focus and persisted order.
