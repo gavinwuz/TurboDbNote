@@ -38,6 +38,12 @@ pub enum ScriptEvent {
     Finished { run: u64, success: bool },
 }
 enum PreflightError {
+    Statement {
+        number: u64,
+        line: u64,
+        reason: String,
+        sql: String,
+    },
     Other(String),
     NoteAccess(crate::note_permissions::Advice),
     Permissions(Vec<sql_script::PermissionBlock>),
@@ -710,10 +716,6 @@ impl ScriptView {
             feedback::error(t(cx, "script.error.dialect"), cx);
             return false;
         }
-        if !selected && self.script.unsupported > 0 {
-            feedback::error(t(cx, "script.error.unsupported"), cx);
-            return false;
-        }
         self.active = true;
         self.run_id += 1;
         let run = self.run_id;
@@ -799,7 +801,21 @@ impl ScriptView {
                 if cancel.load(Ordering::Relaxed) {
                     return Err(PreflightError::Other("script.cancelled".into()));
                 }
-                let sql = reader.statement(number)?;
+                let sql = reader.raw_statement(number)?;
+                if let Err(reason) =
+                    turbodbn_services::database::notebook_query::validate_script_statement(
+                        saved.profile.kind,
+                        &sql,
+                    )
+                {
+                    let entry = reader.page(number)?.into_iter().next();
+                    return Err(PreflightError::Statement {
+                        number,
+                        line: entry.map_or(1, |e| e.line),
+                        reason,
+                        sql,
+                    });
+                }
                 if mode_blocked.is_none()
                     && !turbodbn_services::database::notebook_query::note_mode_allows(
                         mode,
@@ -881,6 +897,11 @@ impl ScriptView {
                     let _ = owner.update_in(cx, |this, window, cx| {
                         if this.run_id == run {
                             match error {
+                                PreflightError::Statement{number,line,reason,sql}=>{
+                                    this.current_location=Some((number,line));
+                                    this.current_sql=sql;
+                                    this.fail(reason,cx);
+                                }
                                 PreflightError::Permissions(blocks) => {
                                     this.permission_dialog(blocks, window, cx)
                                 }
@@ -1456,33 +1477,6 @@ impl ScriptView {
             reason
         };
         self.log(crate::operation_log::Phase::Failed, Some(&error), cx);
-        if error != "notes.access.blocked" {
-            if matches!(
-                error.as_str(),
-                "mysql.error.command_denied"
-                    | "mysql.error.privilege_1227"
-                    | "mysql.error.trigger_privilege_1419"
-            ) {
-                let owner = cx.entity().downgrade();
-                let run = self.run_id;
-                feedback::action_error(
-                    self.status.clone(),
-                    t(cx, "script.diagnostics.run"),
-                    move |window, cx| {
-                        let _ = owner.update(cx, |this, cx| {
-                            if this.run_id != run {
-                                feedback::error(t(cx, "permissions.expired"), cx);
-                                return;
-                            }
-                            this.diagnose(window, cx);
-                        });
-                    },
-                    cx,
-                );
-            } else {
-                feedback::error(self.status.clone(), cx);
-            }
-        }
         self.finish(false, cx);
     }
     fn finish(&mut self, success: bool, cx: &mut Context<Self>) {
@@ -1646,6 +1640,18 @@ impl Render for ScriptView {
                 .min_w_0()
                 .gap_1()
                 .child(self.result_status(cx))
+                .when(
+                    self.failed_location.is_some() && !self.current_sql.is_empty(),
+                    |body| {
+                        body.child(
+                            div()
+                                .p_2()
+                                .text_sm()
+                                .whitespace_normal()
+                                .child(self.current_sql.chars().take(2048).collect::<String>()),
+                        )
+                    },
+                )
                 .child(self.results.clone())
                 .into_any_element();
         }
@@ -1685,7 +1691,7 @@ impl Render for ScriptView {
                             Button::new("script-run-all")
                                 .icon(IconName::ArrowRight)
                                 .label(t(cx, "script.run_all"))
-                                .disabled(disabled || self.script.unsupported > 0)
+                                .disabled(disabled)
                                 .on_click(
                                     cx.listener(|_, _, _, cx| cx.emit(ScriptEvent::Run(false))),
                                 ),

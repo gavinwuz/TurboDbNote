@@ -44,6 +44,7 @@ impl Advice {
                 | "drop"
                 | "truncate"
                 | "script_drop_trigger"
+                | "mysql_dba_write"
         ) && !profile.supports_mutation()
         {
             return Some(Self::Connection);
@@ -93,6 +94,7 @@ impl Advice {
                 | "drop"
                 | "truncate"
                 | "script_drop_trigger"
+                | "mysql_dba_write"
         ) && !profile.supports_mutation()
         {
             return Some(Self::Connection);

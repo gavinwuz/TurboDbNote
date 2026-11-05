@@ -7,7 +7,6 @@ use gpui_component::{
 
 #[derive(Clone, Copy)]
 pub(crate) enum FileAction {
-    Rename,
     SaveAs,
     RenameFile,
     ExportSql,
@@ -15,9 +14,6 @@ pub(crate) enum FileAction {
     Project,
 }
 
-fn valid_title(title: &str) -> bool {
-    !title.is_empty() && title.len() <= 1024 && !title.chars().any(char::is_control)
-}
 pub(super) fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 240
@@ -487,8 +483,7 @@ impl NoteView {
             note.saving || note.picking || note.cells.iter().any(|cell| cell.read(cx).indexing(cx))
         });
         for (action, key, icon) in [
-            (FileAction::Rename, "notes.rename", IconName::ALargeSmall),
-            (FileAction::RenameFile, "notes.rename_file", IconName::File),
+            (FileAction::RenameFile, "notes.rename", IconName::File),
             (
                 FileAction::ExportSql,
                 "notes.export_sql",
@@ -523,41 +518,19 @@ impl NoteView {
             FileAction::Reveal => crate::feedback::reveal_parent(self.path.clone(), cx),
             FileAction::SaveAs => self.save_as(window, cx),
             FileAction::ExportSql => self.export_sql(window, cx),
-            FileAction::RenameFile => self.metadata_dialog(false, true, window, cx),
-            FileAction::Rename | FileAction::Project => {
-                self.metadata_dialog(matches!(action, FileAction::Project), false, window, cx)
-            }
+            FileAction::RenameFile => self.metadata_dialog(false, window, cx),
+            FileAction::Project => self.metadata_dialog(true, window, cx),
         }
     }
-    fn metadata_dialog(
-        &mut self,
-        project: bool,
-        filename: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn metadata_dialog(&mut self, project: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving || self.picking || self.cells.iter().any(|cell| cell.read(cx).indexing(cx)) {
             return;
         }
         let value = if project {
             self.note.project.clone()
-        } else if filename {
-            self.path
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned()
         } else {
-            self.note.title.clone()
+            file_title(&self.path)
         };
-        let file_hint = crate::locale::tr(
-            cx,
-            "notes.title_file_hint",
-            &[(
-                "filename",
-                &self.path.file_name().unwrap_or_default().to_string_lossy(),
-            )],
-        );
         let input = cx.new(|cx| InputState::new(window, cx).default_value(value));
         let projects = self.connections.read(cx).note_projects();
         let view = cx.entity().downgrade();
@@ -571,8 +544,6 @@ impl NoteView {
                     cx,
                     if project {
                         "notes.project"
-                    } else if filename {
-                        "notes.rename_file"
                     } else {
                         "notes.rename"
                     },
@@ -600,14 +571,6 @@ impl NoteView {
                             }),
                     )
                 }))
-                .when(!project && !filename, |dialog| {
-                    dialog.child(
-                        div()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(file_hint.clone()),
-                    )
-                })
                 .footer(move |_, _, _, cx| {
                     let apply = apply.clone();
                     let view = view.clone();
@@ -623,20 +586,15 @@ impl NoteView {
                                         let value = apply.read(cx).value().trim().to_owned();
                                         if value.len() > 1024
                                             || value.chars().any(char::is_control)
-                                            || (!project
-                                                && if filename {
-                                                    !valid_name(&value)
-                                                } else {
-                                                    !valid_title(&value)
-                                                })
+                                            || (!project && !valid_name(&value))
                                         {
                                             feedback::error(
                                                 t(
                                                     cx,
-                                                    if filename {
-                                                        "notes.invalid_name"
-                                                    } else {
+                                                    if project {
                                                         "notes.invalid_title"
+                                                    } else {
+                                                        "notes.invalid_name"
                                                     },
                                                 ),
                                                 cx,
@@ -650,9 +608,6 @@ impl NoteView {
                                                 }
                                                 if project {
                                                     this.note.project = value.clone();
-                                                    this.changed(cx);
-                                                } else if !filename {
-                                                    this.note.title = value.clone();
                                                     this.changed(cx);
                                                 } else {
                                                     let name = if value
@@ -746,10 +701,14 @@ impl NoteView {
             div().id(SharedString::from(format!("tab-title-{name}"))),
         )
         .h_flex()
-        .gap_2()
+        .w_full()
+        .min_w_0()
+        .gap_1()
         .child(crate::assets::note_icon(2, cx))
         .child(
             div()
+                .flex_1()
+                .min_w(px(f32::from(cx.theme().font_size) * 3.))
                 .max_w(px(crate::tabs::title_width(cx)))
                 .overflow_hidden()
                 .text_ellipsis()
@@ -776,6 +735,8 @@ impl NoteView {
         })
         .child(
             Button::new(SharedString::from(format!("tab-close-{name}")))
+                .w(px(16.))
+                .h(px(16.))
                 .ghost()
                 .icon(IconName::Close)
                 .tooltip(t(cx, "common.action.close"))
@@ -809,21 +770,13 @@ fn compact_path(path: &str) -> String {
 }
 #[cfg(test)]
 mod path_tests {
-    use super::{compact_path, valid_name, valid_title};
+    use super::{compact_path, valid_name};
     #[test]
-    fn title_punctuation_is_independent_of_windows_file_rules() {
-        assert!(valid_title("师徒 · 131.165:3306"));
+    fn unified_names_use_file_validation() {
         assert!(!valid_name("师徒 · 131.165:3306"));
-        assert!(valid_name("note-261026-1"));
-        assert!(!valid_title(""));
-        assert!(!valid_title("title\nnext"));
-        let note = turbodbn_core::Note::new("师徒 · 131.165:3306");
-        assert_eq!(
-            turbodbn_core::Note::from_json(&note.to_json().unwrap())
-                .unwrap()
-                .title,
-            note.title
-        );
+        assert!(valid_name("订单排查-261105-1"));
+        assert!(!valid_name(""));
+        assert!(!valid_name("title\nnext"));
     }
     #[test]
     fn tooltip_path_is_bounded_and_unicode_safe() {

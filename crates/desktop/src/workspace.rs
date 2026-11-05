@@ -236,6 +236,7 @@ impl Workspace {
             unreachable!()
         };
         let center_tabs = center_tabs.clone();
+        center_tabs.update(cx, |tabs, cx| tabs.set_compact_tabs(true, cx));
         let left = DockItem::tab(navigation.clone(), &weak, window, cx);
         let right = DockItem::tabs(
             vec![

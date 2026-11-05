@@ -484,6 +484,7 @@ impl NoteView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        loaded.note.title = file_title(&path);
         let default_database = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(t(cx, "notes.default_database"))
@@ -790,28 +791,8 @@ impl NoteView {
         }
         cx.notify();
     }
-    pub fn display_title(&self, cx: &App) -> SharedString {
-        let title = if self.note.title.trim().is_empty() {
-            let stem = self.path.file_stem().unwrap_or_default().to_string_lossy();
-            if Uuid::parse_str(&stem).is_ok() {
-                t(cx, "notes.legacy_title").to_string()
-            } else {
-                stem.into_owned()
-            }
-        } else {
-            self.note.title.clone()
-        };
-        if let Some(profile) = self
-            .note
-            .default_connection_id
-            .and_then(|id| self.connections.read(cx).note_profile(id))
-        {
-            let address = short_address(&profile.host, profile.port);
-            if !address.is_empty() && !title.ends_with(&format!(" · {address}")) {
-                return format!("{title} · {address}").into();
-            }
-        }
-        title.into()
+    pub fn display_title(&self, _: &App) -> SharedString {
+        file_title(&self.path).into()
     }
     pub(crate) fn search_identity(&self, cx: &App) -> (String, String, String, bool) {
         let connection = self
@@ -831,7 +812,7 @@ impl NoteView {
         Entry {
             id: self.note.id,
             path: self.path.clone(),
-            title: self.note.title.clone(),
+            title: file_title(&self.path),
             project: self.note.project.clone(),
             draft: self.draft,
             used: note_store::now(),
@@ -940,7 +921,7 @@ impl NoteView {
         let note = Note {
             schema_version: self.note.schema_version,
             id: self.note.id,
-            title: self.note.title.clone(),
+            title: file_title(&self.path),
             project: self.note.project.clone(),
             default_connection_id: self.note.default_connection_id,
             default_database: (!database.is_empty()).then_some(database),
@@ -978,6 +959,7 @@ impl NoteView {
             return;
         }
         let (mut snapshot, cells) = self.snapshot_deferred(cx);
+        snapshot.title = file_title(&path);
         let revision = self.revision;
         let hash = if as_new { None } else { Some(self.hash) };
         let previous = self.path.clone();
@@ -1007,6 +989,9 @@ impl NoteView {
             {
                 retired = std::fs::remove_file(&previous).is_ok();
             }
+            if move_source && previous != written && !retired {
+                return Err("notes.rename_partial".into());
+            }
             Ok::<_, String>((hash, previous, retired))
         });
         self.save_task = Some(cx.spawn(async move |view, cx| {
@@ -1020,8 +1005,12 @@ impl NoteView {
                             feedback::error(t(cx, "notes.rename_partial"), cx);
                         }
                         this.path = path;
+                        this.note.title = file_title(&this.path);
                         for cell in &this.cells {
-                            cell.update(cx, |cell, cx| cell.set_note_path(this.path.clone(), cx));
+                            cell.update(cx, |cell, cx| {
+                                cell.set_note_path(this.path.clone(), cx);
+                                cell.set_note_name(&this.note.title, cx);
+                            });
                         }
                         this.hash = hash;
                         this.saved_revision = revision;
@@ -1047,14 +1036,14 @@ impl NoteView {
                         }
                     }
                     Err(error) => {
-                        this.error = error.clone();
+                        this.error = crate::locale::message(cx, &error).to_string();
                         this.log(
                             task_id,
                             crate::operation_log::Phase::Failed,
                             Some(&error),
                             cx,
                         );
-                        feedback::error(error, cx);
+                        feedback::error(this.error.clone(), cx);
                         cx.emit(NoteEvent::Failed);
                     }
                 }
@@ -1500,24 +1489,11 @@ mod navigation_tests {
     }
 }
 
-fn short_address(host: &str, port: u16) -> String {
-    if host.is_empty() {
-        return String::new();
-    }
-    let host = host
-        .parse::<std::net::Ipv4Addr>()
-        .map(|ip| {
-            let b = ip.octets();
-            format!("{}.{}", b[2], b[3])
-        })
-        .unwrap_or_else(|_| {
-            if host.contains(':') {
-                format!("[{host}]")
-            } else {
-                host.to_owned()
-            }
-        });
-    format!("{host}:{port}")
+pub(super) fn file_title(path: &std::path::Path) -> String {
+    path.file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
 }
 
 impl Render for NoteView {
@@ -1658,13 +1634,15 @@ impl NoteView {
 #[cfg(test)]
 mod title_tests {
     #[test]
-    fn short_addresses_keep_port_and_handle_non_ipv4_hosts() {
-        assert_eq!(super::short_address("172.24.140.38", 3306), "140.38:3306");
+    fn names_are_exact_file_stems_including_legacy_names() {
         assert_eq!(
-            super::short_address("db.example.com", 5432),
-            "db.example.com:5432"
+            super::file_title(std::path::Path::new("订单排查.note")),
+            "订单排查"
         );
-        assert_eq!(super::short_address("::1", 3306), "[::1]:3306");
-        assert_eq!(super::short_address("", 3306), "");
+        assert_eq!(super::file_title(std::path::Path::new("a.b.note")), "a.b");
+        assert_eq!(
+            super::file_title(std::path::Path::new("55a6cd.note")),
+            "55a6cd"
+        );
     }
 }

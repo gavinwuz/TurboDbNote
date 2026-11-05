@@ -129,6 +129,19 @@ pub fn tr(cx: &App, key: &str, args: &[(&str, &str)]) -> SharedString {
 /// For internally generated semantic status keys or unmodified external text.
 /// Raw backend errors are never treated as legacy translation keys.
 pub fn message(cx: &App, value: &str) -> SharedString {
+    if let Some(location) = value.strip_prefix("notes.sql_parse_location:")
+        && location.len() < 32
+        && let Some((line, column)) = location.split_once(':')
+        && line.parse::<u32>().is_ok_and(|n| n > 0)
+        && column.parse::<u32>().is_ok_and(|n| n > 0)
+    {
+        return tr(
+            cx,
+            "notes.sql_parse_location",
+            &[("line", line), ("column", column)],
+        );
+    }
+
     if let Some(details) = value.strip_prefix("components.mismatch:")
         && details.len() <= 512
         && let Ok(details) = serde_json::from_str::<serde_json::Value>(details)

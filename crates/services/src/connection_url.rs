@@ -4,6 +4,139 @@ use crate::{
     mysql::{Profile, TlsMode},
 };
 
+/// Export only public connection coordinates. Password/key stores are never read.
+/// Certificate files, tunnels and application-only restrictions are not serialized.
+pub fn export(profile: &Profile) -> Result<String, &'static str> {
+    use crate::DatabaseKind;
+    if profile.kind == DatabaseKind::Sqlite {
+        let url =
+            reqwest::Url::from_file_path(&profile.sqlite_path).map_err(|_| "url.export.invalid")?;
+        return Ok(format!(
+            "sqlite:{}{}",
+            url.as_str()
+                .strip_prefix("file:")
+                .ok_or("url.export.invalid")?,
+            if profile.sqlite_read_only {
+                "?mode=ro"
+            } else {
+                "?mode=rw"
+            }
+        ));
+    }
+    let scheme = match profile.kind {
+        DatabaseKind::MySql => {
+            if profile.driver_id == "mariadb" {
+                "mariadb"
+            } else {
+                "mysql"
+            }
+        }
+        DatabaseKind::PostgreSql => "postgresql",
+        DatabaseKind::External if profile.driver_id == "mongodb" => "mongodb",
+        DatabaseKind::Redis => {
+            if profile.tls == TlsMode::Disabled {
+                "redis"
+            } else {
+                "rediss"
+            }
+        }
+        DatabaseKind::ClickHouse => "clickhouse",
+        _ => return Err("url.export.unsupported"),
+    };
+    let host = profile.host.trim();
+    let host = match host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .parse::<std::net::IpAddr>()
+    {
+        Ok(std::net::IpAddr::V6(ip)) => format!("[{ip}]"),
+        Ok(std::net::IpAddr::V4(ip)) => ip.to_string(),
+        Err(_) => {
+            if host.is_empty()
+                || host
+                    .chars()
+                    .any(|c| c.is_control() || c.is_whitespace() || "@:/?#[]\\".contains(c))
+            {
+                return Err("url.export.invalid");
+            }
+            host.to_owned()
+        }
+    };
+    if profile.port == 0
+        || [&profile.user, &profile.database]
+            .iter()
+            .any(|s| s.chars().any(char::is_control))
+    {
+        return Err("url.export.invalid");
+    }
+    let mut url = reqwest::Url::parse(&format!("{scheme}://{host}:{}/", profile.port))
+        .map_err(|_| "url.export.invalid")?;
+    url.set_username(&profile.user)
+        .map_err(|_| "url.export.invalid")?;
+    url.path_segments_mut()
+        .map_err(|_| "url.export.invalid")?
+        .clear()
+        .push(&profile.database);
+    match profile.kind {
+        DatabaseKind::MySql => {
+            url.query_pairs_mut().append_pair(
+                "ssl-mode",
+                match profile.tls {
+                    TlsMode::Disabled => "DISABLED",
+                    TlsMode::Required => "REQUIRED",
+                    TlsMode::VerifyIdentity => "VERIFY_IDENTITY",
+                },
+            );
+            if !profile.charset.is_empty() {
+                url.query_pairs_mut()
+                    .append_pair("charset", &profile.charset);
+            }
+        }
+        DatabaseKind::PostgreSql => {
+            url.query_pairs_mut().append_pair(
+                "sslmode",
+                match profile.tls {
+                    TlsMode::Disabled => "disable",
+                    TlsMode::Required => "require",
+                    TlsMode::VerifyIdentity => "verify-full",
+                },
+            );
+        }
+        DatabaseKind::External if profile.driver_id == "mongodb" => {
+            let auth = if profile.mongo_auth_source.is_empty() {
+                "admin"
+            } else {
+                &profile.mongo_auth_source
+            };
+            url.query_pairs_mut()
+                .append_pair("authSource", auth)
+                .append_pair(
+                    "tls",
+                    if profile.tls == TlsMode::Disabled {
+                        "false"
+                    } else {
+                        "true"
+                    },
+                );
+        }
+        DatabaseKind::ClickHouse => {
+            url.query_pairs_mut().append_pair(
+                "secure",
+                if profile.tls == TlsMode::Disabled {
+                    "false"
+                } else {
+                    "true"
+                },
+            );
+        }
+        _ => {}
+    }
+    if url.password().is_some() {
+        return Err("url.export.invalid");
+    }
+    Ok(url.into())
+}
+
 pub struct Draft {
     pub profile: Profile,
     pub password: String,
@@ -135,7 +268,10 @@ fn one(text: &str) -> Result<Draft, &'static str> {
         let (key, value) = pair.split_once('=').ok_or("url.error.parameter")?;
         let key = decode(&key.replace('+', "%20"))?;
         let value = decode(&value.replace('+', "%20"))?;
-        let identity = if matches!(key.as_str(), "ssl" | "tls") {
+        let identity = if matches!(
+            key.as_str(),
+            "ssl" | "tls" | "ssl-mode" | "sslmode" | "secure"
+        ) {
             "tls"
         } else {
             key.as_str()
@@ -146,6 +282,29 @@ fn one(text: &str) -> Result<Draft, &'static str> {
         match key.as_str() {
             "authSource" if id == "mongodb" && !value.is_empty() => {
                 profile.mongo_auth_source = value
+            }
+            "ssl-mode" if matches!(id, "mysql" | "mariadb") => {
+                profile.tls = match value.to_ascii_uppercase().as_str() {
+                    "DISABLED" => TlsMode::Disabled,
+                    "REQUIRED" => TlsMode::Required,
+                    "VERIFY_IDENTITY" => TlsMode::VerifyIdentity,
+                    _ => return Err("url.error.parameter"),
+                };
+            }
+            "sslmode" if id == "postgresql" => {
+                profile.tls = match value.as_str() {
+                    "disable" => TlsMode::Disabled,
+                    "require" => TlsMode::Required,
+                    "verify-full" => TlsMode::VerifyIdentity,
+                    _ => return Err("url.error.parameter"),
+                };
+            }
+            "secure" if id == "clickhouse" => {
+                profile.tls = match value.as_str() {
+                    "false" => TlsMode::Disabled,
+                    "true" => TlsMode::VerifyIdentity,
+                    _ => return Err("url.error.parameter"),
+                };
             }
             "tls" | "ssl" => {
                 profile.tls = match value.as_str() {
@@ -219,6 +378,91 @@ fn one(text: &str) -> Result<Draft, &'static str> {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exports_network_coordinates_without_secrets_and_roundtrips_identity() {
+        for id in [
+            "mysql",
+            "mariadb",
+            "postgresql",
+            "mongodb",
+            "redis",
+            "clickhouse",
+        ] {
+            let mut profile = driver_catalog::find(id).unwrap().profile();
+            profile.host = "2001:db8::17".into();
+            profile.user = "read@中文:/?".into();
+            profile.database = "app name".into();
+            profile.ca = "private-cert-location".into();
+            profile.client_key = "private-key-location".into();
+            for tls in [
+                TlsMode::Disabled,
+                TlsMode::Required,
+                TlsMode::VerifyIdentity,
+            ] {
+                profile.tls = tls;
+                if id == "redis" {
+                    profile.database = "2".into();
+                }
+                let output = export(&profile).unwrap();
+                let url = reqwest::Url::parse(&output).unwrap();
+                assert!(url.password().is_none());
+                assert!(
+                    !output.contains("private-cert-location")
+                        && !output.contains("private-key-location")
+                );
+                assert!(output.contains("[2001:db8::17]"));
+                assert_eq!(decode(url.username()).unwrap(), profile.user);
+                let imported = parse(&output).unwrap().remove(0).draft.unwrap();
+                assert!(imported.password.is_empty());
+                assert_eq!(imported.profile.user, profile.user);
+                assert_eq!(imported.profile.database, profile.database);
+                assert_eq!(imported.profile.port, profile.port);
+                if matches!(id, "mysql" | "mariadb" | "postgresql") {
+                    assert_eq!(imported.profile.tls, tls);
+                } else if tls != TlsMode::Disabled {
+                    assert_ne!(imported.profile.tls, TlsMode::Disabled);
+                }
+            }
+        }
+    }
+    #[test]
+    fn sqlite_export_uses_absolute_uri_and_preserves_read_only() {
+        let profile = Profile {
+            kind: crate::DatabaseKind::Sqlite,
+            sqlite_path: std::env::temp_dir()
+                .join("connection url fixture.db")
+                .display()
+                .to_string(),
+            sqlite_read_only: true,
+            ..Default::default()
+        };
+        let output = export(&profile).unwrap();
+        assert!(output.starts_with("sqlite:///") && output.ends_with("?mode=ro"));
+        assert!(output.contains("connection%20url%20fixture.db"));
+    }
+    #[test]
+    fn export_rejects_injected_hosts_and_unsupported_drivers() {
+        let mut profile = driver_catalog::find("mysql").unwrap().profile();
+        for host in [
+            "",
+            "server/path",
+            "user@server",
+            "server?tls=false",
+            "server#part",
+            "bad host",
+        ] {
+            profile.host = host.into();
+            assert!(export(&profile).is_err());
+        }
+        let external = driver_catalog::find("oracle").unwrap().profile();
+        assert!(export(&external).is_err());
+        profile.host = "db.example.test".into();
+        profile.user.clear();
+        let output = export(&profile).unwrap();
+        let url = reqwest::Url::parse(&output).unwrap();
+        assert!(url.username().is_empty() && url.password().is_none());
+    }
+
     use super::*;
     #[test]
     fn imports_go_tcp_wrapper_and_surfaces_client_only_options() {

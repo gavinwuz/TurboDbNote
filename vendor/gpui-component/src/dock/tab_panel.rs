@@ -78,6 +78,8 @@ pub struct TabPanel {
     pub(crate) closable: bool,
 
     tab_bar_scroll_handle: ScrollHandle,
+    compact_tabs: bool,
+    tab_bar_width: f32,
     zoomed: bool,
     collapsed: bool,
     /// When drag move, will get the placement of the panel to be split
@@ -172,12 +174,44 @@ impl TabPanel {
             panels: Vec::new(),
             active_ix: 0,
             tab_bar_scroll_handle: ScrollHandle::new(),
+            compact_tabs: false,
+            tab_bar_width: 880.,
             will_split_placement: None,
             zoomed: false,
             collapsed: false,
             closable: true,
             in_tiles: false,
         }
+    }
+
+    /// Compact editor tabs without changing fixed tool docks.
+    pub fn set_compact_tabs(&mut self, compact: bool, cx: &mut Context<Self>) {
+        if self.compact_tabs != compact {
+            self.compact_tabs = compact;
+            cx.notify();
+        }
+    }
+    /// Reorder without refocusing or reactivating any panel.
+    pub fn reorder_panel(&mut self, id: gpui::EntityId, target: usize, cx: &mut Context<Self>) {
+        let Some(source) = self.panels.iter().position(|p| p.view().entity_id() == id) else {
+            return;
+        };
+        let target = target.min(self.panels.len().saturating_sub(1));
+        if source == target {
+            return;
+        }
+        let active = self
+            .panels
+            .get(self.active_ix)
+            .map(|p| p.view().entity_id());
+        let panel = self.panels.remove(source);
+        self.panels.insert(target, panel);
+        self.active_ix = active
+            .and_then(|id| self.panels.iter().position(|p| p.view().entity_id() == id))
+            .unwrap_or(0);
+        self.tab_bar_scroll_handle.scroll_to_item(self.active_ix);
+        cx.emit(PanelEvent::LayoutChanged);
+        cx.notify();
     }
 
     /// Mark the TabPanel as being used in Tiles.
@@ -638,7 +672,7 @@ impl TabPanel {
         let panel_style = dock_area.read(cx).panel_style;
         let visible_panels = self.visible_panels(cx).collect::<Vec<_>>();
 
-        if visible_panels.len() == 1 && panel_style == PanelStyle::default() {
+        if !self.compact_tabs && visible_panels.len() == 1 && panel_style == PanelStyle::default() {
             let panel = visible_panels.get(0).unwrap();
 
             if !panel.visible(cx) {
@@ -705,7 +739,10 @@ impl TabPanel {
 
         let tabs_count = self.panels.len();
 
-        TabBar::new("tab-bar")
+        let minimum = f32::from(cx.theme().font_size) * 3. + 68.;
+        let slot = ((self.tab_bar_width - 96.) / visible_panels.len().max(1) as f32)
+            .clamp(minimum, 220_f32.max(minimum));
+        let bar = TabBar::new("tab-bar")
             .tab_item_top_offset(-px(1.))
             .track_scroll(&self.tab_bar_scroll_handle)
             .when(has_extend_dock_button, |this| {
@@ -740,6 +777,13 @@ impl TabPanel {
 
                 Some(
                     Tab::default()
+                        .when(self.compact_tabs, |tab| {
+                            tab.underline()
+                                .accent_selected(true)
+                                .w(px(slot))
+                                .min_w(px(minimum))
+                                .px_2()
+                        })
                         .when(!has_extend_dock_button && ix == 0, |this| {
                             // Right 1px for avoid border overlap with the first tab
                             this.right(px(1.))
@@ -799,7 +843,7 @@ impl TabPanel {
                     .id("tab-bar-empty-space")
                     .h_full()
                     .flex_grow()
-                    .min_w_16()
+                    .min_w(px(if self.compact_tabs { 8. } else { 64. }))
                     .when(state.droppable, |this| {
                         this.drag_over::<DragPanel>(|this, _, _, cx| {
                             this.bg(cx.theme().drop_target)
@@ -838,6 +882,36 @@ impl TabPanel {
                         )
                         .child(self.render_toolbar(state, window, cx))
                         .when_some(right_dock_button, |this, btn| this.child(btn)),
+                )
+            })
+            .into_any_element();
+        let owner = cx.entity().downgrade();
+        div()
+            .relative()
+            .w_full()
+            .child(bar)
+            .when(self.compact_tabs, |row| {
+                row.child(
+                    gpui::canvas(
+                        move |bounds, _, cx| {
+                            let width = f32::from(bounds.size.width);
+                            if owner
+                                .read_with(cx, |v, _| (v.tab_bar_width - width).abs() > 1.)
+                                .unwrap_or(false)
+                            {
+                                let owner = owner.clone();
+                                cx.defer(move |cx| {
+                                    let _ = owner.update(cx, |v, cx| {
+                                        v.tab_bar_width = width;
+                                        cx.notify();
+                                    });
+                                });
+                            }
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
                 )
             })
             .into_any_element()

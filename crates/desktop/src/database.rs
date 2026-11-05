@@ -1591,6 +1591,12 @@ impl DatabaseView {
                 return;
             }
         };
+        if self.profiles.iter().any(|p| {
+            p.id != profile.id && p.name.trim().to_lowercase() == profile.name.trim().to_lowercase()
+        }) {
+            feedback::error(crate::locale::t(cx, "dbwork.connection.name.duplicate"), cx);
+            return;
+        }
         let id = profile.id;
         let mut profile = profile;
         if self.clear_password && self.fields["password"].read(cx).value().is_empty() {
@@ -1821,6 +1827,7 @@ impl DatabaseView {
             ("restore.open", IconName::ArrowDown, "import-script"),
             ("dbwork.connection.edit", IconName::Settings2, "edit"),
             ("dbwork.connection.copy", IconName::Copy, "copy"),
+            ("dbwork.connection.copy_url", IconName::Copy, "copy-url"),
             ("feedback.storage.title", IconName::Info, "records"),
             ("dbwork.connection.delete", IconName::Delete, "delete"),
         ] {
@@ -1864,6 +1871,32 @@ impl DatabaseView {
                                 }
                                 "edit" => this.select(id, true, window, cx),
                                 "records" => this.show_storage(id, window, cx),
+                                "copy-url" => {
+                                    let profile = if form {
+                                        this.raw_draft(cx).ok()
+                                    } else {
+                                        this.profiles.iter().find(|p| p.id == id).cloned()
+                                    };
+                                    if let Some(profile) = profile {
+                                        match turbodbn_services::connection_url::export(&profile) {
+                                            Ok(url) => {
+                                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                                    url,
+                                                ));
+                                                feedback::success(
+                                                    crate::locale::t(
+                                                        cx,
+                                                        "dbwork.connection.url_copied",
+                                                    ),
+                                                    cx,
+                                                );
+                                            }
+                                            Err(key) => {
+                                                feedback::error(crate::locale::message(cx, key), cx)
+                                            }
+                                        }
+                                    }
+                                }
                                 "copy" => {
                                     if this.editing.id != id && this.dirty(cx) {
                                         feedback::error(
@@ -2173,11 +2206,12 @@ impl DatabaseView {
                                 .tooltip(crate::locale::t(cx, "grid.connection.generate"))
                                 .disabled(self.saving)
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    let p = Profile {
-                                        database: this.text("database", cx),
-                                        host: this.text("host", cx),
-                                        sqlite_path: this.text("sqlite_path", cx),
-                                        ..this.editing.clone()
+                                    let p = match this.raw_draft(cx) {
+                                        Ok(profile) => profile,
+                                        Err(error) => {
+                                            feedback::error(crate::locale::message(cx, &error), cx);
+                                            return;
+                                        }
                                     };
                                     let name = generated_connection_name(&p, &this.profiles);
                                     this.fields["name"]
@@ -2790,36 +2824,20 @@ fn required_connection_field(profile: &Profile, discover: bool) -> Option<&'stat
 }
 
 fn generated_connection_name(profile: &Profile, profiles: &[Profile]) -> String {
-    let prefix = if !profile.database.trim().is_empty() {
-        profile.database.clone()
-    } else if profile.is_file_database() {
+    let base = if profile.is_file_database() {
         std::path::Path::new(&profile.sqlite_path)
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "SQLite".into())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| profile.driver_label().into())
     } else {
-        profile.driver_label().to_string()
+        crate::connection_choice::address(profile, true)
     };
-    let prefix = prefix.chars().take(128).collect::<String>();
     let used = |name: &str| {
-        profiles
-            .iter()
-            .any(|p| p.id != profile.id && p.name.to_lowercase() == name.to_lowercase())
+        profiles.iter().any(|p| {
+            p.id != profile.id && p.name.trim().to_lowercase() == name.trim().to_lowercase()
+        })
     };
-    if profile.is_file_database() && !used(&prefix) {
-        return prefix;
-    }
-    let host = {
-        profile
-            .host
-            .rsplit('.')
-            .next()
-            .unwrap_or("db")
-            .chars()
-            .take(8)
-            .collect::<String>()
-    };
-    let base = format!("{prefix}@{host}");
     if !used(&base) {
         return base;
     }
@@ -2833,25 +2851,34 @@ fn generated_connection_name(profile: &Profile, profiles: &[Profile]) -> String 
 mod connection_form_tests {
     use super::*;
     #[::core::prelude::v1::test]
-    fn generated_names_prefer_database_and_resolve_collisions() {
+    fn generated_names_use_account_endpoint_and_resolve_collisions() {
         let mut draft = DatabaseView::empty_profile(DatabaseKind::MySql);
-        draft.database = "demo".into();
-        draft.host = "127.0.0.1".into();
+        draft.user = "admin".into();
+        draft.host = "192.168.140.17".into();
+        draft.port = 3306;
+        draft.database = "creation_zone".into();
+        assert_eq!(generated_connection_name(&draft, &[]), "admin@140.17:3306");
         let mut saved = draft.clone();
         saved.id = Uuid::new_v4();
-        saved.name = "DEMO@1".into();
-        assert_eq!(generated_connection_name(&draft, &[]), "demo@1");
+        saved.name = "ADMIN@140.17:3306".into();
         assert_eq!(
             generated_connection_name(&draft, std::slice::from_ref(&saved)),
-            "demo@1-2"
+            "admin@140.17:3306-2"
         );
         let mut second = saved.clone();
         second.id = Uuid::new_v4();
-        second.name = "demo@1-2".into();
+        second.name = "admin@140.17:3306-2".into();
         assert_eq!(
             generated_connection_name(&draft, &[saved, second]),
-            "demo@1-3"
+            "admin@140.17:3306-3"
         );
+        draft.name = "admin@140.17:3306".into();
+        assert_eq!(
+            generated_connection_name(&draft, std::slice::from_ref(&draft)),
+            draft.name
+        );
+        draft.database = "another_database".into();
+        assert_eq!(generated_connection_name(&draft, &[]), draft.name);
     }
     #[::core::prelude::v1::test]
     fn explicit_names_and_database_targets_are_required() {

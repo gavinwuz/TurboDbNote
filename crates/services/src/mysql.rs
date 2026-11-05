@@ -393,6 +393,9 @@ pub(crate) const TABLE_MISSING: &str = "mysql.error.table_missing_1146";
 
 pub(crate) fn statement_error(number: u32) -> Option<&'static str> {
     match number {
+        1193 => Some("mysql.error.variable_1193"),
+        1381 => Some("mysql.error.binlog_1381"),
+        1054 => Some("mysql.error.column_1054"),
         1064 => Some(SQL_SYNTAX_ERROR),
         1146 => Some(TABLE_MISSING),
         1142 | 1143 => Some("mysql.error.command_denied"),

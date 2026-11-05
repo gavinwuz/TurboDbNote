@@ -11,6 +11,11 @@ use std::ops::Range;
 actions!(markdown_tools, [Bold, Italic, Link]);
 pub fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new(
+            "ctrl-/",
+            crate::cell::sql_range::ToggleComments,
+            Some("NoteSql > Input"),
+        ),
         KeyBinding::new("ctrl-b", Bold, Some("NoteMarkdown > Input")),
         KeyBinding::new("ctrl-i", Italic, Some("NoteMarkdown > Input")),
         KeyBinding::new("ctrl-k", Link, Some("NoteMarkdown > Input")),

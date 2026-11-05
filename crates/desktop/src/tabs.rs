@@ -25,10 +25,38 @@ pub enum LayoutAction {
     Activate(String),
     Select(String),
     Restore(String),
-    MoveTo { name: String, pane: usize },
+    MoveTo {
+        name: String,
+        pane: usize,
+    },
     ClosePane(usize),
-    Move { from: String, to: String },
-    Split { name: String, left: bool },
+    Move {
+        from: String,
+        to: String,
+    },
+    Reorder {
+        name: String,
+        position: MovePosition,
+    },
+    Split {
+        name: String,
+        left: bool,
+    },
+}
+#[derive(Clone, Copy, Debug)]
+pub enum MovePosition {
+    First,
+    Previous,
+    Next,
+    Last,
+}
+pub(crate) fn move_index(count: usize, index: usize, position: MovePosition) -> usize {
+    match position {
+        MovePosition::First => 0,
+        MovePosition::Previous => index.saturating_sub(1),
+        MovePosition::Next => (index + 1).min(count.saturating_sub(1)),
+        MovePosition::Last => count.saturating_sub(1),
+    }
 }
 #[derive(Clone)]
 struct TabDrag {
@@ -59,7 +87,12 @@ pub struct OpenNote {
     pub position: String,
     pub dirty: bool,
 }
-pub struct TabRouter(pub Entity<TabEvents>, pub usize, pub Vec<OpenNote>);
+pub struct TabRouter(
+    pub Entity<TabEvents>,
+    pub usize,
+    pub Vec<OpenNote>,
+    pub Vec<Vec<String>>,
+);
 impl Global for TabRouter {}
 pub fn is_fixed(name: &str) -> bool {
     matches!(name, "navigation" | "ai-chat" | "properties" | "schema")
@@ -98,12 +131,8 @@ pub fn editor_menu(menu: PopupMenu, name: impl Into<String>, cx: &App) -> PopupM
             .on_click(move |_, _, cx| send(name.clone(), CloseMode::All, cx)),
     )
 }
-pub(crate) fn title_width(cx: &App) -> f32 {
-    let count = cx
-        .try_global::<TabRouter>()
-        .map(|r| r.2.len().div_ceil(r.1.max(1)))
-        .unwrap_or(1);
-    (880. / count.max(1) as f32 - 60.).clamp(64., 220.)
+pub(crate) fn title_width(_: &App) -> f32 {
+    220.
 }
 pub fn title(
     name: impl Into<String>,
@@ -119,12 +148,15 @@ pub fn title(
     let title = div()
         .id(SharedString::from(format!("tab-title-{name}")))
         .h_flex()
-        .gap_2()
+        .w_full()
+        .min_w_0()
+        .gap_1()
         .child(Icon::new(icon))
         .child(
             div()
                 .max_w(px(title_width(cx)))
-                .min_w_0()
+                .flex_1()
+                .min_w(px(f32::from(cx.theme().font_size) * 3.))
                 .truncate()
                 .child(label.clone()),
         )
@@ -160,6 +192,8 @@ pub fn title(
         })
         .child(
             Button::new(SharedString::from(format!("tab-close-{name}")))
+                .w(px(16.))
+                .h(px(16.))
                 .ghost()
                 .icon(IconName::Close)
                 .tooltip(t(cx, "common.action.close"))
@@ -173,6 +207,43 @@ pub fn title(
 }
 pub(crate) fn close_menu(mut menu: PopupMenu, name: String, cx: &App) -> PopupMenu {
     if !is_fixed(&name) {
+        let group = cx
+            .try_global::<TabRouter>()
+            .and_then(|r| r.3.iter().find(|g| g.contains(&name)));
+        for (key, position, icon) in [
+            ("tabs.move.first", MovePosition::First, IconName::ArrowLeft),
+            (
+                "tabs.move.previous",
+                MovePosition::Previous,
+                IconName::ArrowLeft,
+            ),
+            ("tabs.move.next", MovePosition::Next, IconName::ArrowRight),
+            ("tabs.move.last", MovePosition::Last, IconName::ArrowRight),
+        ] {
+            let disabled = group
+                .and_then(|g| {
+                    g.iter()
+                        .position(|n| n == &name)
+                        .map(|i| move_index(g.len(), i, position) == i)
+                })
+                .unwrap_or(true);
+            let name = name.clone();
+            menu = menu.item(
+                PopupMenuItem::new(t(cx, key))
+                    .icon(icon)
+                    .disabled(disabled)
+                    .on_click(move |_, _, cx| {
+                        layout(
+                            LayoutAction::Reorder {
+                                name: name.clone(),
+                                position,
+                            },
+                            cx,
+                        )
+                    }),
+            );
+        }
+        menu = menu.separator();
         for (key, left) in [("tabs.split.left", true), ("tabs.split.right", false)] {
             let name = name.clone();
             menu = menu.item(
@@ -417,6 +488,21 @@ pub(crate) fn opened_notes(
 
 #[cfg(test)]
 mod tests {
+    #[::core::prelude::v1::test]
+    fn move_positions_preserve_order_and_boundaries() {
+        use super::{MovePosition::*, move_index};
+        assert_eq!(move_index(4, 2, First), 0);
+        assert_eq!(move_index(4, 2, Previous), 1);
+        assert_eq!(move_index(4, 2, Next), 3);
+        assert_eq!(move_index(4, 1, Last), 3);
+        assert_eq!(move_index(4, 0, Previous), 0);
+        assert_eq!(move_index(4, 3, Next), 3);
+        let mut names = vec!["a", "b", "c", "d"];
+        let item = names.remove(1);
+        names.insert(move_index(4, 1, Last), item);
+        assert_eq!(names, vec!["a", "c", "d", "b"]);
+    }
+
     use super::*;
     #[::core::prelude::v1::test]
     fn closing_respects_order_and_boundaries() {

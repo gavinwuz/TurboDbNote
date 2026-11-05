@@ -496,7 +496,7 @@ impl NoteLibrary {
         }
     }
     pub fn new_note(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.create_note(None, window, cx);
+        self.create_note(None, String::new(), window, cx);
     }
     pub fn new_table_query(
         &mut self,
@@ -528,11 +528,12 @@ impl NoteLibrary {
             });
             return;
         }
-        self.create_note(Some(target), window, cx);
+        self.create_note(Some(target), String::new(), window, cx);
     }
     fn create_note(
         &mut self,
         target: Option<crate::database::OpenTable>,
+        project: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -546,6 +547,8 @@ impl NoteLibrary {
         self.opening = true;
         let query_open = target.is_some();
         let mut note = Note::new("");
+        note.project = project.clone();
+        self.collapsed.remove(&project);
         note.cells.push(Cell::new(
             "",
             CellContent::Sql {
@@ -769,16 +772,8 @@ impl NoteLibrary {
             .into_any_element()
     }
 }
-fn entry_title(entry: &Entry, cx: &App) -> String {
-    if !entry.title.trim().is_empty() {
-        return entry.title.clone();
-    }
-    let stem = entry.path.file_stem().unwrap_or_default().to_string_lossy();
-    if uuid::Uuid::parse_str(&stem).is_ok() {
-        t(cx, "notes.legacy_title").to_string()
-    } else {
-        stem.into_owned()
-    }
+fn entry_title(entry: &Entry, _: &App) -> String {
+    crate::notebook::file_title(&entry.path)
 }
 impl Render for NoteLibrary {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -839,7 +834,10 @@ impl Render for NoteLibrary {
             }
             let target = group.clone();
             let drag = group.clone();
-            list = list.child(
+            let project = group.clone();
+            let library = cx.entity().downgrade();
+            list = list.child(crate::context_menu::scoped(
+                SharedString::from(format!("note-project-context-{group}")),
                 div()
                     .id(SharedString::from(format!("note-project-row-{group}")))
                     .h_flex()
@@ -886,7 +884,34 @@ impl Render for NoteLibrary {
                                 }),
                         )
                     }),
-            );
+                move |menu, _, cx| {
+                    let library = library.clone();
+                    let project = project.clone();
+                    let disabled = library
+                        .read_with(cx, |this, _| {
+                            !this.ready
+                                || this.loading
+                                || this.opening
+                                || this.documents.len() >= 16
+                                || this.index.entries.len() >= 2000
+                        })
+                        .unwrap_or(true);
+                    menu.item(
+                        PopupMenuItem::new(t(cx, "notes.new"))
+                            .icon(IconName::Plus)
+                            .disabled(disabled)
+                            .on_click(move |_, window, cx| {
+                                let library = library.clone();
+                                let project = project.clone();
+                                window.defer(cx, move |window, cx| {
+                                    let _ = library.update(cx, |this, cx| {
+                                        this.create_note(None, project, window, cx)
+                                    });
+                                });
+                            }),
+                    )
+                },
+            ));
             if !folded {
                 for entry in entries {
                     let path = entry.path.clone();
@@ -916,18 +941,13 @@ impl Render for NoteLibrary {
                             for (action, key, icon) in [
                                 (
                                     crate::notebook::FileAction::RenameFile,
-                                    "notes.rename_file",
+                                    "notes.rename",
                                     IconName::File,
                                 ),
                                 (
                                     crate::notebook::FileAction::ExportSql,
                                     "notes.export_sql",
                                     IconName::ExternalLink,
-                                ),
-                                (
-                                    crate::notebook::FileAction::Rename,
-                                    "notes.rename",
-                                    IconName::ALargeSmall,
                                 ),
                                 (
                                     crate::notebook::FileAction::SaveAs,

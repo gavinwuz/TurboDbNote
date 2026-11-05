@@ -231,13 +231,10 @@ pub fn create_dated(
             next = next.max(n.saturating_add(1));
         }
     }
-    let generated = note.title.trim().is_empty();
     for _ in 0..64 {
         let name = format!("{prefix}{next}");
         let path = directory.join(format!("{name}.note"));
-        if generated {
-            note.title = format!("笔记-{date}-{next}");
-        }
+        note.title = name;
         match save(&path, &note, None) {
             Ok(hash) => return Ok((path, Loaded { note, hash })),
             Err(_) if path.exists() => next = next.saturating_add(1),
@@ -310,7 +307,7 @@ mod tests {
         let before = fs::read(&first).unwrap();
         let (table, loaded) = create_dated(root.path(), "261022", Note::new("cq_user")).unwrap();
         assert_eq!(table.file_name().unwrap(), "cq_user-261022-2.note");
-        assert_eq!(loaded.note.title, "cq_user");
+        assert_eq!(loaded.note.title, "cq_user-261022-2");
         fs::remove_file(table).unwrap();
         let (next, _) = create_dated(root.path(), "261023", Note::new("")).unwrap();
         assert_eq!(next.file_name().unwrap(), "笔记-261023-1.note");
@@ -318,7 +315,7 @@ mod tests {
         assert!(create_dated(root.path(), "../bad", Note::new("")).is_err());
     }
     #[test]
-    fn readable_title_names_preserve_title_and_remove_windows_path_punctuation() {
+    fn generated_names_match_sanitized_file_stems() {
         let root = tempfile::tempdir().unwrap();
         let title = "师徒 · 131.165:3306 / 查询";
         let (path, loaded) = create_dated(root.path(), "261026", Note::new(title)).unwrap();
@@ -328,7 +325,10 @@ mod tests {
                 .to_string_lossy()
                 .starts_with("师徒 · 131.165-3306 - 查询-261026-")
         );
-        assert_eq!(loaded.note.title, title);
+        assert_eq!(
+            loaded.note.title,
+            path.file_stem().unwrap().to_string_lossy()
+        );
         assert_eq!(path.parent().unwrap(), root.path());
     }
     #[test]

@@ -10,6 +10,8 @@ use sqlparser::{
 };
 use std::{collections::BTreeSet, ops::ControlFlow, time::Instant};
 
+#[path = "mysql_maintenance.rs"]
+pub(super) mod mysql_maintenance;
 #[path = "notebook_grid.rs"]
 mod result_grid;
 pub use result_grid::{GridAction, GridSource, grid_request, query_table_name};
@@ -202,7 +204,24 @@ fn parse_for(kind: DatabaseKind, sql: &str, script: bool) -> Result<Statement, S
         .with_recursion_limit(64)
         .try_with_sql(sql)
         .and_then(|mut p| p.parse_statements())
-        .map_err(|_| "SQL 语法或复杂度暂不受支持，请检查当前数据库方言")?;
+        .map_err(|error| {
+            let text = error.to_string();
+            let coordinate = |label: &str| {
+                text.split_once(label).and_then(|(_, tail)| {
+                    tail.chars()
+                        .take_while(char::is_ascii_digit)
+                        .collect::<String>()
+                        .parse::<u32>()
+                        .ok()
+                })
+            };
+            match (coordinate("Line: "), coordinate("Column: ")) {
+                (Some(line), Some(column)) if line > 0 && column > 0 => {
+                    format!("notes.sql_parse_location:{line}:{column}")
+                }
+                _ => "notes.sql_parse_failed".to_string(),
+            }
+        })?;
     if statements.len() != 1 {
         return Err("每个 SQL 子区域一次执行一条语句，请将多条命令拆分到不同区域".into());
     }
@@ -363,6 +382,11 @@ pub fn validate_script_statement(kind: DatabaseKind, sql: &str) -> Result<bool, 
         sql
     };
     if kind == DatabaseKind::MySql
+        && let Some(command) = mysql_maintenance::classify(sql)
+    {
+        return Ok(command.read);
+    }
+    if kind == DatabaseKind::MySql
         && (workbench::script_context::keys_target(sql)?.is_some()
             || workbench::script_context::drop_trigger_target(sql)?.is_some())
     {
@@ -381,6 +405,11 @@ pub fn validate_script_statement(kind: DatabaseKind, sql: &str) -> Result<bool, 
             return Err("script.error.control".into());
         }
         return Ok(false);
+    }
+    if kind == DatabaseKind::MySql
+        && let Some(command) = mysql_maintenance::classify(sql)
+    {
+        return Ok(command.read);
     }
     if mysql_metadata(kind, sql) {
         return Ok(true);
@@ -417,6 +446,14 @@ pub fn validate_script_target(kind: DatabaseKind, sql: &str, database: &str) -> 
         super::clickhouse_sql::classify(sql, database)?;
         return Ok(());
     }
+    if kind == DatabaseKind::MySql
+        && let Some(command) = mysql_maintenance::classify(sql)
+    {
+        for parts in command.tables {
+            object(kind, database, &parts).map_err(|_| "script.error.database_mismatch")?;
+        }
+        return Ok(());
+    }
     workbench::script_context::validate_target(kind, sql, database)?;
     if kind == DatabaseKind::MySql {
         let expanded = workbench::script_context::expand(sql, None)?;
@@ -432,6 +469,12 @@ pub fn validate_script_target(kind: DatabaseKind, sql: &str, database: &str) -> 
                 return Err("script.error.control".into());
             }
             for parts in info.tables {
+                object(kind, database, &parts).map_err(|_| "script.error.database_mismatch")?;
+            }
+            return Ok(());
+        }
+        if let Some(command) = mysql_maintenance::classify(&expanded) {
+            for parts in command.tables {
                 object(kind, database, &parts).map_err(|_| "script.error.database_mismatch")?;
             }
             return Ok(());
@@ -543,6 +586,12 @@ async fn stamp(
 }
 /// Application command categories are not server grants; preparation remains mandatory.
 pub const COMMANDS: &[(&str, &str, bool)] = &[
+    ("mysql_dba_read", "MySQL DBA diagnostics", false),
+    (
+        "mysql_dba_write",
+        "MySQL maintenance / replication control",
+        false,
+    ),
     ("select", "SELECT", true),
     ("explain", "EXPLAIN", true),
     ("insert", "INSERT", false),
@@ -628,6 +677,13 @@ pub fn script_operation_label(sql: &str) -> &'static str {
 pub fn script_command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
     if kind == DatabaseKind::MySql {
         let expanded = workbench::script_context::expand(sql, None).ok()?;
+        if let Some(command) = mysql_maintenance::classify(&expanded) {
+            return Some(if command.read {
+                "mysql_dba_read"
+            } else {
+                "mysql_dba_write"
+            });
+        }
         if let Some((_, locked)) = workbench::script_context::variable_select(&expanded).ok()? {
             return validate_script_statement(kind, sql).ok().map(|_| {
                 if locked {
@@ -706,6 +762,15 @@ pub fn command_required(kind: DatabaseKind, sql: &str) -> Option<&'static str> {
             .ok()
             .map(|c| c.permission);
     }
+    if kind == DatabaseKind::MySql
+        && let Some(command) = mysql_maintenance::classify(sql)
+    {
+        return Some(if command.read {
+            "mysql_dba_read"
+        } else {
+            "mysql_dba_write"
+        });
+    }
     if let Some(key) = extension_required(kind, sql) {
         return Some(key);
     }
@@ -770,6 +835,23 @@ pub fn extension_required(kind: DatabaseKind, sql: &str) -> Option<&'static str>
         _ => return None,
     };
     let suffix = &tokens[index + 1..];
+    if suffix
+        .first()
+        .is_some_and(|t| word(t).as_deref() == Some("WHERE"))
+    {
+        if sql.contains('\\') {
+            return None;
+        }
+
+        let predicate = suffix[1..]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let query = format!("SELECT 1 WHERE {predicate}");
+        let safe = matches!(parse(kind,&query).and_then(|stmt|inspect(&stmt,kind)),Ok(info) if !info.writes && !info.functions && info.tables.is_empty());
+        return safe.then_some(category);
+    }
     if suffix.is_empty()
         || matches!(suffix, [like, Token::SingleQuotedString(_)] if word(like).as_deref() == Some("LIKE") && !sql.contains('\\'))
     {
@@ -801,6 +883,9 @@ fn mysql_metadata(kind: DatabaseKind, sql: &str) -> bool {
     }
     fn keyword(token: Option<&Token>, word: &str) -> bool {
         matches!(token, Some(Token::Word(w)) if w.quote_style.is_none() && w.value.eq_ignore_ascii_case(word))
+    }
+    if mysql_maintenance::classify(sql).is_some_and(|c| c.read) {
+        return true;
     }
     if extension_required(kind, sql).is_some() {
         return true;
@@ -889,6 +974,23 @@ async fn prepare_inner(
     if kind == DatabaseKind::ClickHouse {
         return super::clickhouse_sql::prepare(c, database, sql).await;
     }
+    if kind == DatabaseKind::MySql
+        && let Some(command) = mysql_maintenance::classify(sql)
+        && !command.read
+    {
+        let mut guards = vec![];
+        for parts in command.tables {
+            let object = resolved_object(c, kind, database, &parts).await?;
+            let stamp = stamp(c, kind, database, &object).await?;
+            guards.push(Guard { object, stamp });
+        }
+        return Ok(Plan {
+            sql: sql.trim().into(),
+            read_only: false,
+            confirm: true,
+            guards,
+        });
+    }
     if mysql_metadata(kind, sql) {
         return Ok(Plan {
             sql: sql.trim().into(),
@@ -938,9 +1040,14 @@ pub async fn prepare_script(
     } else {
         sql.into()
     };
+    if kind == DatabaseKind::MySql && mysql_maintenance::classify(&expanded).is_some() {
+        return prepare_inner(c, kind, database, version, &expanded, true).await;
+    }
     let empty = expanded.trim().trim_matches(';').trim().is_empty();
     if empty
-        || kind == DatabaseKind::MySql && workbench::script_context::control(&expanded)?.is_some()
+        || kind == DatabaseKind::MySql
+            && mysql_maintenance::classify(&expanded).is_none()
+            && workbench::script_context::control(&expanded)?.is_some()
     {
         if !empty && !crate::mysql::modern_version(version) {
             return Err("script.error.legacy".into());
@@ -1263,7 +1370,9 @@ pub async fn execute_script(
     };
     let empty = expanded.trim().trim_matches(';').trim().is_empty();
     if empty
-        || kind == DatabaseKind::MySql && workbench::script_context::control(&expanded)?.is_some()
+        || kind == DatabaseKind::MySql
+            && mysql_maintenance::classify(&expanded).is_none()
+            && workbench::script_context::control(&expanded)?.is_some()
     {
         let started = Instant::now();
         if plan.confirm && !confirmed {
@@ -1376,6 +1485,33 @@ async fn execute_inner(
     let (offset, size) = page;
     if kind == DatabaseKind::ClickHouse {
         return super::clickhouse_sql::execute(c, database, plan, confirmed, page).await;
+    }
+    if kind == DatabaseKind::MySql
+        && let Some(command) = mysql_maintenance::classify(&plan.sql)
+        && !command.read
+    {
+        if plan.read_only || !plan.confirm || !confirmed || offset != 0 {
+            return Err("notes.metadata.invalid".into());
+        }
+        for guard in &plan.guards {
+            if stamp(c, kind, database, &guard.object).await? != guard.stamp {
+                return Err("notes.preview_changed".into());
+            }
+        }
+        if command.tables.len() != plan.guards.len()
+            || command
+                .tables
+                .iter()
+                .zip(&plan.guards)
+                .any(|(parts, guard)| {
+                    object(kind, database, parts).map_or(true, |target| target != guard.object)
+                })
+        {
+            return Err("notes.preview_changed".into());
+        }
+        let mut result = metadata_result(c, &plan.sql).await?;
+        result.read_only = false;
+        return Ok(result);
     }
     if mysql_metadata(kind, &plan.sql) {
         if !plan.read_only || !plan.guards.is_empty() || offset != 0 {
@@ -1580,7 +1716,148 @@ async fn execute_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mysql_dba_diagnostics_and_where_filters_are_shared_by_all_note_paths() {
+        use crate::{DatabaseKind, access_mode::AccessMode};
+        let statements = [
+            "SHOW VARIABLES WHERE Variable_name IN ('datadir','log_bin_basename','log_bin_index','log_error','innodb_data_home_dir','innodb_log_group_home_dir')",
+            "SELECT NOW() AS checked_at, @@GLOBAL.binlog_format AS binlog_format, @@GLOBAL.binlog_row_image AS global_row_image, @@SESSION.binlog_row_image AS session_row_image",
+            "SHOW MASTER STATUS",
+            "SHOW BINARY LOG STATUS",
+            "SHOW BINARY LOGS",
+            "SHOW REPLICA STATUS",
+            "SHOW FULL PROCESSLIST",
+            "SHOW ENGINE INNODB STATUS",
+        ];
+        for sql in statements {
+            assert!(
+                super::command_required(DatabaseKind::MySql, sql).is_some(),
+                "{sql}"
+            );
+            assert_eq!(
+                super::validate_script_statement(DatabaseKind::MySql, sql),
+                Ok(true),
+                "{sql}"
+            );
+            assert!(
+                super::validate_script_target(DatabaseKind::MySql, sql, "fixture").is_ok(),
+                "{sql}"
+            );
+            assert!(super::note_mode_allows(
+                AccessMode::Admin,
+                DatabaseKind::MySql,
+                sql,
+                true
+            ));
+        }
+        for sql in [
+            "SHOW BINARY LOGS",
+            "FLUSH LOGS",
+            "KILL QUERY 42",
+            "STOP REPLICA",
+            "ANALYZE TABLE fixture.items",
+        ] {
+            assert!(!super::note_mode_allows(
+                AccessMode::ReadWrite,
+                DatabaseKind::MySql,
+                sql,
+                true
+            ));
+            assert!(super::note_mode_allows(
+                AccessMode::Admin,
+                DatabaseKind::MySql,
+                sql,
+                true
+            ));
+        }
+        assert!(
+            super::extension_required(DatabaseKind::MySql, "SHOW VARIABLES WHERE evil() = 1")
+                .is_none()
+        );
+        assert!(
+            super::command_required(DatabaseKind::MySql, "SHOW BINARY LOGS; DROP TABLE x")
+                .is_none()
+        );
+        assert!(
+            super::validate_script_target(
+                DatabaseKind::MySql,
+                "CHECK TABLE other.items",
+                "fixture"
+            )
+            .is_err()
+        );
+    }
+
     use super::*;
+    #[test]
+    fn maintenance_writes_require_confirmation_and_keep_result_rows() {
+        struct Capture(Vec<String>);
+        impl Access for Capture {
+            fn query<'a>(&'a mut self, sql: &'a str) -> workbench::Query<'a> {
+                Box::pin(async move {
+                    self.0.push(sql.into());
+                    Ok(Rows {
+                        columns: vec!["Status".into()],
+                        values: vec![vec![Some("ok".into())]],
+                    })
+                })
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            for sql in [
+                "FLUSH LOGS",
+                "KILL QUERY 42",
+                "STOP REPLICA",
+                "SET GLOBAL binlog_row_image = 'FULL'",
+            ] {
+                let mut db = Capture(vec![]);
+                let plan = prepare(&mut db, DatabaseKind::MySql, "fixture", "8.0.36", sql)
+                    .await
+                    .unwrap();
+                assert!(plan.confirm && !plan.read_only && db.0.is_empty());
+                assert!(
+                    execute_inner(
+                        &mut db,
+                        DatabaseKind::MySql,
+                        "fixture",
+                        "8.0.36",
+                        &plan,
+                        false,
+                        (0, 20),
+                        false
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(db.0.is_empty());
+                let page = execute_inner(
+                    &mut db,
+                    DatabaseKind::MySql,
+                    "fixture",
+                    "8.0.36",
+                    &plan,
+                    true,
+                    (0, 20),
+                    false,
+                )
+                .await
+                .unwrap();
+                assert!(!page.read_only);
+                assert_eq!(page.rows.values[0][0].as_deref(), Some("ok"));
+                assert_eq!(db.0, vec![sql]);
+                assert_eq!(
+                    validate_script_statement(DatabaseKind::MySql, sql),
+                    Ok(false)
+                );
+                assert!(script_requires_confirmation(DatabaseKind::MySql, sql, false).unwrap());
+            }
+        });
+    }
+
     #[test]
     fn mysql_script_create_counts_distinguish_created_and_skipped_tables() {
         struct Mock {

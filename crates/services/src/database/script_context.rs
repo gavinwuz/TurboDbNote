@@ -276,6 +276,9 @@ pub fn variable_select(sql: &str) -> Result<Option<(String, bool)>, String> {
     )))
 }
 pub fn control(sql: &str) -> Result<Option<Control>, String> {
+    if super::super::notebook_query::mysql_maintenance::classify(sql).is_some() {
+        return Ok(None);
+    }
     let ts = tokens(sql)?;
     let words = ts
         .iter()

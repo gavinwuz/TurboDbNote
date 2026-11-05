@@ -93,7 +93,7 @@ fn main() {
             px(preferences.general.font_size.clamp(12., 24.));
         cx.set_global(locale::Locale::load(preferences.general.language.clone()));
         let events = cx.new(|_| tabs::TabEvents);
-        cx.set_global(tabs::TabRouter(events, 1, vec![]));
+        cx.set_global(tabs::TabRouter(events, 1, vec![], vec![]));
         let _ =
             turbodbn_services::timeout_policy::configure(preferences.database.timeout_defaults());
         cx.set_global(preferences);

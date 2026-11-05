@@ -1517,6 +1517,11 @@ impl InputState {
         }
     }
 
+    /// Start a fresh undo group around an explicit editing command.
+    pub fn break_undo_group(&mut self) {
+        self.history.break_group();
+    }
+
     fn push_history(&mut self, text: &Rope, range: &Range<usize>, new_text: &str) {
         if self.history.ignore {
             return;

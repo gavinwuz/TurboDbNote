@@ -1,4 +1,5 @@
 use super::*;
+actions!(note_sql, [ToggleComments]);
 impl CellView {
     pub(super) fn execution_sql(
         &mut self,
@@ -27,8 +28,8 @@ impl CellView {
         ) {
             Ok(value) => value,
             Err(error) => {
-                feedback::error(crate::locale::message(cx, &error), cx);
-                self.finish_batch(false, cx);
+                let token = self.query.begin();
+                self.failed(token, error, cx);
                 return None;
             }
         };
@@ -130,8 +131,8 @@ impl CellView {
                 let script = match result {
                     Ok(script) => script,
                     Err(error) => {
-                        feedback::error(crate::locale::message(cx, &error), cx);
-                        this.finish_batch(false, cx);
+                        let token = this.query.begin();
+                        this.failed(token, error, cx);
                         return;
                     }
                 };
@@ -176,5 +177,146 @@ impl CellView {
             });
         }));
         cx.notify();
+    }
+}
+
+/// Toggle whole selected lines, leaving a trailing boundary line untouched.
+fn comment_edit(
+    source: &str,
+    selection: std::ops::Range<usize>,
+) -> (std::ops::Range<usize>, String) {
+    let start = source[..selection.start].rfind('\n').map_or(0, |n| n + 1);
+    let last = if selection.end > selection.start && source[..selection.end].ends_with('\n') {
+        selection.end - 1
+    } else {
+        selection.end
+    };
+    let end = source[last..].find('\n').map_or(source.len(), |n| last + n);
+    let block = &source[start..end];
+    if selection.is_empty() && block.trim().is_empty() {
+        let indent = block.trim_end_matches('\r');
+        return (
+            start..end,
+            format!(
+                "{indent}-- {}",
+                if block.ends_with('\r') { "\r" } else { "" }
+            ),
+        );
+    }
+    let uncomment = block
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .all(|line| line.trim_start().starts_with("-- ") || line.trim_start() == "--");
+    let text = block
+        .split('\n')
+        .map(|line| {
+            let indent = line.len() - line.trim_start_matches([' ', '\t']).len();
+            let (spaces, body) = line.split_at(indent);
+            if body.trim().is_empty() {
+                return line.to_string();
+            }
+            if uncomment {
+                format!(
+                    "{spaces}{}",
+                    body.strip_prefix("-- ")
+                        .or_else(|| body.strip_prefix("--"))
+                        .unwrap_or(body)
+                )
+            } else {
+                format!("{spaces}-- {body}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (start..end, text)
+}
+impl CellView {
+    pub(super) fn toggle_sql_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor.update(cx, |input, cx| {
+            if input.marked_text_range(window, cx).is_some() {
+                return;
+            }
+            let source = input.value();
+            let selection = input.selection_byte_range();
+            let (range, text) = comment_edit(&source, selection.clone());
+            let utf16 = source[..range.start].encode_utf16().count()
+                ..source[..range.end].encode_utf16().count();
+            input.break_undo_group();
+            input.replace_text_in_range(Some(utf16), &text, window, cx);
+            input.break_undo_group();
+            if selection.is_empty() {
+                let caret = (selection.start as isize + text.len() as isize
+                    - (range.end - range.start) as isize)
+                    .max(range.start as isize) as usize;
+                input.select_byte_range(
+                    caret.min(range.start + text.len())..caret.min(range.start + text.len()),
+                    window,
+                    cx,
+                );
+            } else {
+                input.select_byte_range(range.start..range.start + text.len(), window, cx);
+            }
+        });
+    }
+}
+#[cfg(test)]
+mod comment_tests {
+    use super::comment_edit;
+    #[test]
+    fn rapid_explicit_edits_have_independent_undo_steps() {
+        #[derive(Clone, PartialEq)]
+        struct Item(usize);
+        impl gpui_component::history::HistoryItem for Item {
+            fn version(&self) -> usize {
+                self.0
+            }
+            fn set_version(&mut self, version: usize) {
+                self.0 = version;
+            }
+        }
+        let mut history = gpui_component::history::History::new()
+            .group_interval(std::time::Duration::from_secs(60));
+        history.push(Item(0));
+        history.break_group();
+        history.push(Item(0));
+        history.break_group();
+        history.push(Item(0));
+        assert_eq!(history.undo().unwrap().len(), 1);
+        assert_eq!(history.undo().unwrap().len(), 1);
+        assert_eq!(history.undo().unwrap().len(), 1);
+    }
+    #[test]
+    fn shortcut_is_scoped_to_sql_editor_input() {
+        let predicate = gpui::KeyBindingContextPredicate::parse("NoteSql > Input").unwrap();
+        let sql = [
+            gpui::KeyContext::parse("NoteSql").unwrap(),
+            gpui::KeyContext::parse("Input").unwrap(),
+        ];
+        assert!(predicate.eval_inner(&sql, &sql));
+        for name in ["NoteMarkdown", "Workspace", "Settings"] {
+            let contexts = [
+                gpui::KeyContext::parse(name).unwrap(),
+                gpui::KeyContext::parse("Input").unwrap(),
+            ];
+            assert!(!predicate.eval_inner(&contexts, &contexts));
+        }
+    }
+    #[test]
+    fn comments_preserve_unicode_crlf_indent_and_selection_boundary() {
+        let source = "  SELECT '中文';\r\n\tSELECT 2;\r\nSELECT 3;";
+        let end = source.find("SELECT 3").unwrap();
+        let (range, commented) = comment_edit(source, 0..end);
+        assert_eq!(commented, "  -- SELECT '中文';\r\n\t-- SELECT 2;\r");
+        let (_, restored) = comment_edit(&commented, 0..commented.len());
+        assert_eq!(restored, &source[range]);
+    }
+    #[test]
+    fn blank_line_can_be_commented() {
+        assert_eq!(comment_edit("", 0..0).1, "-- ");
+        assert_eq!(comment_edit("  \r\n", 2..2).1, "  -- \r");
+    }
+    #[test]
+    fn mixed_selection_comments_all_lines_in_one_edit() {
+        assert_eq!(comment_edit("-- one\ntwo", 0..10).1, "-- -- one\n-- two");
     }
 }

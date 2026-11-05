@@ -4,6 +4,14 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Create a new Note from a project context menu and persist the clicked project before the first file save.
+
+- Unify Note names with file stems and merge rename actions; keep existing files intact until normal save. Compact center tabs from measured pane width, emphasize active selection, and add in-place context-menu ordering with preserved focus and persisted order.
+
+- Generate account/endpoint connection names with numeric collision suffixes, include usernames in selector details, validate duplicate saved names, and copy password-free connection URLs from connection menus.
+
+- Add shared MySQL Note DBA diagnostics and bounded maintenance commands, SHOW WHERE filters, derived SQL-file index refresh, in-cell SQL failure locations without duplicate error toasts, and Ctrl+/ line-comment toggling. Server versions and privileges still apply; destructive reset/purge and arbitrary commands remain unsupported.
+
 ## [0.1.6] - 2026-11-03
 
 - Unify Note cell action alignment across reading, editing and collapsed states. Show secondary actions as a complete group when space permits, overflow them together on narrow views, and prevent long collapsed summaries from overlapping controls.

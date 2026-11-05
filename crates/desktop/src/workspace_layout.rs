@@ -77,6 +77,7 @@ impl Workspace {
     pub(super) fn rebuild_center(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.reconcile_center();
         cx.global_mut::<crate::tabs::TabRouter>().1 = self.center_groups.len();
+        cx.global_mut::<crate::tabs::TabRouter>().3 = self.center_groups.clone();
         let active_panels = self
             .center_views
             .iter()
@@ -99,6 +100,7 @@ impl Workspace {
             let item =
                 DockItem::tabs_with_active(panels, active, &self.dock.downgrade(), window, cx);
             if let DockItem::Tabs { view, .. } = &item {
+                view.update(cx, |tabs, cx| tabs.set_compact_tabs(true, cx));
                 self.center_views.push(view.clone());
             }
             items.push(item);
@@ -202,6 +204,37 @@ impl Workspace {
                 }
                 self.center_groups[pane].push(name);
                 self.active_center = pane;
+            }
+            LayoutAction::Reorder { name, position } => {
+                if crate::tabs::is_fixed(&name) {
+                    return;
+                }
+                let Some(pane) = self.center_groups.iter().position(|g| g.contains(&name)) else {
+                    return;
+                };
+                let group = &mut self.center_groups[pane];
+                let Some(index) = group.iter().position(|n| n == &name) else {
+                    return;
+                };
+                let target = crate::tabs::move_index(group.len(), index, position);
+                if index == target {
+                    return;
+                }
+                let name = group.remove(index);
+                group.insert(target, name.clone());
+                if let Some(panel) = self.panel_for(&name, cx)
+                    && let Some(tabs) = self.center_views.get(pane)
+                {
+                    tabs.update(cx, |tabs, cx| {
+                        tabs.reorder_panel(panel.view().entity_id(), target, cx)
+                    });
+                }
+                self.center_order = self.center_groups.iter().flatten().cloned().collect();
+                self.restored_center = self.center_groups.clone();
+                cx.global_mut::<TabRouter>().3 = self.center_groups.clone();
+                self.save_center_layout(cx);
+                cx.notify();
+                return;
             }
             LayoutAction::Move { from, to } => {
                 if from == to || crate::tabs::is_fixed(&from) || crate::tabs::is_fixed(&to) {
@@ -522,6 +555,7 @@ impl Workspace {
         .detach();
     }
     pub(super) fn save_center_layout(&mut self, cx: &mut Context<Self>) {
+        cx.global_mut::<TabRouter>().3 = self.center_groups.clone();
         if !self.layout_ready || self.layout_error {
             return;
         }

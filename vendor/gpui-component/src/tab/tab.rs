@@ -1,11 +1,11 @@
 use std::rc::Rc;
 
-use crate::{h_flex, ActiveTheme, Icon, IconName, Selectable, Sizable, Size, StyledExt};
+use crate::{ActiveTheme, Icon, IconName, Selectable, Sizable, Size, StyledExt, h_flex};
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    div, px, relative, AnyElement, App, ClickEvent, Div, Edges, ElementId, Hsla,
-    InteractiveElement, IntoElement, ParentElement, Pixels, RenderOnce, SharedString,
-    StatefulInteractiveElement, Styled, Window,
+    AnyElement, App, ClickEvent, Div, Edges, ElementId, Hsla, InteractiveElement, IntoElement,
+    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, Styled, Window,
+    div, px, relative,
 };
 
 /// Tab variants.
@@ -393,6 +393,7 @@ pub struct Tab {
     size: Size,
     pub(super) disabled: bool,
     pub(super) selected: bool,
+    accent_selected: bool,
     on_click: Option<Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
 }
 
@@ -436,6 +437,7 @@ impl Default for Tab {
             children: Vec::new(),
             disabled: false,
             selected: false,
+            accent_selected: false,
             prefix: None,
             suffix: None,
             variant: TabVariant::default(),
@@ -449,6 +451,12 @@ impl Tab {
     /// Create a new tab with a label.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Strong editor selection cues, independent from the surrounding dock theme.
+    pub fn accent_selected(mut self, enabled: bool) -> Self {
+        self.accent_selected = enabled;
+        self
     }
 
     /// Set label for the tab.
@@ -572,6 +580,12 @@ impl RenderOnce for Tab {
         } else {
             self.variant.normal(cx)
         };
+        if self.accent_selected && self.selected {
+            tab_style.bg = cx.theme().primary.opacity(0.12);
+            tab_style.fg = cx.theme().primary;
+            tab_style.border_color = cx.theme().primary;
+            tab_style.borders.bottom = px(2.);
+        }
         let mut hover_style = self.variant.hovered(self.selected, cx);
         if self.disabled {
             tab_style = self.variant.disabled(self.selected, cx);
@@ -627,7 +641,7 @@ impl RenderOnce for Tab {
                     .justify_center()
                     .overflow_hidden()
                     .margins(inner_margins)
-                    .flex_shrink_0()
+                    .min_w_0()
                     .map(|this| match self.icon {
                         Some(icon) => {
                             this.w(inner_height * 1.25)

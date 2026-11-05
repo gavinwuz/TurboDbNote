@@ -15,7 +15,7 @@ pub const MAX_SQL_BYTES: usize = notebook_query::SCRIPT_MAX_BYTES;
 pub const PAGE_SIZE: u64 = 6;
 const HEADER: u64 = 80;
 const RECORD: u64 = 32;
-const MAGIC: &[u8; 8] = b"TDBSQL04";
+const MAGIC: &[u8; 8] = b"TDBSQL05";
 pub fn kind(dialect: SqlDialect) -> DatabaseKind {
     match dialect {
         SqlDialect::MySql => DatabaseKind::MySql,
@@ -1129,7 +1129,11 @@ pub fn refresh(note: &Path, script: &SqlScript, cancel: &AtomicBool) -> Result<S
     if &magic == MAGIC {
         return Ok(script.clone());
     }
-    if &magic != b"TDBSQL01" && &magic != b"TDBSQL02" && &magic != b"TDBSQL03" {
+    if &magic != b"TDBSQL01"
+        && &magic != b"TDBSQL02"
+        && &magic != b"TDBSQL03"
+        && &magic != b"TDBSQL04"
+    {
         return Err("script.error.resource".into());
     }
     drop(index);

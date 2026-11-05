@@ -126,6 +126,8 @@ pub struct CellView {
     elapsed: u64,
     operation: Option<(Uuid, std::time::Instant)>,
     notice: String,
+    failure_line: usize,
+    failure_stage: &'static str,
     note_name: String,
     policy_help: bool,
     grid: Entity<TableState<QueryGrid>>,
@@ -545,6 +547,8 @@ impl CellView {
             elapsed: 0,
             operation: None,
             notice: String::new(),
+            failure_line: 1,
+            failure_stage: "script.failure.prepare",
             note_name: String::new(),
             policy_help: false,
             grid,
@@ -1656,6 +1660,24 @@ impl CellView {
             Action::NoteExecute { plan, .. } => Some(plan.sql.as_str()),
             _ => None,
         };
+        self.failure_stage = if matches!(&action, Action::NoteExecute { .. }) {
+            "script.failure.execute"
+        } else {
+            "script.failure.prepare"
+        };
+        if let Some(sql) = sql {
+            let source = self.editor.read(cx).value();
+            let selection = self.editor.read(cx).selection_byte_range();
+            let offset = if source
+                .get(selection.clone())
+                .is_some_and(|s| s.trim() == sql.trim())
+            {
+                selection.start
+            } else {
+                source.find(sql).unwrap_or(0)
+            };
+            self.failure_line = source[..offset].bytes().filter(|b| *b == b'\n').count() + 1;
+        }
         if let Some(advice) = sql.and_then(|sql| {
             crate::note_permissions::Advice::for_sql(
                 self.access_mode,
@@ -1665,8 +1687,22 @@ impl CellView {
                 cx,
             )
         }) {
-            self.finish_batch(false, cx);
-            cx.emit(CellEvent::PermissionBlocked(advice));
+            if matches!(advice, crate::note_permissions::Advice::Unsupported) {
+                let token = self.query.begin();
+                let reason = sql
+                    .and_then(|s| {
+                        turbodbn_services::database::notebook_query::validate_script_statement(
+                            saved.profile.kind,
+                            s,
+                        )
+                        .err()
+                    })
+                    .unwrap_or_else(|| "notes.sql_scope_unsupported".into());
+                self.failed(token, reason, cx);
+            } else {
+                self.finish_batch(false, cx);
+                cx.emit(CellEvent::PermissionBlocked(advice));
+            }
             return;
         }
         if self.execution_summary.take().is_some() {
@@ -1934,8 +1970,28 @@ impl CellView {
         cx.notify();
     }
     fn failed(&mut self, token: turbodbn_core::QueryToken, error: String, cx: &mut Context<Self>) {
-        self.policy_help = error == "notes.sql_scope_unsupported";
+        self.policy_help = false;
         let error = crate::locale::message(cx, &error).to_string();
+        let error = crate::locale::tr(
+            cx,
+            "notes.failure.inline",
+            &[
+                ("line", &self.failure_line.to_string()),
+                (
+                    "stage",
+                    &t(
+                        cx,
+                        if self.failure_stage == "script.failure.execute" {
+                            "script.failure.execute"
+                        } else {
+                            "script.failure.prepare"
+                        },
+                    ),
+                ),
+                ("reason", &error),
+            ],
+        )
+        .to_string();
         if !self.query.complete(token, Err(error.clone())) {
             return;
         }
@@ -1969,7 +2025,6 @@ impl CellView {
             Some(&error),
             cx,
         );
-        feedback::error(error, cx);
         self.finish_batch(false, cx);
         cx.notify();
     }
@@ -2940,6 +2995,21 @@ impl Render for CellView {
                     }
                 },
             ))
+            .capture_action(
+                cx.listener(|this, _: &sql_range::ToggleComments, window, cx| {
+                    if this.editing
+                        && this.cell.content.is_editable_sql()
+                        && this.editor.read(cx).focus_handle(cx).is_focused(window)
+                        && !this.working(cx)
+                        && !this.batch_locked
+                    {
+                        this.toggle_sql_comments(window, cx);
+                        cx.stop_propagation();
+                    } else {
+                        cx.propagate();
+                    }
+                }),
+            )
             .capture_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key.eq_ignore_ascii_case("f5")
                     && this.cell.content.is_editable_sql()
@@ -3149,22 +3219,25 @@ impl Render for CellView {
                 body = body.child(self.markdown_toolbar(cx));
             }
             body = body.child(
-                div().when(md, |el| el.key_context("NoteMarkdown")).child(
-                    Input::new(&self.editor)
-                        .disabled(busy || self.batch_locked)
-                        .appearance(false)
-                        .bordered(false)
-                        .focus_bordered(false)
-                        .line_height(px(22.))
-                        .h(px(if sql {
-                            self.editor_content_height
-                                .max(3. * 22.)
-                                .min(self.editor_height_limit - 16.)
-                                + 16.
-                        } else {
-                            lines as f32 * 22. + 16.
-                        })),
-                ),
+                div()
+                    .when(md, |el| el.key_context("NoteMarkdown"))
+                    .when(sql, |el| el.key_context("NoteSql"))
+                    .child(
+                        Input::new(&self.editor)
+                            .disabled(busy || self.batch_locked)
+                            .appearance(false)
+                            .bordered(false)
+                            .focus_bordered(false)
+                            .line_height(px(22.))
+                            .h(px(if sql {
+                                self.editor_content_height
+                                    .max(3. * 22.)
+                                    .min(self.editor_height_limit - 16.)
+                                    + 16.
+                            } else {
+                                lines as f32 * 22. + 16.
+                            })),
+                    ),
             );
             if sql {
                 let owner = cx.entity().downgrade();
@@ -3296,6 +3369,52 @@ impl Render for CellView {
                     ),
             );
         }
+        if let QueryStatus::Failed(_) = &self.query.status {
+            body = body.child(
+                div()
+                    .v_flex()
+                    .gap_2()
+                    .p_3()
+                    .border_1()
+                    .border_color(cx.theme().danger)
+                    .child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .items_start()
+                            .child(gpui_component::Icon::new(IconName::TriangleAlert))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .whitespace_normal()
+                                    .child(self.notice.clone()),
+                            ),
+                    )
+                    .child(
+                        Button::new("locate-note-sql-error")
+                            .ghost()
+                            .small()
+                            .icon(IconName::ArrowUp)
+                            .label(t(cx, "notes.failure.locate"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                let source = this.editor.read(cx).value();
+                                let offset = source
+                                    .match_indices('\n')
+                                    .nth(this.failure_line.saturating_sub(2))
+                                    .map_or(0, |(n, _)| n + 1);
+                                let offset = if this.failure_line <= 1 { 0 } else { offset };
+                                let editor = this.editor.clone();
+                                cx.emit(CellEvent::Edit);
+                                window.defer(cx, move |window, cx| {
+                                    editor.update(cx, |input, cx| {
+                                        input.select_byte_range(offset..offset, window, cx)
+                                    })
+                                });
+                            })),
+                    ),
+            );
+        }
         if self.execution_summary.is_some() {
             body = body.child(
                 div()
@@ -3381,6 +3500,8 @@ impl Render for CellView {
         }
         if self.batch_view.is_none()
             && self.results.is_none()
+            && (!matches!(self.query.status, QueryStatus::Failed(_))
+                || !self.grid.read(cx).delegate().rows.columns.is_empty())
             && sql
             && (self.execution_summary.is_none()
                 || !self.grid.read(cx).delegate().rows.columns.is_empty())
