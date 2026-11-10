@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-11-10
+
 - Let result headers ellipsize independently of content-based widths, keep narrow numeric columns compact, and fit full names/content by double-clicking a resize boundary.
 
 - Compact completion into measured name/type/comment columns with horizontal scrolling only on overflow; load missing connected-target metadata once with inline progress, and refresh sampled result widths while preserving explicit user sizes.
