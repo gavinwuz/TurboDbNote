@@ -7,7 +7,7 @@ use crate::{
 };
 use gpui::{prelude::*, *};
 use gpui_component::{
-    ActiveTheme, Disableable, IconName, StyledExt,
+    ActiveTheme, Disableable, IconName, StyledExt, WindowExt,
     button::{Button, ButtonVariants},
     input::{Input, InputState},
     menu::{ContextMenuExt, DropdownMenu, PopupMenuItem},
@@ -34,6 +34,7 @@ pub struct NoteLibrary {
     search: Entity<InputState>,
     collapsed: HashSet<String>,
     deleting: HashSet<PathBuf>,
+    unavailable: HashMap<PathBuf, String>,
     loading: bool,
     opening: bool,
     pending_file_action: Option<(PathBuf, crate::notebook::FileAction)>,
@@ -84,6 +85,11 @@ impl NoteLibrary {
                     continue;
                 };
                 let destination = destination.clone();
+                let task = uuid::Uuid::new_v4();
+                let started = std::time::Instant::now();
+                let _ = view.update(cx, |this, cx| {
+                    this.log_storage(task, crate::operation_log::Phase::Started, 0, None, cx)
+                });
                 let result = cx
                     .background_executor()
                     .spawn(async move {
@@ -96,6 +102,17 @@ impl NoteLibrary {
                     })
                     .await;
                 let _ = view.update(cx, |this, cx| {
+                    this.log_storage(
+                        task,
+                        if result.is_ok() {
+                            crate::operation_log::Phase::Succeeded
+                        } else {
+                            crate::operation_log::Phase::Failed
+                        },
+                        started.elapsed().as_millis() as u64,
+                        result.as_ref().err().map(String::as_str),
+                        cx,
+                    );
                     match result {
                         Ok(()) => {
                             this.index_saved = revision;
@@ -120,7 +137,7 @@ impl NoteLibrary {
         let this = Self {
             database: database.clone(),
             index: Index {
-                version: 1,
+                version: 2,
                 ..Default::default()
             },
             index_path: path,
@@ -130,6 +147,7 @@ impl NoteLibrary {
             search: search.clone(),
             collapsed: HashSet::new(),
             deleting: HashSet::new(),
+            unavailable: HashMap::new(),
             loading: false,
             opening: false,
             pending_file_action: None,
@@ -180,7 +198,11 @@ impl NoteLibrary {
                     &path,
                     "note-library",
                     note_store::MAX_NOTE_BYTES as usize,
-                    |index: &Index| index.version == 1 && index.entries.len() <= 2000,
+                    |index: &Index| {
+                        matches!(index.version, 1 | 2)
+                            && index.entries.len() <= 2000
+                            && index.excluded.len() <= 2000
+                    },
                 )?
             } else {
                 snapshot
@@ -238,7 +260,9 @@ impl NoteLibrary {
                                     Ok(loaded) => {
                                         this.install(entry.path, entry.draft, loaded, window, cx)
                                     }
-                                    Err(error) => feedback::error(error, cx),
+                                    Err(error) => {
+                                        this.unavailable.insert(entry.path, error);
+                                    }
                                 }
                             }
                         }
@@ -262,6 +286,8 @@ impl NoteLibrary {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.index.excluded.retain(|id| *id != loaded.note.id);
+
         if let Some((key, view)) = self.documents.iter().find(|(_, v)| v.read(cx).path == path) {
             cx.emit(LibraryEvent::Open {
                 key: key.clone(),
@@ -380,7 +406,285 @@ impl NoteLibrary {
             self.open_path(path, window, cx);
         }
     }
+    fn log_storage(
+        &self,
+        id: uuid::Uuid,
+        phase: crate::operation_log::Phase,
+        elapsed: u64,
+        error: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(output) = self.database.read(cx).output.clone() {
+            let mut record =
+                crate::operation_log::Record::new(id, crate::operation_log::Kind::Note, phase);
+            record.elapsed_ms = elapsed;
+            if let Some(error) = error {
+                record.failure = crate::operation_log::failure_class(error);
+            }
+            output.update(cx, |log, cx| log.operation(record, cx));
+        }
+    }
+    fn recovery_record_open(&self, path: &std::path::Path, cx: &App) -> bool {
+        let id = self
+            .index
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.id);
+        self.documents.values().any(|v| {
+            let note = v.read(cx);
+            note.path == path || id.is_some_and(|id| note.entry(cx).id == id)
+        })
+    }
+    fn recovery(
+        &mut self,
+        path: PathBuf,
+        error: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.unavailable
+            .retain(|path, _| self.index.entries.iter().any(|e| &e.path == path));
+        self.unavailable.insert(path.clone(), error.clone());
+        let owner = cx.entity().downgrade();
+        let message = if error == "notes.recovery.missing" || error == "notes.recovery.inaccessible"
+        {
+            crate::locale::message(cx, &error)
+        } else {
+            t(cx, "notes.recovery.damaged")
+        };
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let retry = owner.clone();
+            let retry_path = path.clone();
+            let locate = owner.clone();
+            let locate_path = path.clone();
+            let folder = path.clone();
+            let remove = owner.clone();
+            let remove_path = path.clone();
+            dialog
+                .w(px(680.))
+                .title(t(cx, "notes.recovery.title"))
+                .child(
+                    div()
+                        .text_sm()
+                        .whitespace_normal()
+                        .child(crate::notebook::file_title(&path)),
+                )
+                .child(message.clone())
+                .child(
+                    feedback::actions()
+                        .child(feedback::close_button(cx))
+                        .child(
+                            Button::new("retry-note-record")
+                                .label(t(cx, "notes.recovery.retry"))
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let owner = retry.clone();
+                                    let path = retry_path.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        let _ = owner.update(cx, |this, cx| {
+                                            this.open_path(path, window, cx)
+                                        });
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("locate-note-record")
+                                .label(t(cx, "notes.recovery.locate"))
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let owner = locate.clone();
+                                    let path = locate_path.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        let _ = owner
+                                            .update(cx, |this, cx| this.relocate(path, window, cx));
+                                    });
+                                }),
+                        )
+                        .child(
+                            Button::new("reveal-note-folder")
+                                .icon(IconName::FolderOpen)
+                                .label(t(cx, "notes.reveal"))
+                                .on_click(move |_, _, cx| {
+                                    feedback::reveal_parent(folder.clone(), cx)
+                                }),
+                        )
+                        .child(
+                            Button::new("remove-note-record")
+                                .label(t(cx, "notes.recovery.remove"))
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    let owner = remove.clone();
+                                    let path = remove_path.clone();
+                                    window.defer(cx, move |window, cx| {
+                                        feedback::confirm(
+                                            t(cx, "notes.recovery.remove"),
+                                            crate::locale::tr(
+                                                cx,
+                                                "notes.recovery.confirm",
+                                                &[("name", &crate::notebook::file_title(&path))],
+                                            ),
+                                            window,
+                                            cx,
+                                            move |_, cx| {
+                                                let _ = owner.update(cx, |this, cx| {
+                                                    if this.loading || this.opening {
+                                                        feedback::error(
+                                                            t(cx, "notes.recovery.busy"),
+                                                            cx,
+                                                        );
+                                                        return;
+                                                    }
+                                                    if this.recovery_record_open(&path, cx) {
+                                                        feedback::error(
+                                                            t(cx, "notes.recovery.opened"),
+                                                            cx,
+                                                        );
+                                                        return;
+                                                    }
+                                                    let key = this
+                                                        .index
+                                                        .entries
+                                                        .iter()
+                                                        .find(|e| e.path == path)
+                                                        .map(|e| format!("note-{}", e.id));
+                                                    if let Some(id) = this
+                                                        .index
+                                                        .entries
+                                                        .iter()
+                                                        .find(|e| e.path == path)
+                                                        .map(|e| e.id)
+                                                        && !this.index.excluded.contains(&id)
+                                                    {
+                                                        if this.index.excluded.len() >= 2000 {
+                                                            feedback::error(
+                                                                t(cx, "notes.recovery.limit"),
+                                                                cx,
+                                                            );
+                                                            return;
+                                                        }
+                                                        this.index.excluded.push(id);
+                                                    }
+                                                    this.unavailable.remove(&path);
+                                                    this.index.entries.retain(|e| e.path != path);
+                                                    this.index.open.retain(|p| p != &path);
+                                                    this.persist();
+                                                    feedback::success(
+                                                        t(cx, "notes.recovery.removed"),
+                                                        cx,
+                                                    );
+                                                    if let Some(key) = key {
+                                                        cx.emit(LibraryEvent::Removed { key });
+                                                    }
+                                                    cx.notify();
+                                                });
+                                            },
+                                        )
+                                    });
+                                }),
+                        ),
+                )
+        });
+    }
+    fn relocate(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .index
+            .entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.id)
+        else {
+            return;
+        };
+        if self.recovery_record_open(&path, cx) {
+            feedback::error(t(cx, "notes.recovery.opened"), cx);
+            return;
+        }
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(t(cx, "notes.recovery.locate")),
+        });
+        cx.spawn_in(window, async move |owner, cx| {
+            let Ok(Ok(Some(paths))) = selected.await else {
+                return;
+            };
+            let Some(target) = paths.first().cloned() else {
+                return;
+            };
+            let source = target.clone();
+            let task = uuid::Uuid::new_v4();
+            let started = std::time::Instant::now();
+            let _ = owner.update(cx, |this, cx| {
+                this.log_storage(task, crate::operation_log::Phase::Started, 0, None, cx)
+            });
+            let work = cx
+                .background_executor()
+                .spawn(async move { note_store::load(&source) });
+            let result = work.await;
+            let _ = owner.update_in(cx, |this, window, cx| {
+                this.log_storage(
+                    task,
+                    if result.is_ok() {
+                        crate::operation_log::Phase::Succeeded
+                    } else {
+                        crate::operation_log::Phase::Failed
+                    },
+                    started.elapsed().as_millis() as u64,
+                    result.as_ref().err().map(String::as_str),
+                    cx,
+                );
+                if this.loading || this.opening {
+                    feedback::error(t(cx, "notes.recovery.busy"), cx);
+                    return;
+                }
+                if this.recovery_record_open(&path, cx) {
+                    feedback::error(t(cx, "notes.recovery.opened"), cx);
+                    return;
+                }
+                match result {
+                    Ok(loaded)
+                        if loaded.note.id == id
+                            && !this
+                                .index
+                                .entries
+                                .iter()
+                                .any(|e| e.path == target && e.path != path) =>
+                    {
+                        if let Some(entry) = this
+                            .index
+                            .entries
+                            .iter_mut()
+                            .find(|e| e.path == path && e.id == id)
+                        {
+                            entry.path = target.clone();
+                            entry.title = crate::notebook::file_title(&target);
+                        } else {
+                            return;
+                        }
+                        for open in &mut this.index.open {
+                            if *open == path {
+                                *open = target.clone();
+                            }
+                        }
+                        this.unavailable.remove(&path);
+                        this.persist();
+                        this.install(target, false, loaded, window, cx);
+                        feedback::success(t(cx, "notes.recovery.located"), cx);
+                    }
+                    Ok(_) => feedback::error(t(cx, "notes.recovery.identity"), cx),
+                    Err(error) => feedback::error(crate::locale::message(cx, &error), cx),
+                }
+            });
+        })
+        .detach();
+    }
     fn delete_note(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(error) = self.unavailable.get(&path).cloned() {
+            self.recovery(path, error, window, cx);
+            return;
+        }
         if self.deleting.contains(&path) || self.opening || self.loading {
             return;
         }
@@ -440,7 +744,7 @@ impl NoteLibrary {
             .spawn(async move { note_store::archive(&source, expected) });
         cx.spawn_in(window, async move |owner, cx| {
             let result = work.await;
-            let _ = owner.update(cx, |this, cx| {
+            let _ = owner.update_in(cx, |this, window, cx| {
                 this.deleting.remove(&path);
                 let success = result.is_ok();
                 if let Some(output) = &output {
@@ -461,6 +765,7 @@ impl NoteLibrary {
                 }
                 match result {
                     Ok(_) => {
+                        this.unavailable.remove(&path);
                         this.index.entries.retain(|e| e.path != path);
                         this.index.open.retain(|p| p != &path);
                         if let Some((key, _)) = &opened {
@@ -475,7 +780,10 @@ impl NoteLibrary {
                         if let Some((_, view)) = &opened {
                             view.update(cx, |v, cx| v.cancel_delete(cx));
                         }
-                        feedback::error(error, cx);
+                        let path = path.clone();
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.recovery(path, error, window, cx)
+                        });
                     }
                 }
                 cx.emit(LibraryEvent::Settled {
@@ -653,10 +961,16 @@ impl NoteLibrary {
                     this.opening = false;
                     let success = result.is_ok();
                     match result {
-                        Ok(loaded) => this.install(path, draft, loaded, window, cx),
+                        Ok(loaded) => {
+                            this.unavailable.remove(&path);
+                            this.install(path, draft, loaded, window, cx)
+                        }
                         Err(error) => {
                             this.pending_file_action = None;
-                            feedback::error(error, cx);
+                            let path = path.clone();
+                            cx.defer_in(window, move |this, window, cx| {
+                                this.recovery(path, error, window, cx)
+                            });
                         }
                     }
                     cx.emit(LibraryEvent::Settled {
@@ -924,6 +1238,9 @@ impl Render for NoteLibrary {
                         )))
                         .ghost()
                         .pl(px(28.))
+                        .when(self.unavailable.contains_key(&entry.path), |button| {
+                            button.child(gpui_component::Icon::new(IconName::TriangleAlert))
+                        })
                         .child(crate::assets::note_icon(2, cx))
                         .child(
                             div()
@@ -978,6 +1295,28 @@ impl Render for NoteLibrary {
                             }
                             let library = library.clone();
                             let path = file_path.clone();
+                            if let Some(error) = library
+                                .read_with(cx, |this, _| this.unavailable.get(&path).cloned())
+                                .ok()
+                                .flatten()
+                            {
+                                let owner = library.clone();
+                                let source = path.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(t(cx, "notes.recovery.title"))
+                                        .icon(IconName::FolderOpen)
+                                        .on_click(move |_, window, cx| {
+                                            let owner = owner.clone();
+                                            let path = source.clone();
+                                            let error = error.clone();
+                                            window.defer(cx, move |window, cx| {
+                                                let _ = owner.update(cx, |this, cx| {
+                                                    this.recovery(path, error, window, cx)
+                                                });
+                                            });
+                                        }),
+                                );
+                            }
                             menu.separator().item(
                                 PopupMenuItem::new(t(cx, "notes.delete_file"))
                                     .icon(IconName::Delete)

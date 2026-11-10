@@ -26,8 +26,11 @@ pub(super) struct GridDelegate {
     preview_order: std::collections::VecDeque<(usize, usize)>,
 }
 impl GridDelegate {
-    pub fn column_names(&self) -> Vec<&str> {
-        self.columns.iter().map(|c| c.key.as_ref()).collect()
+    pub fn column_layout(&self) -> Vec<(&str, Pixels)> {
+        self.columns
+            .iter()
+            .map(|column| (column.name.as_ref(), column.width))
+            .collect()
     }
     pub fn set_width(&mut self, field: &str, width: f32) {
         if let Some(column) = self
@@ -135,6 +138,9 @@ impl GridDelegate {
     }
 }
 pub(crate) fn column_icon(c: Option<&workbench::Column>, cx: &App) -> AnyElement {
+    column_icon_variant(c, false, cx)
+}
+fn column_icon_variant(c: Option<&workbench::Column>, compact: bool, cx: &App) -> AnyElement {
     let color = |dark, light| {
         rgb(if cx.theme().mode.is_dark() {
             dark
@@ -185,7 +191,13 @@ pub(crate) fn column_icon(c: Option<&workbench::Column>, cx: &App) -> AnyElement
         } else {
             color(0x60a5fa, 0x2563eb)
         })
-        .child(if numeric { "123" } else { "ABC" })
+        .child(if numeric {
+            if compact { "#" } else { "123" }
+        } else if compact {
+            "T"
+        } else {
+            "ABC"
+        })
         .into_any_element()
 }
 impl TableDelegate for GridDelegate {
@@ -250,7 +262,8 @@ impl TableDelegate for GridDelegate {
                     .unwrap_or_else(|| default_highlight_color(cx))
                     .opacity(0.22))
             })
-            .child(column_icon(meta, cx))
+            .when(resize_width < 140., |el| el.px_1().gap_0())
+            .child(column_icon_variant(meta, resize_width < 140., cx))
             .child(
                 div()
                     .id(("column-tip", index))
@@ -651,5 +664,25 @@ impl TableDelegate for GridDelegate {
             },
         )
         .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn refresh_detects_width_changes_and_renamed_columns_with_stable_keys() {
+        let mut before = GridDelegate::new();
+        before
+            .columns
+            .push(GridColumn::new("data-0", "id").width(px(220.)));
+        let mut after = GridDelegate::new();
+        after
+            .columns
+            .push(GridColumn::new("data-0", "id").width(px(120.)));
+        assert_ne!(before.column_layout(), after.column_layout());
+        after.columns[0] = GridColumn::new("data-0", "total").width(px(220.));
+        assert_ne!(before.column_layout(), after.column_layout());
     }
 }

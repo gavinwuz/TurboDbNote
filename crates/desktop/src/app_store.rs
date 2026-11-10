@@ -169,10 +169,10 @@ mod tests {
             &dir.path().join("note-library.json"),
             "note-library",
             1024,
-            |index: &turbodbn_services::note_store::Index| index.version == 1,
+            |index: &turbodbn_services::note_store::Index| index.version == 2,
         )
         .unwrap();
-        assert_eq!(index.version, 1);
+        assert_eq!(index.version, 2);
         assert!(old.is_file());
     }
     #[test]

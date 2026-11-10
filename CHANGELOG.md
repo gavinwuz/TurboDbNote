@@ -4,6 +4,16 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Let result headers ellipsize independently of content-based widths, keep narrow numeric columns compact, and fit full names/content by double-clicking a resize boundary.
+
+- Compact completion into measured name/type/comment columns with horizontal scrolling only on overflow; load missing connected-target metadata once with inline progress, and refresh sampled result widths while preserving explicit user sizes.
+
+- Enable identifier-aware double-click selection in read-only DDL, and show all cached matching columns (up to 1024) with full names and two-axis scrolling.
+
+- Bound the right table-definition viewport to its available height, refresh the table grid when leaving DDL mode, and fetch missing column metadata instead of rendering an empty structure grid.
+
+- Recover stale Note records with retry, original-file relocation and confirmed record-only removal; preserve open drafts and damaged files, distinguish missing/inaccessible paths and prevent removed records from being automatically rediscovered.
+
 ## [0.1.7] - 2026-11-05
 
 - Create a new Note from a project context menu and persist the clicked project before the first file save.

@@ -56,11 +56,62 @@ impl Model {
             let _ = view.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok(Reply::Schema(schema)) => {
+                    Ok(Reply::Schema(mut schema)) => {
                         if schema.columns.is_empty() && schema.ddl.trim().is_empty() {
                             this.schema = None;
                             this.error = "ddl.note.definition_missing".into();
                             cx.notify();
+                            return;
+                        }
+                        if schema.columns.is_empty() && !schema.ddl.trim().is_empty() {
+                            // Keep DDL available, but a definition-only response is not a
+                            // complete table schema. Fetch columns through the adapter.
+                            if let Some(source) = this.source.upgrade() {
+                                let target = this.target.clone();
+                                let rx = source.update(cx, |source, cx| {
+                                    source.mcp_request(
+                                        target.connection,
+                                        target.generation,
+                                        target.database,
+                                        Action::BrowseColumns(target.object),
+                                        cx,
+                                    )
+                                });
+                                this.schema = Some(schema.clone());
+                                this.revision += 1;
+                                this.busy = true;
+                                cx.notify();
+                                cx.spawn(async move |owner, cx| {
+                                    let result =
+                                        rx.recv().await.unwrap_or_else(|_| Err("mcp.stale".into()));
+                                    let _ = owner.update(cx, |this, cx| {
+                                        this.busy = false;
+                                        match result {
+                                            Ok(Reply::Schema(columns))
+                                                if !columns.columns.is_empty() =>
+                                            {
+                                                schema.columns = columns.columns;
+                                                if let Some(source) = this.source.upgrade() {
+                                                    source.update(cx, |source, cx| {
+                                                        source.remember_designer_schema(
+                                                            &this.target,
+                                                            &schema,
+                                                            cx,
+                                                        )
+                                                    });
+                                                }
+                                                this.schema = Some(schema);
+                                                this.error.clear();
+                                                this.revision += 1;
+                                            }
+                                            Err(error) => this.error = error,
+                                            _ => this.error = "ddl.note.definition_missing".into(),
+                                        }
+                                        cx.notify();
+                                    });
+                                })
+                                .detach();
+                            }
                             return;
                         }
                         if let Some(source) = this.source.upgrade() {
@@ -97,6 +148,7 @@ pub struct Designer {
     grid_observer: Option<Subscription>,
     text_mode: bool,
     scroll: ScrollHandle,
+    selected_column: Option<usize>,
     _observe: Subscription,
 }
 impl Designer {
@@ -148,6 +200,7 @@ impl Designer {
             revision: u64::MAX,
             text_mode: false,
             scroll: ScrollHandle::new(),
+            selected_column: None,
             _observe: observer,
         }
     }
@@ -305,9 +358,11 @@ impl Render for Designer {
             self.revision = m.revision;
             self.grid = None;
             self.grid_observer = None;
+            self.selected_column = None;
         }
         if self.grid.is_none()
             && let Some(schema) = &schema
+            && !schema.columns.is_empty()
         {
             let flag = |v: Option<bool>| {
                 Some(
@@ -358,6 +413,15 @@ impl Render for Designer {
                 )
             }));
         }
+        if let Some(row) = self.selected_column.take()
+            && let Some(grid) = &self.grid
+        {
+            grid.update(cx, |grid, cx| {
+                if row < grid.delegate().rows.values.len() {
+                    grid.set_selected_row(row, cx);
+                }
+            });
+        }
         if self.grid_observer.is_none()
             && let Some(grid) = &self.grid
         {
@@ -378,6 +442,7 @@ impl Render for Designer {
             .child(
                 div()
                     .h_flex()
+                    .flex_shrink_0()
                     .gap_2()
                     .child(
                         div()
@@ -408,6 +473,10 @@ impl Render for Designer {
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.text_mode = !this.text_mode;
+                                if !this.text_mode {
+                                    this.selected_column=this.grid.as_ref().and_then(|grid|grid.read(cx).delegate().selected).map(|(row,_)|row);
+                                    this.grid=None;this.grid_observer=None;
+                                }
                                 cx.notify();
                             })),
                     )
@@ -428,6 +497,7 @@ impl Render for Designer {
             .child(
                 div()
                     .h_flex()
+                    .flex_shrink_0()
                     .gap_2()
                     .child(
                         Button::new("design-add")
@@ -512,14 +582,14 @@ impl Render for Designer {
                 body = body.child(crate::content_scroll::view(
                     "design-ddl",
                     &self.scroll,
-                    div().min_w_full().w(px(width)).child(
+                    div().min_w_full().w(px(width)).flex_shrink_0().child(
                         gpui_component::text::TextView::markdown(
                             "design-sql",
                             crate::cell::sql_reading(&schema.ddl, target.kind),
                             window,
                             cx,
                         )
-                        .selectable(true),
+                        .word_selectable(true),
                     ),
                 ));
             }

@@ -128,13 +128,13 @@ impl DatabaseView {
                 )
                 .child(self.ddl_selector(cx))
                 .child(
-                    div().flex_1().min_h_0().min_w_0().child(
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .min_w_0()
-                            .child(self.ddl.designer.as_ref().unwrap().clone()),
-                    ),
+                    div()
+                        .v_flex()
+                        .flex_1()
+                        .min_h_0()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .child(self.ddl.designer.as_ref().unwrap().clone()),
                 )
                 .into_any_element();
         }

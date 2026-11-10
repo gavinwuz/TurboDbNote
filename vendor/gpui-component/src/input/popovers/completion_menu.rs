@@ -3,8 +3,9 @@ use std::rc::Rc;
 use gpui::{
     Action, AnyElement, App, AppContext, Bounds, Context, DismissEvent, Empty, Entity,
     EventEmitter, HighlightStyle, InteractiveElement as _, IntoElement, ParentElement, Pixels,
-    Point, Render, RenderOnce, SharedString, StatefulInteractiveElement, Styled, StyledText,
-    Subscription, Window, canvas, deferred, div, prelude::FluentBuilder, px, relative,
+    Point, Render, RenderOnce, ScrollHandle, SharedString, StatefulInteractiveElement, Styled,
+    StyledText, Subscription, TextRun, Window, canvas, deferred, div, prelude::FluentBuilder, px,
+    relative, rems,
 };
 use lsp_types::{CompletionItem, CompletionTextEdit};
 
@@ -20,6 +21,7 @@ use crate::{
     },
     label::Label,
     list::{List, ListDelegate, ListEvent, ListState},
+    scroll::{Scrollbar, ScrollbarShow},
 };
 
 struct ContextMenuDelegate {
@@ -28,10 +30,34 @@ struct ContextMenuDelegate {
     menu: Entity<CompletionMenu>,
     items: Vec<Rc<CompletionItem>>,
     selected_ix: usize,
+    column_width: Option<ColumnWidths>,
 }
 
 impl ContextMenuDelegate {
-    fn set_items(&mut self, items: Vec<CompletionItem>) {
+    fn set_items(&mut self, items: Vec<CompletionItem>, window: &Window) {
+        let fields = items
+            .iter()
+            .filter(|item| item.kind == Some(lsp_types::CompletionItemKind::FIELD));
+        self.column_width = fields.clone().next().map(|_| {
+            let mut widths = ColumnWidths {
+                name: px(0.),
+                data_type: px(0.),
+                comment: px(0.),
+            };
+            for item in fields {
+                let (data_type, comment) = column_detail(item);
+                widths.name = widths.name.max(text_width(&item.label, window) + px(4.));
+                widths.data_type = widths
+                    .data_type
+                    .max(text_width(data_type, window) + px(4.))
+                    .min(px(180.));
+                widths.comment = widths
+                    .comment
+                    .max(text_width(comment, window))
+                    .min(px(200.));
+            }
+            widths
+        });
         self.items = items.into_iter().map(Rc::new).collect();
         self.selected_ix = 0;
     }
@@ -49,6 +75,7 @@ struct CompletionMenuItem {
     selected: bool,
     highlight_prefix: SharedString,
     icon: Option<AnyElement>,
+    column_width: Option<ColumnWidths>,
 }
 
 impl CompletionMenuItem {
@@ -60,6 +87,7 @@ impl CompletionMenuItem {
             selected: false,
             highlight_prefix: "".into(),
             icon: None,
+            column_width: None,
         }
     }
 
@@ -89,11 +117,15 @@ impl RenderOnce for CompletionMenuItem {
         let item = self.item;
 
         let deprecated = item.deprecated.unwrap_or(false);
-        let matched_len = item
+        let mut matched_len = item
             .filter_text
             .as_ref()
             .map(|s| s.len())
-            .unwrap_or(self.highlight_prefix.len());
+            .unwrap_or(self.highlight_prefix.len())
+            .min(item.label.len());
+        while !item.label.is_char_boundary(matched_len) {
+            matched_len -= 1;
+        }
 
         let highlights = vec![(
             0..matched_len,
@@ -123,7 +155,7 @@ impl RenderOnce for CompletionMenuItem {
             .gap_2()
             .p_1()
             .text_xs()
-            .line_height(relative(1.))
+            .line_height(relative(1.4))
             .rounded_sm()
             .when(item.deprecated.unwrap_or(false), |this| this.line_through())
             .hover(|this| this.bg(cx.theme().accent.opacity(0.8)))
@@ -135,20 +167,47 @@ impl RenderOnce for CompletionMenuItem {
             .child(
                 div()
                     .flex_shrink_0()
-                    .max_w(px(280.))
-                    .overflow_hidden()
-                    .text_ellipsis()
+                    .when_some(self.column_width, |this, width| {
+                        this.w(width.name).whitespace_nowrap()
+                    })
+                    .when(self.column_width.is_none(), |this| {
+                        this.max_w(px(280.)).overflow_hidden().text_ellipsis()
+                    })
                     .child(StyledText::new(item.label.clone()).with_highlights(highlights)),
             )
-            .when(item.detail.is_some(), |this| {
+            .when_some(self.column_width, |this, widths| {
+                let (data_type, comment) = column_detail(&item);
                 this.child(
-                    div().min_w_0().overflow_hidden().text_ellipsis().child(
-                        Label::new(item.detail.as_deref().unwrap_or("").to_string())
-                            .text_color(cx.theme().muted_foreground)
-                            .when(deprecated, |this| this.line_through()),
-                    ),
+                    div()
+                        .w(widths.data_type)
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(data_type.to_owned()),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(comment.to_owned()),
                 )
             })
+            .when(
+                self.column_width.is_none() && item.detail.is_some(),
+                |this| {
+                    this.child(
+                        div().min_w_0().overflow_hidden().text_ellipsis().child(
+                            Label::new(item.detail.as_deref().unwrap_or("").to_string())
+                                .text_color(cx.theme().muted_foreground)
+                                .when(deprecated, |this| this.line_through()),
+                        ),
+                    )
+                },
+            )
             .children(self.children)
     }
 }
@@ -171,6 +230,9 @@ impl ListDelegate for ContextMenuDelegate {
         let item = self.items.get(ix.row)?;
         let mut row =
             CompletionMenuItem::new(ix.row, item.clone()).highlight_prefix(self.query.clone());
+        row.column_width = (item.kind == Some(lsp_types::CompletionItemKind::FIELD))
+            .then_some(self.column_width)
+            .flatten();
         row.icon = self.provider.completion_leading(item, cx);
         Some(row)
     }
@@ -204,6 +266,7 @@ pub struct CompletionMenu {
     list: Entity<ListState<ContextMenuDelegate>>,
     open: bool,
     bounds: Bounds<Pixels>,
+    horizontal_scroll: ScrollHandle,
 
     /// The offset of the first character that triggered the completion.
     pub(crate) trigger_start_offset: Option<usize>,
@@ -229,6 +292,7 @@ impl CompletionMenu {
                 menu: view,
                 items: vec![],
                 selected_ix: 0,
+                column_width: None,
             };
 
             let list = cx.new(|cx| ListState::new(menu, window, cx));
@@ -245,6 +309,7 @@ impl CompletionMenu {
                 trigger_start_offset: None,
                 query: SharedString::default(),
                 bounds: Bounds::default(),
+                horizontal_scroll: ScrollHandle::new(),
                 _subscriptions,
             }
         })
@@ -427,7 +492,7 @@ impl CompletionMenu {
                 .unwrap_or(0);
 
             this.delegate_mut().query = self.query.clone();
-            this.delegate_mut().set_items(items);
+            this.delegate_mut().set_items(items, window);
             this.set_selected_index(Some(IndexPath::new(0)), window, cx);
             this.set_item_to_measure_index(IndexPath::new(longest_ix), window, cx);
         });
@@ -487,11 +552,26 @@ impl Render for CompletionMenu {
             .and_then(|item| item.documentation.clone());
 
         let editor_bounds = self.editor.read(cx).input_bounds;
-        let edge = editor_bounds.right().min(window.bounds().size.width) - px(8.);
+        let column_width = self.list.read(cx).delegate().column_width;
+        let edge = if column_width.is_some() {
+            window.bounds().size.width
+        } else {
+            editor_bounds.right().min(window.bounds().size.width)
+        } - px(8.);
         let mut abs_pos = editor_bounds.origin + pos;
-        if edge - abs_pos.x < px(200.) {
+        let preferred_width = if column_width.is_some() {
+            px(420.)
+        } else {
+            px(200.)
+        };
+        let left_edge = if column_width.is_some() {
+            px(8.)
+        } else {
+            editor_bounds.left()
+        };
+        if edge - abs_pos.x < preferred_width {
             let shift =
-                (px(200.) - (edge - abs_pos.x)).min((abs_pos.x - editor_bounds.left()).max(px(0.)));
+                (preferred_width - (edge - abs_pos.x)).min((abs_pos.x - left_edge).max(px(0.)));
             pos.x -= shift;
             abs_pos.x -= shift;
         }
@@ -508,9 +588,24 @@ impl Render for CompletionMenu {
             .max()
             .unwrap_or(0)
             .min(72);
-        let menu_width =
-            px((content_width as f32 * 7.5 + 32.).max(if footer.is_some() { 320. } else { 200. }))
-                .min(max_width);
+        let menu_width = column_width
+            .map(|widths| (widths.content_width() + px(10.)).max(px(420.)))
+            .unwrap_or_else(|| {
+                px((content_width as f32 * 7.5 + 32.).max(if footer.is_some() {
+                    320.
+                } else {
+                    200.
+                }))
+            })
+            .min(max_width);
+        // Popover padding and borders belong to the viewport, not the scrollable content.
+        let viewport_width = (menu_width - px(10.)).max(px(0.));
+        let list_width = column_width
+            .map(|widths| widths.content_width().max(viewport_width))
+            .unwrap_or(viewport_width);
+        let horizontal_overflow = column_width.is_some() && list_width > viewport_width + px(0.5);
+        let horizontal_gutter = if horizontal_overflow { px(14.) } else { px(0.) };
+        let vertical_scroll = self.list.read(cx).scroll_handle().clone();
         let doc_width = px(360.).min(max_width);
         let vertical_layout = abs_pos.x + menu_width + doc_width + POPOVER_GAP > edge;
         let documentation = custom_documentation.or_else(|| {
@@ -558,7 +653,59 @@ impl Render for CompletionMenu {
                         .w(menu_width)
                         .max_w(max_width)
                         .min_w(px(120.))
-                        .child(List::new(&self.list).max_h(MAX_MENU_HEIGHT))
+                        .child(if column_width.is_some() {
+                            div()
+                                .relative()
+                                .w_full()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .pb(horizontal_gutter)
+                                .child(
+                                    div()
+                                        .id("completion-horizontal-scroll")
+                                        .w_full()
+                                        .overflow_x_scroll()
+                                        .track_scroll(&self.horizontal_scroll)
+                                        .child(
+                                            div().w(list_width).flex_shrink_0().pr(px(14.)).child(
+                                                List::new(&self.list)
+                                                    .max_h(MAX_MENU_HEIGHT - horizontal_gutter)
+                                                    .scrollbar_visible(false),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .absolute()
+                                        .right_0()
+                                        .top_0()
+                                        .bottom(horizontal_gutter)
+                                        .w(px(12.))
+                                        .child(
+                                            Scrollbar::vertical(&vertical_scroll)
+                                                .scrollbar_show(ScrollbarShow::Always),
+                                        ),
+                                )
+                                .when(horizontal_overflow, |this| {
+                                    this.child(
+                                        div()
+                                            .absolute()
+                                            .bottom_0()
+                                            .left_0()
+                                            .right(px(14.))
+                                            .h(px(12.))
+                                            .child(
+                                                Scrollbar::horizontal(&self.horizontal_scroll)
+                                                    .scrollbar_show(ScrollbarShow::Always),
+                                            ),
+                                    )
+                                })
+                                .into_any_element()
+                        } else {
+                            List::new(&self.list)
+                                .max_h(MAX_MENU_HEIGHT)
+                                .into_any_element()
+                        })
                         .children(footer)
                         .child(
                             canvas(
@@ -587,4 +734,57 @@ impl Render for CompletionMenu {
         )
         .into_any_element()
     }
+}
+
+#[derive(Clone, Copy)]
+struct ColumnWidths {
+    name: Pixels,
+    data_type: Pixels,
+    comment: Pixels,
+}
+
+impl ColumnWidths {
+    fn content_width(self) -> Pixels {
+        // Type icon, row padding, column gaps, and a separate vertical scrollbar gutter.
+        self.name + self.data_type + self.comment + px(64.)
+    }
+}
+
+fn column_detail(item: &CompletionItem) -> (&str, &str) {
+    if let Some(data) = &item.data
+        && let Some(data_type) = data.get("column_type").and_then(|value| value.as_str())
+    {
+        return (
+            data_type,
+            data.get("column_comment")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default(),
+        );
+    }
+    let detail = item.detail.as_deref().unwrap_or_default();
+    detail.split_once(" · ").unwrap_or((detail, ""))
+}
+
+fn text_width(text: &str, window: &Window) -> Pixels {
+    if text.is_empty() {
+        return px(0.);
+    }
+    let style = window.text_style();
+    let run = TextRun {
+        len: text.len(),
+        font: style.font(),
+        color: style.color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(
+            text.to_owned().into(),
+            rems(0.75).to_pixels(window.rem_size()),
+            &[run],
+            None,
+        )
+        .width
 }

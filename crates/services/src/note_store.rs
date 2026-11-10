@@ -27,14 +27,17 @@ pub struct Index {
     pub entries: Vec<Entry>,
     pub open: Vec<PathBuf>,
     pub roots: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded: Vec<Uuid>,
 }
 impl Default for Index {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             entries: vec![],
             open: vec![],
             roots: vec![],
+            excluded: vec![],
         }
     }
 }
@@ -51,7 +54,13 @@ pub fn now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
-    let file = fs::File::open(path).map_err(io_error)?;
+    let file = fs::File::open(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "notes.recovery.missing".to_string()
+        } else {
+            "notes.recovery.inaccessible".to_string()
+        }
+    })?;
     if file.metadata().map_err(io_error)?.len() > MAX_NOTE_BYTES {
         return Err("笔记文件超过 16 MiB 上限".into());
     }
@@ -128,7 +137,13 @@ pub fn save(path: &Path, note: &Note, expected: Option<[u8; 32]>) -> Result<[u8;
 }
 /// Recoverable deletion on the same filesystem. Keep the original basename for manual recovery.
 pub fn archive(path: &Path, expected: Option<[u8; 32]>) -> Result<PathBuf, String> {
-    let metadata = fs::symlink_metadata(path).map_err(io_error)?;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            "notes.recovery.missing".to_string()
+        } else {
+            "notes.recovery.inaccessible".to_string()
+        }
+    })?;
     if !path.is_absolute() || !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err("只能删除普通 .note 文件".into());
     }
@@ -154,22 +169,30 @@ pub fn archive(path: &Path, expected: Option<[u8; 32]>) -> Result<PathBuf, Strin
 pub fn load_index(path: &Path) -> Result<Index, String> {
     if !path.exists() {
         return Ok(Index {
-            version: 1,
+            version: 2,
             ..Default::default()
         });
     }
     let bytes = read_bytes(path)?;
-    let index: Index = serde_json::from_slice(&bytes).map_err(|_| "笔记索引损坏，原文件已保留")?;
-    if index.version != 1 {
+    let mut index: Index =
+        serde_json::from_slice(&bytes).map_err(|_| "笔记索引损坏，原文件已保留")?;
+    if index.entries.len() > 2000 || index.excluded.len() > 2000 {
+        return Err("笔记索引超过上限，原文件已保留".into());
+    }
+    if !matches!(index.version, 1 | 2) {
         return Err("笔记索引版本不受支持".into());
     }
+    index.version = 2;
     Ok(index)
 }
 pub fn save_index(path: &Path, index: &Index) -> Result<(), String> {
     let parent = path.parent().ok_or("索引目录无效")?;
     fs::create_dir_all(parent).map_err(io_error)?;
     let bytes = serde_json::to_vec(index).map_err(io_error)?;
-    if bytes.len() as u64 > MAX_NOTE_BYTES || index.entries.len() > 2000 {
+    if bytes.len() as u64 > MAX_NOTE_BYTES
+        || index.entries.len() > 2000
+        || index.excluded.len() > 2000
+    {
         return Err("笔记索引超过上限，请整理笔记列表".into());
     }
     let mut file = tempfile::NamedTempFile::new_in(parent).map_err(io_error)?;
@@ -245,6 +268,11 @@ pub fn create_dated(
 }
 
 pub fn discover(index: &mut Index, directory: &Path) -> Result<(), String> {
+    if !matches!(index.version, 1 | 2) {
+        return Err("笔记索引版本不受支持，原记录已保留".into());
+    }
+    index.version = 2;
+
     if !directory.is_absolute() {
         return Err("临时笔记目录必须是绝对路径".into());
     }
@@ -252,7 +280,7 @@ pub fn discover(index: &mut Index, directory: &Path) -> Result<(), String> {
     if !index.roots.contains(&directory.to_path_buf()) {
         index.roots.push(directory.to_path_buf());
     }
-    if index.entries.len() > 2000 {
+    if index.entries.len() > 2000 || index.excluded.len() > 2000 {
         return Err("笔记列表超过 2000 项，请整理索引".into());
     }
     let roots = index.roots.clone();
@@ -278,6 +306,9 @@ pub fn discover(index: &mut Index, directory: &Path) -> Result<(), String> {
             }
             // A damaged file is left intact and can be explicitly opened for an error report.
             if let Ok(loaded) = load(&path) {
+                if index.excluded.contains(&loaded.note.id) {
+                    continue;
+                }
                 if index.entries.len() >= 2000 {
                     return Err("笔记列表达到 2000 项上限，请整理目录".into());
                 }
@@ -423,5 +454,62 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         assert!(load(&path).is_err());
         assert!(fs::read(path).unwrap() == bytes);
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn recovery_index_migrates_legacy_and_preserves_future_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut index = Index {
+            version: 1,
+            ..Default::default()
+        };
+        discover(&mut index, directory.path()).unwrap();
+        assert_eq!(index.version, 2);
+        index.version = 99;
+        let untouched = directory.path().join("future");
+        assert!(discover(&mut index, &untouched).is_err());
+        assert_eq!(index.version, 99);
+        assert!(!untouched.exists());
+    }
+    #[test]
+    fn removed_records_stay_excluded_from_discovery_without_deleting_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kept.note");
+        let note = Note::new("kept");
+        save(&path, &note, None).unwrap();
+        let mut index = Index::default();
+        index.excluded.push(note.id);
+        discover(&mut index, directory.path()).unwrap();
+        assert!(index.entries.is_empty() && path.exists());
+        let persisted = directory.path().join("index.json");
+        save_index(&persisted, &index).unwrap();
+        let mut restored = load_index(&persisted).unwrap();
+        discover(&mut restored, directory.path()).unwrap();
+        assert!(restored.entries.is_empty());
+        restored.excluded.clear();
+        discover(&mut restored, directory.path()).unwrap();
+        assert_eq!(restored.entries.len(), 1);
+    }
+    #[test]
+    fn absent_files_are_distinct_and_never_recreated_by_open_or_delete() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("missing.note");
+        assert!(matches!(load(&path),Err(ref e) if e=="notes.recovery.missing"));
+        assert_eq!(archive(&path, None).unwrap_err(), "notes.recovery.missing");
+        assert!(!path.exists());
+    }
+    #[test]
+    fn damaged_note_is_preserved_when_open_and_archive_fail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("broken.note");
+        fs::write(&path, b"invalid note fixture").unwrap();
+        let original = fs::read(&path).unwrap();
+        assert!(load(&path).is_err());
+        assert!(archive(&path, None).is_err());
+        assert_eq!(fs::read(path).unwrap(), original);
     }
 }

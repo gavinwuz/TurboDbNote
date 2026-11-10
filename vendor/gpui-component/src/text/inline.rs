@@ -5,13 +5,15 @@ use std::{
 };
 
 use gpui::{
-    point, px, quad, App, BorderStyle, Bounds, CursorStyle, Edges, Element, ElementId,
-    GlobalElementId, Half, HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement,
-    LayoutId, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, StyledText, TextLayout,
-    Window,
+    App, BorderStyle, Bounds, CursorStyle, Edges, Element, ElementId, GlobalElementId, Half,
+    HighlightStyle, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, SharedString, StyledText,
+    TextLayout, Window, point, px, quad,
 };
 
-use crate::{global_state::GlobalState, input::Selection, text::node::LinkMark, ActiveTheme};
+use super::word_selection::identifier_range;
+
+use crate::{ActiveTheme, global_state::GlobalState, input::Selection, text::node::LinkMark};
 
 /// A inline element used to render a inline text and support selectable.
 ///
@@ -121,7 +123,7 @@ impl Inline {
             };
 
             let mut char_width = line_height.half();
-            if let Some(next_pos) = text_layout.position_for_index(offset + 1) {
+            if let Some(next_pos) = text_layout.position_for_index(offset + c.len_utf8()) {
                 if next_pos.y == pos.y {
                     char_width = next_pos.x - pos.x;
                 }
@@ -321,6 +323,47 @@ impl Element for Inline {
             Self::paint_selection(selection, &text_layout, &bounds, window, cx);
         }
 
+        if is_selectable {
+            if let Some(text_view) = GlobalState::global(cx).text_view_state()
+                && text_view.read(cx).word_selectable
+            {
+                let text_view = text_view.clone();
+                let text = self.text.clone();
+                let layout = text_layout.clone();
+                let hitbox = hitbox.clone();
+                window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                    if !phase.bubble()
+                        || event.button != MouseButton::Left
+                        || event.click_count != 2
+                        || !hitbox.is_hovered(window)
+                    {
+                        return;
+                    }
+                    let Some(range) = layout
+                        .index_for_position(event.position)
+                        .ok()
+                        .and_then(|index| identifier_range(&text, index))
+                    else {
+                        return;
+                    };
+                    let (Some(start), Some(end)) = (
+                        layout.position_for_index(range.start),
+                        layout.position_for_index(range.end),
+                    ) else {
+                        return;
+                    };
+                    text_view.update(cx, |state, _| {
+                        state.select_range(
+                            start + point(px(0.), layout.line_height().half()),
+                            end + point(px(0.), layout.line_height().half()),
+                        )
+                    });
+                    cx.notify(current_view);
+                    cx.stop_propagation();
+                });
+            }
+        }
+
         // mouse move, update hovered link
         window.on_mouse_event({
             let hitbox = hitbox.clone();
@@ -402,7 +445,8 @@ fn point_in_text_selection(
 #[cfg(test)]
 mod tests {
     use super::point_in_text_selection;
-    use gpui::{point, px, size, Bounds};
+
+    use gpui::{Bounds, point, px, size};
 
     #[test]
     fn test_point_in_text_selection() {

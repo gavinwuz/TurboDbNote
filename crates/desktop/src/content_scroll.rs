@@ -13,6 +13,8 @@ pub(crate) fn view(id: &'static str, handle: &ScrollHandle, child: impl IntoElem
             div()
                 .id(id)
                 .size_full()
+                .min_h_0()
+                .min_w_0()
                 .overflow_scroll()
                 .track_scroll(handle)
                 .pr(px(16.))

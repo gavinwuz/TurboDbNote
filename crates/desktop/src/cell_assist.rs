@@ -90,6 +90,49 @@ struct AssistMemo {
         Vec<turbodbn_services::database::workbench::Object>,
     )>,
 }
+#[derive(Default)]
+struct AutomaticMetadata {
+    scope: Option<(AssistContext, u64)>,
+    attempted: Vec<Option<sql_assist::TableName>>,
+}
+impl AutomaticMetadata {
+    fn can_claim(
+        &self,
+        scope: &CompletionScope,
+        column: Option<&sql_assist::ColumnRequest>,
+    ) -> bool {
+        if !scope.connected
+            || scope.context.1.is_none()
+            || column.is_some_and(|column| column.local_columns.is_some())
+        {
+            return false;
+        }
+        let key = (scope.context.clone(), scope.generation);
+        self.scope.as_ref() != Some(&key)
+            || (self.attempted.len() < 128
+                && !self
+                    .attempted
+                    .contains(&column.map(|column| column.table.clone())))
+    }
+    fn claim(
+        &mut self,
+        scope: &CompletionScope,
+        column: Option<&sql_assist::ColumnRequest>,
+    ) -> bool {
+        if !self.can_claim(scope, column) {
+            return false;
+        }
+        let key = (scope.context.clone(), scope.generation);
+        if self.scope.as_ref() != Some(&key) {
+            self.scope = Some(key);
+            self.attempted.clear();
+        }
+        self.attempted
+            .push(column.map(|column| column.table.clone()));
+        true
+    }
+}
+
 pub(super) struct SqlCompletion {
     owner: WeakEntity<CellView>,
     serial: std::rc::Rc<std::cell::Cell<u64>>,
@@ -101,6 +144,7 @@ pub(super) struct SqlCompletion {
     select_override: std::cell::Cell<Option<bool>>,
     has_tables: std::cell::Cell<bool>,
     expanded_help: std::cell::RefCell<Option<String>>,
+    automatic_metadata: std::cell::RefCell<AutomaticMetadata>,
     failed_columns: std::cell::RefCell<Option<sql_assist::ColumnRequest>>,
     column_snapshot: std::cell::RefCell<Option<(sql_assist::ColumnRequest, u64)>>,
     columns_only: std::cell::Cell<bool>,
@@ -125,6 +169,7 @@ impl SqlCompletion {
             select_override: Default::default(),
             has_tables: Default::default(),
             expanded_help: Default::default(),
+            automatic_metadata: Default::default(),
             failed_columns: Default::default(),
             column_snapshot: Default::default(),
             columns_only: Default::default(),
@@ -346,6 +391,13 @@ impl CompletionRequest {
 
 impl CompletionProvider for SqlCompletion {
     fn completion_leading(&self, item: &CompletionItem, cx: &App) -> Option<AnyElement> {
+        if item.data.as_ref().and_then(|value| value.as_str()) == Some("loading-metadata") {
+            return Some(
+                gpui_component::spinner::Spinner::new()
+                    .small()
+                    .into_any_element(),
+            );
+        }
         if item.kind != Some(lsp_types::CompletionItemKind::FIELD) {
             return None;
         }
@@ -593,7 +645,7 @@ impl CompletionProvider for SqlCompletion {
             let text = request.text.clone();
             let kind = request.scope.context.0;
             let analysis = memo.clone();
-            let (source, column, word, choices) = cx
+            let (source, column, word, choices, table_context) = cx
                 .background_executor()
                 .spawn(async move {
                     let source = text.to_string();
@@ -629,7 +681,8 @@ impl CompletionProvider for SqlCompletion {
                             column = choices.pop();
                         }
                     }
-                    (source, column, word, choices)
+                    let table_context = word.as_ref().is_some_and(|word| sql_assist::table_completion_context(kind, &source, word));
+                    (source, column, word, choices, table_context)
                 })
                 .await;
             if !request.current(&owner, &editor, cx) {
@@ -739,7 +792,9 @@ impl CompletionProvider for SqlCompletion {
                                 }
                             }
                         }
-                        missing = tables.is_empty();
+                        missing = tables.is_empty() && cache.as_ref().is_none_or(|cache| {
+                            cache.read("", 0, 1).ok().flatten().is_none()
+                        });
                     }
                     let names = tables
                         .iter()
@@ -754,9 +809,6 @@ impl CompletionProvider for SqlCompletion {
                             .unwrap_or_default()
                     } else if let Some(column) = column {
                         sql_assist::column_suggestions(kind, &column, &columns)
-                            .into_iter()
-                            .take(8)
-                            .collect()
                     } else if columns_only {
                         vec![]
                     } else {
@@ -784,7 +836,7 @@ impl CompletionProvider for SqlCompletion {
                     for item in &mut items {
                         if item.kind==Some(lsp_types::CompletionItemKind::FIELD)
                             && let Some(column)=columns.iter().find(|column|column.name==item.label) {
-                            item.data=Some(serde_json::json!({"column_type":column.data_type,"column_primary":column.primary}));
+                            item.data=Some(serde_json::json!({"column_type":column.data_type,"column_comment":column.comment,"column_primary":column.primary}));
                         }
                     }
 
@@ -814,6 +866,29 @@ impl CompletionProvider for SqlCompletion {
                 cell.completion
                     .has_tables
                     .set(tables_only && !items.is_empty());
+            })?;
+            let table_missing = missing && !columns_only && (tables_only || manual || table_context);
+            let auto_target = if let Some(column) = missing_column.clone() {
+                Some(Some(column))
+            } else if table_missing { Some(None) } else { None };
+            let auto_load = owner.update_in(cx, |cell, window, cx| {
+                let Some(column) = auto_target else { return false; };
+                if cell.column_loading.is_some() || cell.completion.gate.catalog_pending.borrow().is_some()
+                    || !cell.completion.automatic_metadata.borrow().can_claim(&request.scope, column.as_ref()) {
+                    return false;
+                }
+                let owner = cx.entity().downgrade();
+                let request = request.clone();
+                window.defer(cx, move |window, cx| {
+                    let _ = owner.update(cx, |cell, cx| {
+                        let scope = CompletionScope::capture(cell, cx);
+                        if cell.editing && cell.note_active && request.matches_resume(cell.editor.read(cx).text(), cell.editor.read(cx).cursor(), &scope)
+                            && cell.completion.automatic_metadata.borrow_mut().claim(&scope, column.as_ref()) {
+                            cell.load_assist_metadata(column, request, window, cx);
+                        }
+                    });
+                });
+                true
             })?;
             if !choices.is_empty() {
                 for (index, choice) in choices.iter().enumerate() {
@@ -852,7 +927,7 @@ impl CompletionProvider for SqlCompletion {
                 let item = owner.update_in(cx, |cell, _, cx| CompletionItem {
                     label: if !request.scope.connected && cell.column_loading.is_none() {
                         t(cx, "sql_assist.connect_load").to_string()
-                    } else if cell.column_loading.is_some() {
+                    } else if auto_load || cell.column_loading.is_some() {
                         t(cx, "sql_assist.loading_columns").to_string()
                     } else {
                         tr(
@@ -867,7 +942,7 @@ impl CompletionProvider for SqlCompletion {
                         .to_string()
                     },
                     detail: None,
-                    data: Some(serde_json::Value::String("load-columns".into())),
+                    data: Some(serde_json::Value::String(if auto_load || cell.column_loading.is_some() { "loading-metadata" } else { "load-columns" }.into())),
                     ..Default::default()
                 })?;
                 items.push(item);
@@ -875,12 +950,12 @@ impl CompletionProvider for SqlCompletion {
             } else {
                 gate.missing_column.borrow_mut().take();
             }
-            if missing && !columns_only && (tables_only || manual) {
+            if table_missing {
                 items.push(owner.update_in(cx, |cell, _, cx| {
                     CompletionItem {
                         label: t(
                             cx,
-                            if cell.column_loading.is_some()
+                            if auto_load || cell.column_loading.is_some()
                                 || cell.completion.gate.catalog_pending.borrow().is_some()
                             {
                                 "sql_assist.loading_tables"
@@ -891,7 +966,7 @@ impl CompletionProvider for SqlCompletion {
                             },
                         )
                         .to_string(),
-                        data: Some(serde_json::Value::String("load-tables".into())),
+                        data: Some(serde_json::Value::String(if auto_load || cell.completion.gate.catalog_pending.borrow().is_some() { "loading-metadata" } else { "load-tables" }.into())),
                         ..Default::default()
                     }
                 })?);
@@ -931,6 +1006,9 @@ impl CompletionProvider for SqlCompletion {
         window: &mut Window,
         cx: &mut Context<InputState>,
     ) -> bool {
+        if item.data.as_ref().and_then(|value| value.as_str()) == Some("loading-metadata") {
+            return true;
+        }
         let Some(current) = self.gate.accepted.borrow().clone() else {
             return true;
         };
@@ -1539,6 +1617,17 @@ impl CellView {
                 {
                     return;
                 }
+                let request = this
+                    .completion
+                    .gate
+                    .accepted
+                    .borrow()
+                    .clone()
+                    .filter(|latest| {
+                        latest.scope.context == request.scope.context
+                            && latest.scope.generation == request.scope.generation
+                    })
+                    .unwrap_or(request);
                 match reply {
                     Ok(Ok(Reply::Schema(schema))) => {
                         let origin = cx.entity_id();
@@ -1612,6 +1701,17 @@ impl CellView {
             *self.completion.gate.catalog_pending.borrow_mut() = Some(request);
             return;
         }
+        let request = self
+            .completion
+            .gate
+            .accepted
+            .borrow()
+            .clone()
+            .filter(|latest| {
+                latest.scope.context == request.scope.context
+                    && latest.scope.generation == request.scope.generation
+            })
+            .unwrap_or(request);
         let scope = CompletionScope::capture(self, cx);
         if scope.context != request.scope.context
             || scope.generation != request.scope.generation
@@ -1933,6 +2033,78 @@ impl CellView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[::core::prelude::v1::test]
+    fn column_completion_keeps_all_identifiers_and_original_insertions() {
+        let source = "SELECT * FROM works w WHERE w.";
+        let request =
+            sql_assist::column_request(Some(DatabaseKind::MySql), source, source.len()).unwrap();
+        let columns = (0..120)
+            .map(|i| turbodbn_services::database::workbench::Column {
+                name: format!("original_lookface_{i:03}"),
+                data_type: "varchar(500)".into(),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let suggestions =
+            sql_assist::column_suggestions(Some(DatabaseKind::MySql), &request, &columns);
+        let labels = std::array::from_fn(|_| String::new());
+        let items = completion_items(&Rope::from(source), suggestions, &labels);
+        assert_eq!(items.len(), 120);
+        let last = items.last().unwrap();
+        assert_eq!(last.label, "original_lookface_119");
+        let Some(CompletionTextEdit::Edit(edit)) = &last.text_edit else {
+            panic!("missing edit")
+        };
+        assert_eq!(edit.new_text, "`original_lookface_119`");
+    }
+
+    #[::core::prelude::v1::test]
+    fn automatic_metadata_is_once_per_target_and_connection_generation() {
+        let mut request = pending("SELECT * FROM works w WHERE w.");
+        let column = sql_assist::column_request(
+            request.scope.context.0,
+            &request.text.to_string(),
+            request.offset,
+        )
+        .unwrap();
+        let mut loads = AutomaticMetadata::default();
+        assert!(loads.claim(&request.scope, Some(&column)));
+        let mut filtered = column.clone();
+        filtered.prefix = "na".into();
+        assert!(!loads.claim(&request.scope, Some(&filtered)));
+        assert!(loads.claim(&request.scope, None));
+        assert!(!loads.claim(&request.scope, None));
+        request.scope.catalog.0 += 1;
+        assert!(!loads.claim(&request.scope, Some(&column)));
+        request.scope.generation += 1;
+        assert!(loads.claim(&request.scope, Some(&column)));
+        request.scope.connected = false;
+        assert!(!loads.claim(&request.scope, None));
+    }
+
+    #[::core::prelude::v1::test]
+    fn automatic_catalog_requests_only_follow_relation_context() {
+        for (source, expected) in [
+            ("SELECT * FROM wor", true),
+            ("SELECT * FROM db.", true),
+            ("SELECT cou", false),
+            ("SELECT 'FROM wor", false),
+            ("-- FROM wor", false),
+        ] {
+            let word = sql_assist::completion_word(Some(DatabaseKind::MySql), source, source.len());
+            assert_eq!(
+                word.as_ref()
+                    .is_some_and(|word| sql_assist::table_completion_context(
+                        Some(DatabaseKind::MySql),
+                        source,
+                        word
+                    )),
+                expected,
+                "{source}"
+            );
+        }
+    }
 
     fn pending(source: &str) -> CompletionRequest {
         CompletionRequest {

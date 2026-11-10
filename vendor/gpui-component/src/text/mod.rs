@@ -4,6 +4,7 @@ mod node;
 mod style;
 mod text_view;
 mod utils;
+mod word_selection;
 
 use gpui::App;
 pub use style::*;

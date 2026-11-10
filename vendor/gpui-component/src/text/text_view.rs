@@ -8,8 +8,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::{
     AnyElement, App, AppContext, Bounds, ClipboardItem, Context, Element, ElementId, Entity,
     EntityId, FocusHandle, GlobalElementId, InspectorElementId, InteractiveElement, IntoElement,
-    KeyBinding, LayoutId, ListState, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement,
-    Pixels, Point, RenderOnce, SharedString, Size, StyleRefinement, Styled, Timer, Window, div, px,
+    KeyBinding, LayoutId, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ParentElement, Pixels, Point, RenderOnce, SharedString, Size, StyleRefinement, Styled, Timer,
+    Window, div, px,
 };
 use smol::stream::StreamExt;
 
@@ -95,6 +96,7 @@ pub struct TextView {
     state: Entity<TextViewState>,
     style: StyleRefinement,
     selectable: bool,
+    word_selectable: bool,
     scrollable: bool,
     code_block_actions: Option<Arc<CodeBlockActionsFn>>,
 }
@@ -228,6 +230,7 @@ pub(crate) struct TextViewState {
     /// Is current in selection.
     is_selecting: bool,
     is_selectable: bool,
+    pub(crate) word_selectable: bool,
     list_state: ListState,
 }
 
@@ -243,6 +246,7 @@ impl TextViewState {
             selection_positions: (None, None),
             is_selecting: false,
             is_selectable: false,
+            word_selectable: false,
             list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
         }
     }
@@ -266,6 +270,14 @@ impl TextViewState {
         let pos = pos - self.bounds.origin;
         self.selection_positions = (Some(pos), Some(pos));
         self.is_selecting = true;
+    }
+
+    pub(crate) fn select_range(&mut self, start: Point<Pixels>, end: Point<Pixels>) {
+        self.selection_positions = (
+            Some(start - self.bounds.origin),
+            Some(end - self.bounds.origin),
+        );
+        self.is_selecting = false;
     }
 
     fn update_selection(&mut self, pos: Point<Pixels>) {
@@ -429,6 +441,7 @@ impl TextView {
             style: StyleRefinement::default(),
             state,
             selectable: false,
+            word_selectable: false,
             scrollable: false,
             code_block_actions: None,
         }
@@ -460,6 +473,7 @@ impl TextView {
             state,
             raw: html,
             selectable: false,
+            word_selectable: false,
             scrollable: false,
             code_block_actions: None,
         }
@@ -490,6 +504,14 @@ impl TextView {
                 }
             }
         }
+        self
+    }
+
+    /// Enable identifier-aware double-click selection for read-only code views.
+    /// Regular selectable text keeps its existing double-click behavior.
+    pub fn word_selectable(mut self, enabled: bool) -> Self {
+        self.word_selectable = enabled;
+        self.selectable |= enabled;
         self
     }
 
@@ -692,11 +714,13 @@ impl Element for TextView {
     ) {
         let entity_id = window.current_view();
         let is_selectable = self.selectable;
+        let word_selectable = self.word_selectable;
 
         self.state.update(cx, |state, _| {
             state.parent_entity = Some(entity_id);
             state.update_bounds(bounds);
             state.is_selectable = is_selectable;
+            state.word_selectable = word_selectable;
         });
 
         GlobalState::global_mut(cx)
@@ -711,12 +735,20 @@ impl Element for TextView {
 
             window.on_mouse_event({
                 let state = self.state.clone();
-                move |event: &MouseDownEvent, phase, _, cx| {
-                    if !bounds.contains(&event.position) || !phase.bubble() {
+                move |event: &MouseDownEvent, phase, window, cx| {
+                    if event.button != MouseButton::Left
+                        || !bounds.contains(&event.position)
+                        || !phase.bubble()
+                    {
                         return;
                     }
 
                     state.update(cx, |state, _| {
+                        if state.word_selectable {
+                            if let Some(focus) = &state.focus_handle {
+                                focus.focus(window);
+                            }
+                        }
                         state.start_selection(event.position);
                     });
                     cx.notify(entity_id);

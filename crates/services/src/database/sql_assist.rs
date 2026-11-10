@@ -308,6 +308,30 @@ impl ColumnMemo {
     }
 }
 
+/// Whether the caret expects a relation name; never infer this from SQL text inside literals.
+pub fn table_completion_context(
+    kind: Option<DatabaseKind>,
+    source: &str,
+    word: &CompletionWord,
+) -> bool {
+    let Some(before) = source.get(..word.range.start) else {
+        return false;
+    };
+    let Ok(tokens) = Tokenizer::new(dialect(kind).as_ref(), before).tokenize() else {
+        return false;
+    };
+    tokens
+        .iter()
+        .rev()
+        .find(|token| !matches!(token, Token::Whitespace(_)))
+        .is_some_and(|token| {
+            matches!(
+                token.to_string().to_ascii_uppercase().as_str(),
+                "FROM" | "JOIN" | "INTO" | "UPDATE" | "TABLE" | "."
+            )
+        })
+}
+
 /// Replace only the word at the caret; strings and comments never receive suggestions.
 pub fn complete(
     kind: Option<DatabaseKind>,

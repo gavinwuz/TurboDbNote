@@ -34,6 +34,8 @@ pub(super) fn handle(
     width: f32,
     cx: &App,
 ) -> AnyElement {
+    let fit_owner = owner.clone();
+    let fit_field = field.clone();
     div()
         .id("deferred-column-resize")
         .h_full()
@@ -42,6 +44,21 @@ pub(super) fn handle(
         .cursor_col_resize()
         .border_r_1()
         .border_color(cx.theme().border)
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            if event.click_count != 2 {
+                return;
+            }
+            cx.stop_propagation();
+            let owner = fit_owner.clone();
+            let field = fit_field.clone();
+            window.defer(cx, move |window, cx| {
+                let _ = owner.update(cx, |this, cx| {
+                    if let Some(col) = this.rows.columns.iter().position(|name| name == &field) {
+                        this.width_action(col, "fit", window, cx);
+                    }
+                });
+            });
+        })
         .on_drag(
             WidthDrag {
                 owner,

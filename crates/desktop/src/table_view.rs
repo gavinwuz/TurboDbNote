@@ -1004,7 +1004,7 @@ impl TableView {
                     .font_size,
             );
             for (name, width) in self.rows.columns.iter().zip(widths) {
-                self.auto_widths.entry(name.clone()).or_insert(width);
+                self.auto_widths.insert(name.clone(), width);
             }
         }
 
@@ -1014,7 +1014,7 @@ impl TableView {
         }
         let data = grid_ui::GridDelegate::snapshot(self, cx.entity().downgrade());
         self.grid_state.update(cx, |table, cx| {
-            let columns_changed = table.delegate().column_names() != data.column_names();
+            let columns_changed = table.delegate().column_layout() != data.column_layout();
             table.clear_selection(cx);
             *table.delegate_mut() = data;
             if columns_changed {
