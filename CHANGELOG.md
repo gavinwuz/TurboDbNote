@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Add a disabled-by-default current-user launch-at-login switch in General settings for Windows and Linux.
+
 ## [0.1.8] - 2026-11-10
 
 - Let result headers ellipsize independently of content-based widths, keep narrow numeric columns compact, and fit full names/content by double-clicking a resize boundary.

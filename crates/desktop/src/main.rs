@@ -19,6 +19,7 @@ mod about;
 mod app_store;
 mod assets;
 mod auto_connect;
+mod autostart;
 mod catalog;
 mod catalog_cache;
 mod cell;

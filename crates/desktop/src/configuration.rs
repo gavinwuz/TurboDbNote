@@ -835,6 +835,45 @@ impl Configuration {
 
         body = body.child(
             div()
+                .v_flex()
+                .gap_2()
+                .child(
+                    gpui_component::switch::Switch::new("autostart")
+                        .label(t(cx, "settings.general.autostart"))
+                        .checked(self.general.autostart)
+                        .disabled(self.locked)
+                        .on_click(cx.listener(|this, value, _, cx| {
+                            let enabled = *value;
+                            this.locked = true;
+                            cx.spawn(async move |view, cx| {
+                                let result = cx
+                                    .background_executor()
+                                    .spawn(async move { crate::autostart::set_enabled(enabled) })
+                                    .await;
+                                let _ = view.update(cx, |this, cx| {
+                                    this.locked = false;
+                                    match result {
+                                        Ok(()) => {
+                                            this.general.autostart = enabled;
+                                            crate::feedback::success(
+                                                t(cx, "settings.general.autostart_saved"),
+                                                cx,
+                                            );
+                                        }
+                                        Err(key) => crate::feedback::error(t(cx, &key), cx),
+                                    }
+                                    cx.notify();
+                                });
+                            })
+                            .detach();
+                            cx.notify();
+                        })),
+                )
+                .child(t(cx, "settings.general.autostart_hint")),
+        );
+
+        body = body.child(
+            div()
                 .border_t_1()
                 .border_color(cx.theme().border)
                 .pt_3()

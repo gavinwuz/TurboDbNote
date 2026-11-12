@@ -3,6 +3,10 @@
   "id": "en",
   "name": "English",
   "strings": {
+    "settings.general.autostart": "Launch at login",
+    "settings.general.autostart_hint": "Open TurboDBNote when you sign in. Applies to the current user; moving the executable requires enabling this again.",
+    "settings.general.autostart_saved": "Startup preference updated.",
+    "settings.general.autostart_failed": "Could not update startup registration. Check your account permissions and try again.",
     "agents.setup.unbound": "Codex CLI was detected. Select a detected version or install and bind the managed version.",
     "agents.setup.busy": "Wait for installation or sign-in to finish, or cancel it before connecting.",
     "agents.setup.cancelled": "This operation was cancelled. You can start it again.",

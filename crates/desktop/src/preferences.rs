@@ -71,6 +71,7 @@ pub struct GeneralPreferences {
     pub note_directory: String,
     pub note_autosave: bool,
     pub close_to_tray: bool,
+    pub autostart: bool,
     pub theme: Option<String>,
 }
 impl Default for GeneralPreferences {
@@ -82,6 +83,7 @@ impl Default for GeneralPreferences {
             note_directory: String::new(),
             note_autosave: true,
             close_to_tray: false,
+            autostart: false,
             theme: None,
         }
     }

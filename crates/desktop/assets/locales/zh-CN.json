@@ -3,6 +3,10 @@
   "id": "zh-CN",
   "name": "简体中文",
   "strings": {
+    "settings.general.autostart": "开机启动",
+    "settings.general.autostart_hint": "登录系统时打开 TurboDBNote，仅对当前用户生效；移动程序位置后需重新开启。",
+    "settings.general.autostart_saved": "开机启动设置已更新。",
+    "settings.general.autostart_failed": "无法更新开机启动项，请检查当前账号权限后重试。",
     "agents.setup.unbound": "已检测到 Codex CLI，请选择检测结果中的版本，或下载安装并绑定托管版本。",
     "agents.setup.busy": "请等待安装或登录完成，或取消当前操作后再连接。",
     "agents.setup.cancelled": "本次操作已取消，可重新发起。",
