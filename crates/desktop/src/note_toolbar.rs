@@ -362,7 +362,6 @@ impl NoteView {
         }
         names.sort();
         names.dedup();
-        names.truncate(2000);
         let context = (
             self.note.default_connection_id,
             names.clone(),
@@ -381,9 +380,15 @@ impl NoteView {
                     window,
                     cx,
                 );
-                picker.set_selected_value(&value, window, cx);
+                if picker.selected_value() != Some(&value) {
+                    picker.set_selected_value(&value, window, cx);
+                }
             });
         }
+        let loading_databases = self
+            .note
+            .default_connection_id
+            .is_some_and(|id| self.connections.read(cx).note_databases_loading(id));
         let binding = cx.entity();
         let clear_binding = binding.clone();
         div()
@@ -475,6 +480,25 @@ impl NoteView {
                     )
                     .into_any_element()
             })
+            .when(
+                loading_databases
+                    || self.note.default_connection_id.is_some_and(|id| {
+                        self.connections
+                            .read(cx)
+                            .note_connection_state(id)
+                            .is_none()
+                    }),
+                |row| {
+                    row.child(
+                        div()
+                            .h_flex()
+                            .gap_1()
+                            .text_xs()
+                            .child(gpui_component::spinner::Spinner::new().small())
+                            .child(t(cx, "notes.databases_refreshing")),
+                    )
+                },
+            )
             .into_any_element()
     }
     pub(crate) fn file_menu(mut menu: PopupMenu, view: WeakEntity<Self>, cx: &App) -> PopupMenu {

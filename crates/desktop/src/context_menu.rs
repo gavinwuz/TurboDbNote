@@ -41,3 +41,33 @@ fn scoped_inner(
             }),
     )
 }
+
+/// Shared column copy actions for both database navigation layouts.
+pub fn column_copy(
+    mut menu: PopupMenu,
+    name: &str,
+    kind: Option<turbodbn_services::DatabaseKind>,
+    cx: &App,
+) -> PopupMenu {
+    use turbodbn_services::DatabaseKind;
+    let quoted = match kind {
+        Some(DatabaseKind::MySql | DatabaseKind::ClickHouse) => {
+            format!("`{}`", name.replace('`', "``"))
+        }
+        _ => format!("\"{}\"", name.replace('"', "\"\"")),
+    };
+    for (key, value) in [
+        ("grid.column.copy", name.to_owned()),
+        ("grid.column.copy_quoted", quoted),
+    ] {
+        menu = menu.item(
+            gpui_component::menu::PopupMenuItem::new(crate::locale::t(cx, key)).on_click(
+                move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+                    crate::feedback::success(crate::locale::t(cx, "feedback.copied"), cx);
+                },
+            ),
+        );
+    }
+    menu
+}

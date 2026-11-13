@@ -1739,8 +1739,8 @@ impl InputState {
     pub(super) fn previous_boundary(&self, offset: usize) -> usize {
         let mut offset = self.text.clip_offset(offset.saturating_sub(1), Bias::Left);
         if let Some(ch) = self.text.char_at(offset) {
-            if ch == '\r' {
-                offset -= 1;
+            if ch == '\r' && offset > 0 && self.text.char_at(offset + 1) == Some('\n') {
+                offset = self.text.clip_offset(offset - 1, Bias::Left);
             }
         }
 

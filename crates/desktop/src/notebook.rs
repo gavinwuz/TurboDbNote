@@ -53,6 +53,7 @@ pub struct NoteView {
             gpui_component::select::SearchableVec<crate::database::DatabaseChoice>,
         >,
     >,
+    database_refresh: Option<Task<()>>,
     default_context: Option<(Option<Uuid>, Vec<String>, String)>,
     batch: Option<batch_ui::Batch>,
     batch_notice: String,
@@ -525,6 +526,54 @@ impl NoteView {
                 },
             ),
         ];
+        let mut picker_was_open = false;
+        subscriptions.push(cx.observe(&default_picker, move |this, picker, cx| {
+            let open = picker.read(cx).is_open();
+            let opening = open && !picker_was_open;
+            picker_was_open = open;
+            if !open {
+                this.database_refresh = None;
+            }
+            if opening && let Some(id) = this.note.default_connection_id {
+                let connections = this.connections.clone();
+                cx.defer(move |cx| {
+                    connections.update(cx, |db, cx| db.ensure_note_connection(id, false, cx));
+                });
+                this.database_refresh = Some(cx.spawn(async move |note, cx| {
+                    let started = std::time::Instant::now();
+                    loop {
+                        gpui::Timer::after(std::time::Duration::from_millis(100)).await;
+                        let keep_waiting = note
+                            .update(cx, |this, cx| {
+                                if this.note.default_connection_id != Some(id)
+                                    || !this.default_picker.read(cx).is_open()
+                                {
+                                    return false;
+                                }
+                                let db = this.connections.read(cx);
+                                match db.note_connection_state(id) {
+                                    Some(false) => false,
+                                    None => started.elapsed().as_secs() < 60,
+                                    Some(true) => {
+                                        let pending = db.note_databases_loading(id);
+                                        if pending {
+                                            return false;
+                                        }
+                                        !this
+                                            .connections
+                                            .update(cx, |db, cx| db.refresh_note_databases(id, cx))
+                                            && started.elapsed().as_secs() < 60
+                                    }
+                                }
+                            })
+                            .unwrap_or(false);
+                        if !keep_waiting {
+                            break;
+                        }
+                    }
+                }));
+            }
+        }));
         let connections_observer = cx.observe(&connections, |_, _, cx| cx.notify());
         let add_focus = cx.focus_handle();
         subscriptions.push(cx.on_focus_in(&add_focus, window, |_, _, cx| cx.notify()));
@@ -549,6 +598,7 @@ impl NoteView {
             access_mode: Default::default(),
             default_database,
             default_picker,
+            database_refresh: None,
             default_context: None,
             batch: None,
             batch_notice: String::new(),

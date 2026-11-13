@@ -86,7 +86,7 @@ enum Row {
     DatabaseMore(Uuid),
     Category(Scope, String),
     Object(Scope, String, Object),
-    Column(workbench::Column),
+    Column(Scope, workbench::Column),
     Page(Scope, String),
     FilterMore(Uuid),
     FilterUnindexed(Uuid),
@@ -956,9 +956,9 @@ impl DatabaseView {
                                             .contains(&scope.key(&object_key))
                                         {
                                             if let Some(columns) = page.columns.get(&object_key) {
-                                                rows.extend(
-                                                    columns.iter().cloned().map(Row::Column),
-                                                );
+                                                rows.extend(columns.iter().cloned().map(
+                                                    |column| Row::Column(scope.clone(), column),
+                                                ));
                                             } else if page.busy.contains(&object_key) {
                                                 rows.push(Row::Notice("ddl.loading"));
                                             }
@@ -1621,20 +1621,28 @@ impl DatabaseView {
                     )
                     .into_any_element()
             }
-            Row::Column(column) => div()
-                .h_flex()
-                .pl(px(108.))
-                .gap_2()
-                .text_sm()
-                .child(crate::table_view::column_icon(Some(&column), cx))
-                .child(div().flex_1().truncate().child(column.name))
-                .child(
+            Row::Column(scope, column) => {
+                let name = column.name.clone();
+                let kind = self.note_profile(scope.id).map(|profile| profile.kind);
+                crate::context_menu::scoped(
+                    SharedString::from(scope.key(&format!("column-menu:{name}"))),
                     div()
-                        .text_color(cx.theme().muted_foreground)
-                        .truncate()
-                        .child(column.data_type),
+                        .h_flex()
+                        .pl(px(108.))
+                        .gap_2()
+                        .text_sm()
+                        .child(crate::table_view::column_icon(Some(&column), cx))
+                        .child(div().flex_1().truncate().child(column.name))
+                        .child(
+                            div()
+                                .text_color(cx.theme().muted_foreground)
+                                .truncate()
+                                .child(column.data_type),
+                        ),
+                    move |menu, _, cx| crate::context_menu::column_copy(menu, &name, kind, cx),
                 )
-                .into_any_element(),
+                .into_any_element()
+            }
             Row::Page(scope, category) => {
                 let page = self.tree.pages.get(&page_key(&scope, &category));
                 let busy = page.is_some_and(|p| !p.busy.is_empty());

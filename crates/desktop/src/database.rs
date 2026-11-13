@@ -464,6 +464,21 @@ impl DatabaseView {
             .get(&id)
             .is_none_or(|rule| rule.matches(name))
     }
+    pub(crate) fn note_databases_loading(&self, id: Uuid) -> bool {
+        self.active_operation
+            .as_ref()
+            .is_some_and(|(target, _, kind)| {
+                *target == id && matches!(kind, OperationKind::Databases)
+            })
+    }
+
+    pub(crate) fn refresh_note_databases(&mut self, id: Uuid, cx: &mut Context<Self>) -> bool {
+        if self.note_connection_state(id) == Some(true) && self.active_operation.is_none() {
+            return self.request_operation(id, OperationKind::Databases, cx);
+        }
+        false
+    }
+
     pub(crate) fn note_databases(&self, id: Uuid) -> Vec<String> {
         self.directory_databases(id)
             .into_iter()

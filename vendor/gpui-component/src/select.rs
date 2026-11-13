@@ -634,6 +634,9 @@ where
     }
 
     /// Get the selected index of the select.
+    /// Whether the candidate menu is open.
+    pub fn is_open(&self) -> bool { self.open }
+
     pub fn selected_index(&self, cx: &App) -> Option<IndexPath> {
         self.list.read(cx).selected_index()
     }

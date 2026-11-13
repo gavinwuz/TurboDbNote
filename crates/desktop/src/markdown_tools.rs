@@ -62,9 +62,13 @@ fn byte_offset(source: &str, utf16: usize) -> usize {
 fn wrap(source: &str, range: Range<usize>, marker: &str) -> Edit {
     let selected = &source[range.clone()];
     let exact_before = source[..range.start].ends_with(marker)
-        && !source[..range.start - marker.len()].ends_with(&marker[..1]);
+        && !source
+            .get(..range.start - marker.len())
+            .is_some_and(|text| text.ends_with(&marker[..1]));
     let exact_after = source[range.end..].starts_with(marker)
-        && !source[range.end + marker.len()..].starts_with(&marker[..1]);
+        && !source
+            .get(range.end + marker.len()..)
+            .is_some_and(|text| text.starts_with(&marker[..1]));
     if exact_before && exact_after {
         let start = range.start - marker.len();
         return Edit {
@@ -454,6 +458,21 @@ impl CellView {
 #[cfg(test)]
 mod tests {
     use super::{Edit, Format, byte_offset, transform};
+    #[::core::prelude::v1::test]
+    fn formatting_next_to_unicode_keeps_valid_boundaries() {
+        for (source, range) in [
+            ("中**标题**文", 5..11),
+            ("😀*标题*文", 5..11),
+            ("\r\n## 流程为：\r\n登录 → 选择区服角色", 0..0),
+        ] {
+            for format in [Format::Bold, Format::Italic, Format::Strike, Format::Code] {
+                let edit = transform(source, range.clone(), format);
+                assert!(source.is_char_boundary(edit.range.start));
+                assert!(source.is_char_boundary(edit.range.end));
+            }
+        }
+    }
+
     fn apply(source: &str, edit: Edit) -> String {
         format!(
             "{}{}{}",

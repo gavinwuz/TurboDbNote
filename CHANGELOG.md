@@ -4,6 +4,14 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Share column-copy actions across merged-tree and two-pane database object lists.
+
+- Add clipped column-name copy menus and harden editor deletion at a leading CRLF boundary. The reported Markdown crash still requires its original reproduction.
+
+- Resume Note database-list refresh after its single automatic connection attempt; stop pending refresh on menu close or target change.
+
+- Refresh the connected Note database selector on opening while retaining cached choices and search, with visible refresh progress.
+
 - Add a disabled-by-default current-user launch-at-login switch in General settings for Windows and Linux.
 
 ## [0.1.8] - 2026-11-10

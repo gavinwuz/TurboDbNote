@@ -3,6 +3,8 @@
   "id": "en",
   "name": "English",
   "strings": {
+    "grid.column.copy_quoted": "Copy quoted column name",
+    "notes.databases_refreshing": "Refreshing databases…",
     "settings.general.autostart": "Launch at login",
     "settings.general.autostart_hint": "Open TurboDBNote when you sign in. Applies to the current user; moving the executable requires enabling this again.",
     "settings.general.autostart_saved": "Startup preference updated.",

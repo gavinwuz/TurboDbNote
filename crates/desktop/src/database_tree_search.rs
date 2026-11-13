@@ -425,7 +425,12 @@ impl DatabaseView {
                                 && let Some(page) = self.tree.pages.get(&page_key(&scope, category))
                             {
                                 if let Some(columns) = page.columns.get(&key) {
-                                    group_rows.extend(columns.iter().cloned().map(Row::Column));
+                                    group_rows.extend(
+                                        columns
+                                            .iter()
+                                            .cloned()
+                                            .map(|column| Row::Column(scope.clone(), column)),
+                                    );
                                 } else if page.busy.contains(&key) {
                                     group_rows.push(Row::Notice("ddl.loading"));
                                 }

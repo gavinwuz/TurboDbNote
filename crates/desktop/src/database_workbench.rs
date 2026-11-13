@@ -841,7 +841,14 @@ impl DatabaseView {
                     let o = object.clone();
                     let col = column.clone();
                     let sql = schema.ddl.clone();
-                    root = root.child(
+                    let copy_name = column.name.clone();
+                    let copy_kind = self
+                        .selected_database
+                        .as_ref()
+                        .and_then(|(id, _)| self.note_profile(*id))
+                        .map(|profile| profile.kind);
+                    root = root.child(crate::context_menu::scoped(
+                        SharedString::from(format!("column-copy-{key}-{index}")),
                         div()
                             .id(SharedString::from(format!("column-{key}-{index}")))
                             .h_flex()
@@ -886,7 +893,10 @@ impl DatabaseView {
                                     );
                                 }
                             })),
-                    );
+                        move |menu, _, cx| {
+                            crate::context_menu::column_copy(menu, &copy_name, copy_kind, cx)
+                        },
+                    ));
                 }
             }
             for (label, rows) in [

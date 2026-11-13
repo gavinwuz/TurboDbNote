@@ -3,6 +3,8 @@
   "id": "zh-CN",
   "name": "简体中文",
   "strings": {
+    "grid.column.copy_quoted": "复制带引用列名",
+    "notes.databases_refreshing": "正在刷新数据库…",
     "settings.general.autostart": "开机启动",
     "settings.general.autostart_hint": "登录系统时打开 TurboDBNote，仅对当前用户生效；移动程序位置后需重新开启。",
     "settings.general.autostart_saved": "开机启动设置已更新。",
