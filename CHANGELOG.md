@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-13
+
 - Share column-copy actions across merged-tree and two-pane database object lists.
 
 - Add clipped column-name copy menus and harden editor deletion at a leading CRLF boundary. The reported Markdown crash still requires its original reproduction.
