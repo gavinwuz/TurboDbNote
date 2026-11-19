@@ -4,6 +4,8 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-19
+
 - Add four built-in light styles, defaulting to Celadon White, and preserve the chosen light palette across dark/light switching. Hide unloaded-count placeholders in database object trees.
 - Release reconstructible reading and result-display caches after a Note stays in the background for 20 minutes, preserving editors, undo history, original results and pending changes. Add opt-in bounded object-lifetime diagnostics.
 - Add manual SQL source-file reload with immutable snapshots and retained previews on failure. Changed content resets session-only skip selections; reload never executes SQL.
