@@ -26,6 +26,11 @@ pub(super) struct GridDelegate {
     preview_order: std::collections::VecDeque<(usize, usize)>,
 }
 impl GridDelegate {
+    pub(super) fn release_display_caches(&mut self) {
+        self.previews = Default::default();
+        self.preview_order = Default::default();
+    }
+
     pub fn column_layout(&self) -> Vec<(&str, Pixels)> {
         self.columns
             .iter()
@@ -684,5 +689,33 @@ mod layout_tests {
         assert_ne!(before.column_layout(), after.column_layout());
         after.columns[0] = GridColumn::new("data-0", "total").width(px(220.));
         assert_ne!(before.column_layout(), after.column_layout());
+    }
+}
+
+#[cfg(test)]
+mod idle_cache_tests {
+    use super::GridDelegate;
+    use std::rc::Rc;
+
+    #[test]
+    fn cache_release_preserves_source_and_pending_grid_state() {
+        let mut grid = GridDelegate::new();
+        let rows = grid.rows.clone();
+        grid.selection = Some((3, 2));
+        grid.pending = vec![3];
+        grid.deleted = vec![4];
+        grid.defaults = vec![(5, 1)];
+        grid.offset = 200;
+        grid.previews.insert((3, 2), "display copy".into());
+        grid.preview_order.push_back((3, 2));
+        grid.release_display_caches();
+        assert!(Rc::ptr_eq(&grid.rows, &rows));
+        assert_eq!(grid.selection, Some((3, 2)));
+        assert_eq!(grid.pending, vec![3]);
+        assert_eq!(grid.deleted, vec![4]);
+        assert_eq!(grid.defaults, vec![(5, 1)]);
+        assert_eq!(grid.offset, 200);
+        assert!(grid.previews.is_empty());
+        assert!(grid.preview_order.is_empty());
     }
 }

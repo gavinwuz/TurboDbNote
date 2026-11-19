@@ -639,7 +639,7 @@ impl DatabaseView {
                                                 .filter(|p| p.loaded && !p.more)
                                         });
                                     let count = if this.browser.supported && page.is_none() {
-                                        t(cx, "browser.not_loaded").to_string()
+                                        String::new()
                                     } else {
                                         format!(
                                             "{count}{}",
@@ -668,7 +668,11 @@ impl DatabaseView {
                                     } else {
                                         IconName::ChevronDown
                                     })
-                                    .label(format!("{} ({count})", t(cx, label)))
+                                    .label(if count.is_empty() {
+                                        t(cx, label).to_string()
+                                    } else {
+                                        format!("{} ({count})", t(cx, label))
+                                    })
                                     .justify_start()
                                     .w_full()
                                     .h(px(30.))

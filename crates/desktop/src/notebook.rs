@@ -40,6 +40,7 @@ pub enum NoteEvent {
     Ready,
 }
 pub struct NoteView {
+    _lifetime: crate::lifecycle::Guard,
     query_filter: Option<Entity<crate::table_view::TableView>>,
     query_filter_subscription: Option<Subscription>,
     pub key: String,
@@ -67,6 +68,7 @@ pub struct NoteView {
     cell_list: ListState,
     view_lists: std::collections::HashMap<String, ListState>,
     active_views: std::collections::HashSet<String>,
+    cache_idle_task: Option<Task<()>>,
     editor_height_limit: f32,
     cell_observers: std::collections::HashMap<EntityId, Subscription>,
     hash: [u8; 32],
@@ -589,6 +591,7 @@ impl NoteView {
         });
         let cells = std::mem::take(&mut loaded.note.cells);
         let mut this = Self {
+            _lifetime: crate::lifecycle::Guard::new(crate::lifecycle::Kind::NoteView),
             key: format!("note-{}", loaded.note.id),
             path,
             draft,
@@ -612,6 +615,7 @@ impl NoteView {
             cell_list: ListState::new(0, ListAlignment::Top, px(200.)).measure_all(),
             view_lists: Default::default(),
             active_views: Default::default(),
+            cache_idle_task: None,
             editor_height_limit: 280.,
             cell_observers: Default::default(),
             hash: loaded.hash,
@@ -905,6 +909,9 @@ impl NoteView {
     // Typing changes the document revision, not its layout or index metadata.
     // Only the first dirty transition (or clearing a save error) updates Note chrome.
     fn content_changed(&mut self, cx: &mut Context<Self>) {
+        if self.active_views.is_empty() {
+            self.schedule_cache_release(cx);
+        }
         if self.deleting {
             return;
         }
@@ -919,6 +926,9 @@ impl NoteView {
         }
     }
     fn changed(&mut self, cx: &mut Context<Self>) {
+        if self.active_views.is_empty() {
+            self.schedule_cache_release(cx);
+        }
         if self.deleting {
             return;
         }
@@ -1560,6 +1570,7 @@ impl Render for NoteView {
 /// A viewport owns no document, save worker or database task.
 /// Closing it only drops its navigation state; the NoteLibrary remains the sole owner.
 pub(crate) struct NotePane {
+    _lifetime: crate::lifecycle::Guard,
     pub key: String,
     pub owner: Entity<NoteView>,
     list: ListState,
@@ -1578,6 +1589,7 @@ impl NotePane {
         });
         let observe = cx.observe(&owner, |_, _, cx| cx.notify());
         Self {
+            _lifetime: crate::lifecycle::Guard::new(crate::lifecycle::Kind::NotePane),
             key,
             owner,
             list,
@@ -1648,6 +1660,26 @@ impl NoteView {
         }
         self.set_view_active(key, false, cx);
     }
+    fn schedule_cache_release(&mut self, cx: &mut Context<Self>) {
+        self.cache_idle_task = Some(cx.spawn(async move |owner, cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(20 * 60))
+                .await;
+            let _ = owner.update(cx, |note, cx| {
+                note.cache_idle_task = None;
+                if !note.active_views.is_empty() {
+                    return;
+                }
+                if note.pending() || note.running(cx) {
+                    note.schedule_cache_release(cx);
+                    return;
+                }
+                for cell in &note.cells {
+                    cell.update(cx, |cell, cx| cell.release_display_caches(cx));
+                }
+            });
+        }));
+    }
     fn set_view_active(&mut self, key: &str, active: bool, cx: &mut Context<Self>) {
         if active {
             self.active_views.insert(key.into());
@@ -1655,6 +1687,11 @@ impl NoteView {
             self.active_views.remove(key);
         }
         let active = !self.active_views.is_empty();
+        if active {
+            self.cache_idle_task = None;
+        } else if self.cache_idle_task.is_none() {
+            self.schedule_cache_release(cx);
+        }
         for cell in &self.cells {
             cell.update(cx, |cell, cx| {
                 cell.set_note_active(active, cx);

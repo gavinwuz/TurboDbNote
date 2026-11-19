@@ -2205,6 +2205,24 @@
     "compare.issue.parse_column": "Column {column} could not be fully parsed; other supported changes are included.",
     "compare.object_name": "Object",
     "indexes.preview_target": "Target database: {database}",
-    "compare.attribute_summary": "Differences: {different}."
+    "compare.attribute_summary": "Differences: {different}.",
+    "settings.theme.celadon": "Celadon White (recommended)",
+    "settings.theme.mist_blue": "Mist Blue",
+    "settings.theme.warm_paper": "Warm Paper",
+    "settings.theme.graphite_purple": "Graphite Purple",
+    "script.selection.empty": "Select at least one statement to execute.",
+    "script.selection.toggle": "Include or skip this entire statement",
+    "script.selection.skipped": "Skipped",
+    "script.selection.summary": "Execute {execute} statements; skip {skip}.",
+    "script.selection.restore": "Restore all",
+    "script.reload": "Reload SQL script",
+    "script.reload.choose": "No source file is linked. Use Replace file to select the SQL source first.",
+    "script.reload.done": "SQL script reloaded. If content changed, skipped selections were reset.",
+    "script.view_full": "View full SQL",
+    "script.selection.unsupported_hint": "Skip unsupported statements before execution. Selected statements are still validated.",
+    "script.selection.dependencies": "Skipping USE, SET or transaction controls can affect later statements. Skipped statements will not be run automatically.",
+    "script.full.search": "Search SQL lines",
+    "script.full.wrap": "Wrap lines",
+    "script.reload.failed": "Could not reload the SQL script; the previous preview was kept. {reason} Check the source file or choose Replace file to select it again."
   }
 }

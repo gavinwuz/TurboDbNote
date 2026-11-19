@@ -202,3 +202,7 @@ MySQL Note DBA support includes bounded log/replication/process/engine diagnosti
 Connection name generation uses username@last-two-IPv4-octets:port with numeric collision suffixes; selector details retain the full account/host/port. Connection menus can copy a password-free basic URL for supported drivers, with TLS options and a reminder to configure advanced settings in the destination tool.
 
 Missing or inaccessible Note files offer recovery actions: retry, locate the original document by ID, or explicitly remove only its sidebar/recent/restore record. Open documents must be saved and closed first; unavailable storage is never automatically purged.
+
+Light appearance includes Celadon White (default), Mist Blue, Warm Paper and Graphite Purple in Settings → General → Themes. Object categories omit unloaded-count placeholders.
+
+SQL file cells support manual source reload, scrollable statement selection with per-statement skipping, and a full SQL viewer with line numbers, search and wrapping. Reload never runs SQL; changed content resets session-only skip selections.

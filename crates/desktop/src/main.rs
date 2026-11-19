@@ -17,6 +17,7 @@ mod table_designer;
 
 mod about;
 mod app_store;
+mod appearance;
 mod assets;
 mod auto_connect;
 mod autostart;
@@ -36,6 +37,7 @@ mod driver_components;
 mod drivers;
 mod duration;
 mod feedback;
+mod lifecycle;
 mod locale;
 mod locale_catalog;
 mod mongo_tree;
@@ -52,6 +54,7 @@ mod script_cell;
 mod script_import;
 mod script_results;
 mod settings;
+mod sql_source_view;
 mod table_view;
 mod tabs;
 mod task_list;
@@ -88,6 +91,7 @@ fn main() {
                 cx,
             );
         }
+        appearance::initialize(cx);
         gpui_component::Theme::global_mut(cx).font_family =
             preferences.general.font_family.clone().into();
         gpui_component::Theme::global_mut(cx).font_size =
@@ -132,12 +136,9 @@ fn main() {
                     .general
                     .theme
                     .clone()
-                    && let Some(theme) = gpui_component::ThemeRegistry::global(cx)
-                        .themes()
-                        .get(name.as_str())
-                        .cloned()
+                    && let Some(theme) = appearance::resolve(&name, cx)
                 {
-                    gpui_component::Theme::global_mut(cx).apply_config(&theme);
+                    appearance::apply_selected(&theme, cx);
                 }
                 crate::locale::apply_font(cx);
                 cx.refresh_windows();

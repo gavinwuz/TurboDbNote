@@ -70,6 +70,7 @@ pub struct BatchScope {
     connection: SavedConnection,
 }
 pub struct CellView {
+    _lifetime: crate::lifecycle::Guard,
     query_only: bool,
     note_path: std::path::PathBuf,
     batch_view: Option<Entity<crate::script_cell::ScriptView>>,
@@ -487,6 +488,7 @@ impl CellView {
         subscriptions.push(cx.on_focus_in(&focus, window, |_, _, cx| cx.notify()));
         subscriptions.push(cx.on_focus_out(&focus, window, |_, _, _, cx| cx.notify()));
         Self {
+            _lifetime: crate::lifecycle::Guard::new(crate::lifecycle::Kind::CellView),
             query_only: false,
             note_path,
             batch_view: None,
@@ -824,6 +826,16 @@ impl CellView {
                             }),
                     )
                     .child(self.scope_controls(window, cx))
+                    .child(crate::assets::note_tool("reload-sql-file")
+                        .icon(gpui_component::Icon::default().path("icons/refresh.svg"))
+                        .tooltip(t(cx, "script.reload"))
+                        .disabled(self.working(cx) || self.batch_locked || self.result_pending(cx))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(script) = &this.script {
+                                if script.read(cx).script.source_path.is_none() { cx.emit(CellEvent::ReplaceSqlFile); }
+                                else { script.update(cx, |script, cx| script.reload(cx)); }
+                            }
+                        })))
                     .child(self.cell_actions(true, window, cx))
                     .child(
                         crate::assets::note_tool("sql-file-more")
@@ -834,6 +846,7 @@ impl CellView {
                                 move |mut menu, window, cx| {
                                     for (key, action) in [
                                         ("notes.file.replace", 0),
+                                        ("script.reload", 6),
                                         ("restore.open", 5),
                                         ("clickhouse.sql.reanalyze", 4),
                                         ("script.copy_path", 1),
@@ -850,6 +863,7 @@ impl CellView {
                                                     window.defer(cx,move |window,cx| {
                                                         let _ = target.update(cx, |this, cx| {
                                                             match action {
+                                                                6 => { if let Some(script) = &this.script { script.update(cx, |script, cx| script.reload(cx)); } }
                                                                 0 => cx.emit(
                                                                     CellEvent::ReplaceSqlFile,
                                                                 ),
@@ -1211,6 +1225,15 @@ impl CellView {
                 ));
                 feedback::success(t(cx, "feedback.copied"), cx);
             }))
+    }
+    pub(crate) fn release_display_caches(&mut self, cx: &mut Context<Self>) {
+        self.reading = None;
+        if let Some(results) = &self.results {
+            results.update(cx, |view, cx| view.release_display_caches(cx));
+        }
+        for script in self.script.iter().chain(self.batch_view.iter()) {
+            script.update(cx, |view, cx| view.release_display_caches(cx));
+        }
     }
     pub(crate) fn set_note_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if !active {

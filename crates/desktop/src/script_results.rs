@@ -99,6 +99,7 @@ struct Detail {
     status: &'static str,
 }
 pub struct ScriptResults {
+    _lifetime: crate::lifecycle::Guard,
     rowsets: VecDeque<(
         u64,
         Entity<crate::table_view::TableView>,
@@ -143,6 +144,18 @@ pub struct ScriptResults {
     metadata_job: Option<(uuid::Uuid, Instant)>,
 }
 impl ScriptResults {
+    pub(crate) fn has_pending_changes(&self, cx: &App) -> bool {
+        self.rowsets
+            .iter()
+            .any(|(_, view, ..)| view.read(cx).staged() || view.read(cx).writing())
+    }
+
+    pub(crate) fn release_display_caches(&mut self, cx: &mut Context<Self>) {
+        for (_, view, ..) in &self.rowsets {
+            view.update(cx, |view, cx| view.release_display_caches(cx));
+        }
+    }
+
     pub fn new(
         connections: Entity<DatabaseView>,
         window: &mut Window,
@@ -150,6 +163,7 @@ impl ScriptResults {
     ) -> Self {
         cx.on_release(|this, cx| this.cancel_metadata(cx)).detach();
         Self {
+            _lifetime: crate::lifecycle::Guard::new(crate::lifecycle::Kind::ScriptResults),
             rowsets: VecDeque::new(),
             active_rowset: None,
             rowset_subscriptions: Default::default(),

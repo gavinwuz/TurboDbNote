@@ -215,7 +215,14 @@ impl Configuration {
         (general, providers, extensions, database)
     }
     pub fn reset_theme(&mut self, cx: &mut Context<Self>) {
-        self.general.theme = None;
+        if !self
+            .general
+            .theme
+            .as_ref()
+            .is_some_and(|name| crate::appearance::CHOICES.iter().any(|(id, _)| id == name))
+        {
+            self.general.theme = None;
+        }
         cx.notify();
     }
     pub fn signature(&self, cx: &App) -> String {
@@ -383,12 +390,9 @@ impl Configuration {
             prefs.providers = self.providers.clone();
             prefs.extensions = self.extensions.clone();
             if let Some(name) = &self.general.theme
-                && let Some(theme) = gpui_component::ThemeRegistry::global(cx)
-                    .themes()
-                    .get(name.as_str())
-                    .cloned()
+                && let Some(theme) = crate::appearance::resolve(name, cx)
             {
-                Theme::global_mut(cx).apply_config(&theme);
+                crate::appearance::apply_selected(&theme, cx);
             }
             prefs.dark = Some(cx.theme().mode.is_dark());
             prefs.save()?;
@@ -737,7 +741,9 @@ impl Configuration {
                             .selected(!dark)
                             .disabled(self.locked)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.general.theme = None;
+                                this.general
+                                    .theme
+                                    .get_or_insert_with(|| crate::appearance::CHOICES[0].0.into());
                                 Theme::change(ThemeMode::Light, Some(window), cx);
                                 crate::locale::apply_font(cx);
                                 cx.notify();
@@ -750,7 +756,7 @@ impl Configuration {
                             .selected(dark)
                             .disabled(self.locked)
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.general.theme = None;
+                                this.reset_theme(cx);
                                 Theme::change(ThemeMode::Dark, Some(window), cx);
                                 crate::locale::apply_font(cx);
                                 cx.notify();
@@ -766,6 +772,26 @@ impl Configuration {
                     .dropdown_menu({
                         let entity = cx.entity();
                         move |mut menu, _, cx| {
+                            for (index, (name, _)) in crate::appearance::CHOICES.iter().enumerate()
+                            {
+                                let name = *name;
+                                let label = match index {
+                                    0 => t(cx, "settings.theme.celadon"),
+                                    1 => t(cx, "settings.theme.mist_blue"),
+                                    2 => t(cx, "settings.theme.warm_paper"),
+                                    _ => t(cx, "settings.theme.graphite_purple"),
+                                };
+                                let entity = entity.clone();
+                                menu = menu.item(PopupMenuItem::new(label).on_click(
+                                    move |_, _, cx| {
+                                        entity.update(cx, |this, cx| {
+                                            this.general.theme = Some(name.into());
+                                            Theme::change(ThemeMode::Light, None, cx);
+                                            cx.notify();
+                                        });
+                                    },
+                                ));
+                            }
                             let themes = gpui_component::ThemeRegistry::global(cx)
                                 .sorted_themes()
                                 .into_iter()

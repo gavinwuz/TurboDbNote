@@ -2205,6 +2205,24 @@
     "compare.issue.parse_column": "列 {column} 的定义无法完整识别，其余可支持的变更已生成。",
     "compare.object_name": "对象",
     "indexes.preview_target": "目标数据库：{database}",
-    "compare.attribute_summary": "差异 {different} 项。"
+    "compare.attribute_summary": "差异 {different} 项。",
+    "settings.theme.celadon": "青瓷白（推荐）",
+    "settings.theme.mist_blue": "雾蓝灰",
+    "settings.theme.warm_paper": "暖砂纸",
+    "settings.theme.graphite_purple": "石墨紫",
+    "script.selection.empty": "请先选择至少一条需要执行的语句。",
+    "script.selection.toggle": "选择或跳过整条语句",
+    "script.selection.skipped": "跳过",
+    "script.selection.summary": "执行 {execute} 条 · 跳过 {skip} 条。",
+    "script.selection.restore": "恢复全部",
+    "script.reload": "重新加载 SQL 脚本",
+    "script.reload.choose": "尚未关联源文件，请先通过“更换文件”选择 SQL 源文件。",
+    "script.reload.done": "SQL 脚本已重新加载；内容变化时已重置跳过标记。",
+    "script.view_full": "查看完整 SQL",
+    "script.selection.unsupported_hint": "请跳过不支持的语句；执行前仍会校验所有选中语句。",
+    "script.selection.dependencies": "跳过 USE、SET 或事务控制可能影响后续语句；应用不会自动补执行已跳过的语句。",
+    "script.full.search": "搜索 SQL 行",
+    "script.full.wrap": "自动换行",
+    "script.reload.failed": "无法重新加载 SQL 脚本，已保留旧预览。{reason} 请检查源文件，或通过“更换文件”重新选择。"
   }
 }

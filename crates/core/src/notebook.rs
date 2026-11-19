@@ -95,6 +95,8 @@ pub struct RestoreOptions {
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SqlScript {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<std::path::PathBuf>,
     pub name: String,
     pub source_hash: String,
     pub index_hash: String,
@@ -426,6 +428,7 @@ mod tests {
     fn script_references_roundtrip_without_source_and_legacy_v2_migrates() {
         let mut note = Note::new("script");
         let script = SqlScript {
+            source_path: None,
             name: "import.sql".into(),
             source_hash: "a".repeat(64),
             index_hash: "b".repeat(64),

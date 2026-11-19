@@ -1014,7 +1014,7 @@ impl DatabaseView {
         let count_label = if loaded {
             count.to_string()
         } else {
-            t(cx, "browser.not_loaded").to_string()
+            String::new()
         };
         let icon = if key.ends_with(":columns-folded") {
             gpui_component::Icon::new(IconName::GalleryVerticalEnd)
@@ -1036,7 +1036,11 @@ impl DatabaseView {
                         IconName::ChevronDown
                     })
                     .child(icon)
-                    .child(format!("{label} ({count_label})"))
+                    .child(if loaded {
+                        format!("{label} ({count_label})")
+                    } else {
+                        label.to_string()
+                    })
                     .justify_start()
                     .w_full()
                     .h(px(28.))

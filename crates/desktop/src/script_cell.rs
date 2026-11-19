@@ -59,11 +59,14 @@ impl From<&str> for PreflightError {
     }
 }
 pub struct ScriptView {
+    _lifetime: crate::lifecycle::Guard,
     pub path: PathBuf,
     pub script: SqlScript,
     connections: Entity<DatabaseView>,
     rows: Vec<Entry>,
     page: u64,
+    excluded: std::collections::BTreeSet<u64>,
+    frozen_excluded: std::collections::BTreeSet<u64>,
     issues_only: bool,
     select_last_issue: bool,
     list_scroll: UniformListScrollHandle,
@@ -86,6 +89,7 @@ pub struct ScriptView {
     next: u64,
     end: u64,
     completed: u64,
+    run_total: u64,
     frozen: Option<Arc<Mutex<Reader>>>,
     binding: Option<(SavedConnection, String)>,
     session: Option<Session>,
@@ -116,6 +120,7 @@ pub struct ScriptView {
     authorization_summary: Option<sql_script::AuthorizationSummary>,
     compact: bool,
     preview_expanded: bool,
+    reload_job: Option<(uuid::Uuid, Instant)>,
     results: Entity<crate::script_results::ScriptResults>,
     _connections_observe: Subscription,
 }
@@ -125,6 +130,10 @@ impl ScriptView {
         self.results.read(cx).note_scroll_handles(cx)
     }
 
+    pub(crate) fn release_display_caches(&mut self, cx: &mut Context<Self>) {
+        self.results
+            .update(cx, |results, cx| results.release_display_caches(cx));
+    }
     pub fn compact_results(&mut self) {
         self.compact = true;
         self.indexing = false;
@@ -152,6 +161,108 @@ impl ScriptView {
             self.status = t(cx, "notes.results_stale");
         }
         cx.notify();
+    }
+    fn reload_log(
+        &self,
+        job: uuid::Uuid,
+        phase: crate::operation_log::Phase,
+        elapsed_ms: u64,
+        error: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(output) = self.connections.read(cx).output.clone() {
+            let mut record =
+                crate::operation_log::Record::new(job, crate::operation_log::Kind::Import, phase);
+            record.elapsed_ms = elapsed_ms;
+            if let Some(error) = error {
+                record.failure = crate::operation_log::failure_class(error);
+            }
+            output.update(cx, |output, cx| output.operation(record, cx));
+        }
+    }
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        if self.active
+            || self.locked
+            || self.indexing
+            || self.diagnostic_running
+            || self.results.read(cx).has_pending_changes(cx)
+        {
+            return;
+        }
+        let Some(source) = self.script.source_path.clone() else {
+            feedback::error(t(cx, "script.reload.choose"), cx);
+            return;
+        };
+        let job = uuid::Uuid::new_v4();
+        let started = Instant::now();
+        self.reload_log(job, crate::operation_log::Phase::Started, 0, None, cx);
+        self.reload_job = Some((job, started));
+        self.indexing = true;
+        self.page_epoch += 1;
+        let epoch = self.page_epoch;
+        let path = self.path.clone();
+        let old = self.script.clone();
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        let work = cx.background_executor().spawn(async move {
+            let mut prepared = sql_script::prepare(&source, old.dialect, &cancel, |_, _| {})?;
+            prepared.script.source_path = Some(source);
+            prepared.script.restore = old.restore;
+            prepared.publish(&path, &cancel)?;
+            Ok::<_, String>(prepared.script)
+        });
+        self.page_task = Some(cx.spawn(async move |owner, cx| {
+            let result = work.await;
+            let _ = owner.update(cx, |this, cx| {
+                if this.page_epoch != epoch {
+                    return;
+                }
+                this.indexing = false;
+                this.reload_job = None;
+                this.reload_log(
+                    job,
+                    if result.is_ok() {
+                        crate::operation_log::Phase::Succeeded
+                    } else {
+                        crate::operation_log::Phase::Failed
+                    },
+                    started.elapsed().as_millis() as u64,
+                    result.as_ref().err().map(String::as_str),
+                    cx,
+                );
+                match result {
+                    Ok(script) => {
+                        if script.source_hash != this.script.source_hash {
+                            this.excluded.clear();
+                        }
+                        if script.dialect != this.script.dialect {
+                            this.excluded.clear();
+                        }
+                        this.script = script.clone();
+                        this.preview_epoch += 1;
+                        this.preview = "".into();
+                        this.preview_markdown = "".into();
+                        this.results
+                            .update(cx, |results, cx| results.stale_scope(cx));
+                        cx.emit(ScriptEvent::Reindexed(script));
+                        this.index_error = false;
+                        this.selected = 0;
+                        this.list_scroll = UniformListScrollHandle::new();
+                        this.load_page(0, cx);
+                        feedback::success(t(cx, "script.reload.done"), cx);
+                    }
+                    Err(error) => feedback::error(
+                        tr(
+                            cx,
+                            "script.reload.failed",
+                            &[("reason", crate::locale::message(cx, &error).as_ref())],
+                        ),
+                        cx,
+                    ),
+                }
+                cx.notify();
+            });
+        }));
     }
     pub fn copy_path(&self, cx: &mut Context<Self>) {
         if let Some(parent) = self.path.parent() {
@@ -197,11 +308,14 @@ impl ScriptView {
             }
         });
         Self {
+            _lifetime: crate::lifecycle::Guard::new(crate::lifecycle::Kind::ScriptView),
             path,
             script,
             connections,
             rows: vec![],
             page: 0,
+            excluded: Default::default(),
+            frozen_excluded: Default::default(),
             issues_only: false,
             select_last_issue: false,
             list_scroll: UniformListScrollHandle::new(),
@@ -224,6 +338,7 @@ impl ScriptView {
             next: 0,
             end: 0,
             completed: 0,
+            run_total: 0,
             frozen: None,
             binding: None,
             session: None,
@@ -255,6 +370,7 @@ impl ScriptView {
             results,
             compact: false,
             preview_expanded: false,
+            reload_job: None,
             _connections_observe: observed,
         }
     }
@@ -280,6 +396,9 @@ impl ScriptView {
                 match result {
                     Ok(script) => {
                         if script != this.script {
+                            if script.dialect != this.script.dialect {
+                                this.excluded.clear();
+                            }
                             this.script = script.clone();
                             cx.emit(ScriptEvent::Reindexed(script));
                         }
@@ -323,6 +442,9 @@ impl ScriptView {
                 this.indexing = false;
                 match result {
                     Ok(script) => {
+                        if script.dialect != this.script.dialect {
+                            this.excluded.clear();
+                        }
                         this.script = script.clone();
                         this.index_error = false;
                         this.status = "".into();
@@ -354,39 +476,34 @@ impl ScriptView {
         let issues = self.issues_only;
         let last = self.select_last_issue;
         self.select_last_issue = false;
-        self.preview_epoch += 1;
-        self.list_scroll = UniformListScrollHandle::new();
-        let work = cx.background_executor().spawn(async move {
-            if issues {
-                sql_script::issue_page(&path, &script, page)
-            } else {
-                sql_script::page(&path, &script, page)
-            }
-        });
+        self.rows.clear();
+        let work = cx
+            .background_executor()
+            .spawn(async move { sql_script::viewport(&path, &script, page, issues) });
         self.page_task = Some(cx.spawn(async move |owner, cx| {
             let result = work.await;
             let _ = owner.update(cx, |this, cx| {
                 if this.page_epoch != epoch {
                     return;
                 }
+                this.page_task = None;
                 match result {
                     Ok(rows) => {
                         this.rows = rows;
                         if last && let Some(row) = this.rows.last() {
                             this.selected = row.number;
                         }
-                        if !this.rows.iter().any(|row| row.number == this.selected)
-                            && let Some(first) = this.rows.first()
-                        {
-                            this.selected = first.number;
-                            this.preview = "".into();
-                            this.preview_markdown = "".into();
-                        }
                         if issues && !this.rows.is_empty() {
+                            if !this.rows.iter().any(|row| row.number == this.selected) {
+                                this.selected = this.rows[0].number;
+                            }
                             this.select(this.selected, cx);
                         }
                     }
-                    Err(error) => this.status = crate::locale::message(cx, &error),
+                    Err(error) => {
+                        this.index_error = true;
+                        this.status = crate::locale::message(cx, &error);
+                    }
                 }
                 cx.notify();
             });
@@ -397,7 +514,7 @@ impl ScriptView {
         let page = if self.issues_only {
             0
         } else {
-            self.selected / sql_script::PAGE_SIZE * sql_script::PAGE_SIZE
+            self.selected / 64 * 64
         };
         self.load_page(page, cx);
     }
@@ -413,11 +530,11 @@ impl ScriptView {
             index.checked_sub(1).and_then(|i| self.rows.get(i))
         } {
             self.select(row.number, cx);
-        } else if next && self.page + sql_script::PAGE_SIZE < self.script.unsupported {
-            self.load_page(self.page + sql_script::PAGE_SIZE, cx);
+        } else if next && self.page + (self.rows.len() as u64) < self.script.unsupported {
+            self.load_page(self.page + self.rows.len() as u64, cx);
         } else if !next && self.page > 0 {
             self.select_last_issue = true;
-            self.load_page(self.page - sql_script::PAGE_SIZE, cx);
+            self.load_page(self.page.saturating_sub(128), cx);
         }
     }
     fn select(&mut self, number: u64, cx: &mut Context<Self>) {
@@ -716,6 +833,13 @@ impl ScriptView {
             feedback::error(t(cx, "script.error.dialect"), cx);
             return false;
         }
+        if (selected && self.excluded.contains(&self.selected))
+            || (!selected && self.excluded.len() as u64 >= self.script.statements)
+        {
+            feedback::error(t(cx, "script.selection.empty"), cx);
+            return false;
+        }
+        self.frozen_excluded = self.excluded.clone();
         self.active = true;
         self.run_id += 1;
         let run = self.run_id;
@@ -735,6 +859,8 @@ impl ScriptView {
         } else {
             self.script.statements
         };
+        self.run_total =
+            (self.end - self.next) - self.frozen_excluded.range(self.next..self.end).count() as u64;
         self.authorize_next = self.next;
         self.operation = 0;
         self.pending_request = None;
@@ -747,12 +873,13 @@ impl ScriptView {
         let cancel = self.cancel.clone();
         self.status = t(cx, "script.verifying");
         self.results.update(cx, |results, cx| {
-            results.reset(saved.clone(), database.clone(), self.end - self.next, cx)
+            results.reset(saved.clone(), database.clone(), self.run_total, cx)
         });
         self.log(crate::operation_log::Phase::Started, None, cx);
         let path = self.path.clone();
         let script = self.script.clone();
         let range = self.next..self.end;
+        let excluded = self.frozen_excluded.clone();
         let allowed = turbodbn_services::database::notebook_query::COMMANDS
             .iter()
             .chain(turbodbn_services::database::notebook_query::SCRIPT_COMMANDS)
@@ -766,6 +893,7 @@ impl ScriptView {
         let mode = self.access_mode;
         let work = cx.background_executor().spawn(async move {
             let mut reader = sql_script::freeze(&path, &script, &cancel)?;
+            reader.exclude(excluded.clone());
             let mut blocked = Vec::new();
             let mut mode_blocked = None;
             if selected && saved.profile.kind == turbodbn_services::DatabaseKind::MySql {
@@ -798,6 +926,9 @@ impl ScriptView {
             let mut sequence =
                 turbodbn_services::database::workbench::script_context::Sequence::default();
             for number in range {
+                if excluded.contains(&number) {
+                    continue;
+                }
                 if cancel.load(Ordering::Relaxed) {
                     return Err(PreflightError::Other("script.cancelled".into()));
                 }
@@ -1107,6 +1238,7 @@ impl ScriptView {
             return;
         };
         let start = self.authorize_next;
+        let excluded = self.frozen_excluded.clone();
         let end = self.end;
         let run = self.run_id;
         let cancel = self.cancel.clone();
@@ -1122,6 +1254,9 @@ impl ScriptView {
                 None
             };
             for number in start..end {
+                if excluded.contains(&number) {
+                    continue;
+                }
                 if cancel.load(Ordering::Relaxed) {
                     return Err("script.cancelled".to_string());
                 }
@@ -1256,6 +1391,14 @@ impl ScriptView {
         cx.notify();
     }
     fn load_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while self.next < self.end && self.frozen_excluded.contains(&self.next) {
+            self.next += 1;
+        }
+        if self.next >= self.end {
+            self.finish(true, cx);
+            return;
+        }
+
         self.current_location = None;
         self.preparing_authorization = false;
         self.status = tr(
@@ -1263,10 +1406,7 @@ impl ScriptView {
             "script.progress",
             &[
                 ("done", &self.completed.to_string()),
-                (
-                    "total",
-                    &(self.end - self.next + self.completed).to_string(),
-                ),
+                ("total", &(self.run_total).to_string()),
             ],
         );
         let Some(reader) = self.frozen.clone() else {
@@ -1508,6 +1648,16 @@ impl ScriptView {
     }
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         if self.indexing {
+            if let Some((job, started)) = self.reload_job.take() {
+                self.reload_log(
+                    job,
+                    crate::operation_log::Phase::Cancelled,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                    cx,
+                );
+            }
+            self.page_epoch += 1;
             self.cancel.store(true, Ordering::Relaxed);
             self.page_task = None;
             self.indexing = false;
@@ -1664,11 +1814,7 @@ impl Render for ScriptView {
         } else if self.indexing {
             t(cx, "script.reindexing")
         } else if self.script.unsupported > 0 {
-            tr(
-                cx,
-                "script.disabled.unsupported",
-                &[("count", &self.script.unsupported.to_string())],
-            )
+            t(cx, "script.selection.unsupported_hint")
         } else {
             t(cx, "script.run_hint")
         };
@@ -1691,7 +1837,10 @@ impl Render for ScriptView {
                             Button::new("script-run-all")
                                 .icon(IconName::ArrowRight)
                                 .label(t(cx, "script.run_all"))
-                                .disabled(disabled)
+                                .disabled(
+                                    disabled
+                                        || self.excluded.len() as u64 >= self.script.statements,
+                                )
                                 .on_click(
                                     cx.listener(|_, _, _, cx| cx.emit(ScriptEvent::Run(false))),
                                 ),
@@ -1719,7 +1868,9 @@ impl Render for ScriptView {
                             .small()
                             .icon(IconName::ArrowRight)
                             .label(t(cx, "script.run_selected"))
-                            .disabled(disabled || !supported)
+                            .disabled(
+                                disabled || !supported || self.excluded.contains(&self.selected),
+                            )
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(ScriptEvent::Run(true)))),
                     )
                 })
@@ -1806,6 +1957,33 @@ impl Render for ScriptView {
                     ),
                 ],
             ));
+            body = body.child(
+                div()
+                    .h_flex()
+                    .gap_2()
+                    .child(tr(
+                        cx,
+                        "script.selection.summary",
+                        &[
+                            (
+                                "execute",
+                                &(self.script.statements - self.excluded.len() as u64).to_string(),
+                            ),
+                            ("skip", &self.excluded.len().to_string()),
+                        ],
+                    ))
+                    .child(
+                        Button::new("script-select-all")
+                            .ghost()
+                            .small()
+                            .label(t(cx, "script.selection.restore"))
+                            .disabled(self.active || self.locked)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.excluded.clear();
+                                cx.notify();
+                            })),
+                    ),
+            );
             if self.index_error {
                 body = body.child(
                     Button::new("script-retry-index")
@@ -1825,11 +2003,32 @@ impl Render for ScriptView {
                     .child(
                         uniform_list(
                             "script-rows",
-                            self.rows.len(),
+                            if self.issues_only {
+                                self.script.unsupported
+                            } else {
+                                self.script.statements
+                            } as usize,
                             cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+                                if !this.indexing
+                                    && !this.index_error
+                                    && (range.start < this.page as usize
+                                        || range.end > this.page as usize + this.rows.len())
+                                {
+                                    let page = (range.start as u64 / 64) * 64;
+                                    if page != this.page
+                                        || this.rows.is_empty() && this.page_task.is_none()
+                                    {
+                                        this.load_page(page, cx);
+                                    }
+                                }
                                 range
                                     .map(|index| {
-                                        let row = &this.rows[index];
+                                        let Some(row) = index
+                                            .checked_sub(this.page as usize)
+                                            .and_then(|i| this.rows.get(i))
+                                        else {
+                                            return div().h(px(30.)).into_any_element();
+                                        };
                                         let number = row.number;
                                         div()
                                             .id(SharedString::from(format!("script-row-{number}")))
@@ -1843,6 +2042,38 @@ impl Render for ScriptView {
                                             } else {
                                                 transparent_black()
                                             })
+                                            .child(
+                                                gpui_component::checkbox::Checkbox::new(
+                                                    SharedString::from(format!(
+                                                        "script-include-{number}"
+                                                    )),
+                                                )
+                                                .checked(!this.excluded.contains(&number))
+                                                .disabled(
+                                                    this.active || this.locked || this.indexing,
+                                                )
+                                                .on_click(cx.listener(
+                                                    move |this, value, _, cx| {
+                                                        cx.stop_propagation();
+                                                        if *value {
+                                                            this.excluded.remove(&number);
+                                                        } else {
+                                                            this.excluded.insert(number);
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                )),
+                                            )
+                                            .child(
+                                                div()
+                                                    .w(px(32.))
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child(if this.excluded.contains(&number) {
+                                                        t(cx, "script.selection.skipped")
+                                                    } else {
+                                                        "".into()
+                                                    }),
+                                            )
                                             .child(div().w(px(48.)).child((number + 1).to_string()))
                                             .child(
                                                 div()
@@ -1895,6 +2126,7 @@ impl Render for ScriptView {
                                             .on_click(cx.listener(move |this, _, _, cx| {
                                                 this.select(number, cx)
                                             }))
+                                            .into_any_element()
                                     })
                                     .collect()
                             }),
@@ -1916,53 +2148,6 @@ impl Render for ScriptView {
                             ),
                     )
                     .w_full(),
-            );
-            body = body.child(
-                div()
-                    .h_flex()
-                    .gap_3()
-                    .justify_end()
-                    .child(
-                        Button::new("script-page-prev")
-                            .ghost()
-                            .icon(IconName::ChevronLeft)
-                            .tooltip(t(cx, "script.previous"))
-                            .disabled(self.page == 0)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.load_page(this.page.saturating_sub(sql_script::PAGE_SIZE), cx)
-                            })),
-                    )
-                    .child(format!(
-                        "{}–{} / {}",
-                        self.page + 1,
-                        (self.page + sql_script::PAGE_SIZE).min(if self.issues_only {
-                            self.script.unsupported
-                        } else {
-                            self.script.statements
-                        }),
-                        if self.issues_only {
-                            self.script.unsupported
-                        } else {
-                            self.script.statements
-                        }
-                    ))
-                    .child(
-                        Button::new("script-page-next")
-                            .ghost()
-                            .icon(IconName::ChevronRight)
-                            .tooltip(t(cx, "script.next"))
-                            .disabled(
-                                self.page + sql_script::PAGE_SIZE
-                                    >= if self.issues_only {
-                                        self.script.unsupported
-                                    } else {
-                                        self.script.statements
-                                    },
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.load_page(this.page + sql_script::PAGE_SIZE, cx)
-                            })),
-                    ),
             );
             if !self.preview_markdown.is_empty() {
                 body = body.child(
@@ -1991,6 +2176,16 @@ impl Render for ScriptView {
                                     })),
                             )
                         })
+                        .child(
+                            Button::new("script-full-sql")
+                                .ghost()
+                                .small()
+                                .icon(IconName::ExternalLink)
+                                .label(t(cx, "script.view_full"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    crate::sql_source_view::open(this.preview.clone(), window, cx);
+                                })),
+                        )
                         .child(
                             Button::new("script-copy-sql")
                                 .ghost()
@@ -2023,8 +2218,7 @@ impl Render for ScriptView {
                     div()
                         .id("script-preview")
                         .relative()
-                        .max_h(px(220.))
-                        .overflow_y_scroll()
+                        .h(px(220.))
                         .child(
                             TextView::markdown(
                                 "script-current-source",
@@ -2032,7 +2226,8 @@ impl Render for ScriptView {
                                 window,
                                 cx,
                             )
-                            .selectable(true),
+                            .selectable(true)
+                            .scrollable(true),
                         )
                         .child(
                             div().absolute().right(px(6.)).top(px(6.)).child(

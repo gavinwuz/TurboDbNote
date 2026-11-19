@@ -50,6 +50,7 @@ impl EventEmitter<TableDraftChanged> for TableView {}
 pub struct FilterSqlReady(pub String);
 impl EventEmitter<FilterSqlReady> for TableView {}
 pub struct TableView {
+    _lifetime: crate::lifecycle::Guard,
     _pane_focus: Subscription,
     compare_subscription: Option<Subscription>,
     restored: bool,
@@ -115,6 +116,11 @@ pub struct TableView {
     committing: bool,
 }
 impl TableView {
+    pub(crate) fn release_display_caches(&mut self, cx: &mut Context<Self>) {
+        self.grid_state
+            .update(cx, |table, _| table.delegate_mut().release_display_caches());
+    }
+
     pub(crate) fn note_scroll_handles(&self, cx: &App) -> Vec<ScrollHandle> {
         let grid = self.grid_state.read(cx);
         let mut handles = vec![
@@ -397,6 +403,7 @@ impl TableView {
             crate::tabs::layout(crate::tabs::LayoutAction::Activate(this.key.clone()), cx)
         });
         Self {
+            _lifetime: crate::lifecycle::Guard::new(crate::lifecycle::Kind::TableView),
             compare_subscription: None,
             restored: false,
             restored_comparison: None,

@@ -21,6 +21,7 @@ pub struct AuthorizationView {
     target: String,
     start: u64,
     end: u64,
+    included: u64,
     legacy: bool,
     page: u64,
     risk_only: bool,
@@ -47,6 +48,10 @@ impl AuthorizationView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let included = reader
+            .lock()
+            .map(|r| r.selected_count(start, end))
+            .unwrap_or(0);
         cx.defer_in(window, |this, _, cx| this.load(0, cx));
         Self {
             reader,
@@ -54,6 +59,7 @@ impl AuthorizationView {
             target,
             start,
             end,
+            included,
             legacy,
             page: 0,
             risk_only: false,
@@ -138,13 +144,21 @@ impl Render for AuthorizationView {
         let total = if self.risk_only {
             self.summary.risky
         } else {
-            self.end - self.start
+            self.included
         };
         let mut body = div().v_flex().gap_3().child(self.target.clone()).child(tr(
             cx,
             "script.batch.summary",
             &[
-                ("total", &(self.end - self.start).to_string()),
+                (
+                    "total",
+                    &(self
+                        .reader
+                        .lock()
+                        .map(|r| r.selected_count(self.start, self.end))
+                        .unwrap_or(0))
+                    .to_string(),
+                ),
                 ("reads", &self.summary.reads.to_string()),
                 ("writes", &self.summary.writes.to_string()),
                 ("ddl", &self.summary.ddl.to_string()),
@@ -153,6 +167,18 @@ impl Render for AuthorizationView {
                 ("transactions", &self.summary.transactions.to_string()),
             ],
         ));
+        let included = self.included;
+        body = body.child(tr(
+            cx,
+            "script.selection.summary",
+            &[
+                ("execute", &included.to_string()),
+                ("skip", &(self.end - self.start - included).to_string()),
+            ],
+        ));
+        if included < self.end - self.start {
+            body = body.child(t(cx, "script.selection.dependencies"));
+        }
         if self.summary.destructive > 0
             || self.summary.relaxed_checks > 0
             || self.summary.locks > 0

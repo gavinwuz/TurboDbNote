@@ -201,6 +201,13 @@ impl AuthorizationSummary {
     }
 }
 impl Reader {
+    pub fn exclude(&mut self, excluded: std::collections::BTreeSet<u64>) {
+        self.excluded = excluded;
+    }
+    pub fn selected_count(&self, start: u64, end: u64) -> u64 {
+        (end - start).saturating_sub(self.excluded.range(start..end).count() as u64)
+    }
+
     /// Original, hash-verified frozen attachment, bounded for combined Note export.
     pub fn export_source(&mut self, limit: u64) -> Result<String, String> {
         if self.script.bytes > limit {
@@ -232,6 +239,9 @@ impl Reader {
         let kind = kind(self.script.dialect);
         for number in start..end {
             check(cancel)?;
+            if self.excluded.contains(&number) {
+                continue;
+            }
             let sql = self.statement(number)?;
             let key = notebook_query::script_command_required(kind, &sql)
                 .ok_or("script.error.unsupported")?;
@@ -267,13 +277,19 @@ impl Reader {
         legacy: bool,
     ) -> Result<Vec<Entry>, String> {
         if !risk_only {
-            return (start + page..(start + page + PAGE_SIZE).min(end))
-                .map(|n| self.entry(n))
-                .collect();
+            let numbers = (start..end)
+                .filter(|n| !self.excluded.contains(n))
+                .skip(page as usize)
+                .take(PAGE_SIZE as usize)
+                .collect::<Vec<_>>();
+            return numbers.into_iter().map(|n| self.entry(n)).collect();
         }
         let mut found = 0;
         let mut rows = Vec::new();
         for number in start..end {
+            if self.excluded.contains(&number) {
+                continue;
+            }
             let sql = self.statement(number)?;
             if notebook_query::script_requires_confirmation(
                 kind(self.script.dialect),
@@ -561,6 +577,7 @@ pub fn prepare(
         .to_string_lossy()
         .into_owned();
     let script = SqlScript {
+        source_path: None,
         name,
         source_hash,
         index_hash,
@@ -956,6 +973,7 @@ impl Scanner {
 }
 
 pub struct Reader {
+    excluded: std::collections::BTreeSet<u64>,
     source: File,
     index: File,
     script: SqlScript,
@@ -993,6 +1011,7 @@ impl Reader {
             index,
             script: script.clone(),
             _frozen: None,
+            excluded: Default::default(),
         })
     }
     fn range(&mut self, number: u64) -> Result<(u64, u64, u64, u8), String> {
@@ -1153,6 +1172,7 @@ pub fn reparse(
         return Err("script.error.changed".into());
     }
     prepared.script.name = script.name.clone();
+    prepared.script.source_path = script.source_path.clone();
     prepared.script.restore = script.restore.clone();
     prepared.publish(note, cancel)?;
     Ok(prepared.script)
@@ -1171,6 +1191,36 @@ pub fn freeze(note: &Path, script: &SqlScript, cancel: &AtomicBool) -> Result<Re
     let mut reader = Reader::from_root(directory.path(), script)?;
     reader._frozen = Some(directory);
     Ok(reader)
+}
+
+/// Bounded visible-window metadata for the scrollable script list.
+pub fn viewport(
+    note: &Path,
+    script: &SqlScript,
+    start: u64,
+    issues: bool,
+) -> Result<Vec<Entry>, String> {
+    let mut reader = Reader::from_root(&folder(note)?, script)?;
+    if !issues {
+        return (start..(start + 128).min(script.statements))
+            .map(|n| reader.entry(n))
+            .collect();
+    }
+    let mut found = 0;
+    let mut rows = Vec::new();
+    for n in 0..script.statements {
+        let (_, _, _, flags) = reader.range(n)?;
+        if flags == 0 {
+            if found >= start {
+                rows.push(reader.entry(n)?);
+            }
+            found += 1;
+            if rows.len() == 128 {
+                break;
+            }
+        }
+    }
+    Ok(rows)
 }
 
 #[cfg(test)]
@@ -1732,5 +1782,63 @@ mod text_attachment_tests {
             .join(".turbodbnote-scripts")
             .join(format!("{}.sql", prepared.script.source_hash));
         assert_eq!(fs::read_to_string(file).unwrap(), source);
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    #[test]
+    fn excluded_statements_are_absent_from_authorization_summary_and_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("source.sql");
+        fs::write(&file, "SELECT 1; DROP TABLE dangerous; SELECT 2;").unwrap();
+        let cancel = AtomicBool::new(false);
+        let prepared = prepare(&file, SqlDialect::Sqlite, &cancel, |_, _| {}).unwrap();
+        let mut reader = prepared.reader().unwrap();
+        reader.exclude([1].into_iter().collect());
+        let summary = reader.authorization_summary(0, 3, false, &cancel).unwrap();
+        assert_eq!(summary.reads, 2);
+        assert_eq!(summary.destructive, 0);
+        assert_eq!(reader.selected_count(0, 3), 2);
+        let page = reader.authorization_page(0, 3, 0, false, false).unwrap();
+        assert_eq!(
+            page.iter().map(|e| e.number).collect::<Vec<_>>(),
+            vec![0, 2]
+        );
+        assert!(
+            reader
+                .authorization_page(0, 3, 0, true, false)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[cfg(test)]
+mod reload_tests {
+    use super::*;
+    #[test]
+    fn reloading_publishes_new_content_without_mutating_frozen_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.sql");
+        let note = dir.path().join("test.note");
+        let cancel = AtomicBool::new(false);
+        fs::write(&source, "SELECT 1;").unwrap();
+        let original = prepare(&source, SqlDialect::Sqlite, &cancel, |_, _| {}).unwrap();
+        original.publish(&note, &cancel).unwrap();
+        let mut frozen = freeze(&note, &original.script, &cancel).unwrap();
+        fs::write(&source, "SELECT 2; SELECT 3;").unwrap();
+        let updated = prepare(&source, SqlDialect::Sqlite, &cancel, |_, _| {}).unwrap();
+        updated.publish(&note, &cancel).unwrap();
+        assert_ne!(original.script.source_hash, updated.script.source_hash);
+        assert_eq!(frozen.statement(0).unwrap().trim(), "SELECT 1;");
+        assert_eq!(viewport(&note, &updated.script, 0, false).unwrap().len(), 2);
+        fs::remove_file(&source).unwrap();
+        assert!(prepare(&source, SqlDialect::Sqlite, &cancel, |_, _| {}).is_err());
+        assert_eq!(
+            preview(&note, &updated.script, 1).unwrap().trim(),
+            "SELECT 3;"
+        );
     }
 }

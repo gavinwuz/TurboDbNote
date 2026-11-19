@@ -150,7 +150,8 @@ impl ImportView {
                 }
                 this.busy = false;
                 match result {
-                    Ok((prepared, preview)) => {
+                    Ok((mut prepared, preview)) => {
+                        prepared.script.source_path = Some(this.source.clone());
                         this.preview = preview;
                         this.log(
                             crate::operation_log::Phase::Prepared,

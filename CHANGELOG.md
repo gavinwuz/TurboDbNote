@@ -4,6 +4,12 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+- Add four built-in light styles, defaulting to Celadon White, and preserve the chosen light palette across dark/light switching. Hide unloaded-count placeholders in database object trees.
+- Release reconstructible reading and result-display caches after a Note stays in the background for 20 minutes, preserving editors, undo history, original results and pending changes. Add opt-in bounded object-lifetime diagnostics.
+- Add manual SQL source-file reload with immutable snapshots and retained previews on failure. Changed content resets session-only skip selections; reload never executes SQL.
+- Replace SQL-file statement pagination with bounded scroll loading and per-statement execution selection shared by preflight, batch authorization and execution. Add full SQL viewing with line numbers, search, wrapping and complete-source copy, and fix clipped long previews.
+- Windows isolated UI and protocol tests cover script scrolling, previewing and reload; these checks do not constitute Linux desktop or real external database acceptance.
+
 ## [0.1.9] - 2026-11-13
 
 - Share column-copy actions across merged-tree and two-pane database object lists.
