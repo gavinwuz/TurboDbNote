@@ -116,7 +116,15 @@ impl DatabaseView {
             .profiles
             .iter()
             .filter(|p| {
-                p.kind != DatabaseKind::Redis
+                (cx.global::<crate::preferences::Preferences>()
+                    .database
+                    .sidebar_layout
+                    != crate::preferences::SidebarLayout::Split
+                    || self
+                        .selected_database
+                        .as_ref()
+                        .is_some_and(|(id, _)| *id == p.id))
+                    && p.kind != DatabaseKind::Redis
                     && self.note_connection_state(p.id) == Some(true)
                     && self.tree.filter.visible.iter().any(|(id, _)| *id == p.id)
             })
@@ -672,7 +680,12 @@ impl DatabaseView {
             self.navigation.tree_connections.contains(&id)
         }
     }
-    pub(super) fn tree_toggle_connection(&mut self, id: Uuid, cx: &mut Context<Self>) {
+    pub(super) fn tree_toggle_connection(
+        &mut self,
+        id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.tree_object_query(cx).is_empty() {
             let key = format!("connection:{id}");
             if !self.tree.filter.collapsed.remove(&key) {
@@ -683,6 +696,9 @@ impl DatabaseView {
                 self.navigation.tree_connections.insert(id);
             }
             self.persist_navigation();
+        }
+        if self.tree_connection_open(id, cx) && self.note_connection_state(id) == Some(false) {
+            self.connect_saved(id, window, cx);
         }
         self.tree.revision += 1;
         cx.notify();

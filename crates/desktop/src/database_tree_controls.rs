@@ -22,6 +22,14 @@ impl SearchScope {
 }
 impl DatabaseView {
     pub(super) fn tree_object_query(&self, cx: &App) -> String {
+        if cx
+            .global::<crate::preferences::Preferences>()
+            .database
+            .sidebar_layout
+            == crate::preferences::SidebarLayout::Split
+        {
+            return String::new();
+        }
         if self.tree.search_scope == SearchScope::Connections {
             String::new()
         } else {
@@ -29,6 +37,14 @@ impl DatabaseView {
         }
     }
     pub(super) fn tree_connection_query(&self, cx: &App) -> String {
+        if cx
+            .global::<crate::preferences::Preferences>()
+            .database
+            .sidebar_layout
+            == crate::preferences::SidebarLayout::Split
+        {
+            return String::new();
+        }
         if self.tree.search_scope == SearchScope::Connections {
             self.tree_filter.read(cx).value().trim().to_lowercase()
         } else {

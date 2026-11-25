@@ -855,6 +855,9 @@ struct LegacyAccess<'a> {
     raw_gbk: bool,
 }
 impl crate::database::workbench::Access for LegacyAccess<'_> {
+    fn raw_gbk(&self) -> bool {
+        self.raw_gbk
+    }
     fn supports_keyset(&self) -> bool {
         !self.raw_gbk
     }
@@ -869,7 +872,26 @@ impl crate::database::workbench::Access for LegacyAccess<'_> {
             {
                 return self.query(sql).await;
             }
-            unsafe { legacy_workbench_rows(self.raw, self.library, sql, self.charset, true) }
+            let mut latin1 = std::collections::BTreeSet::new();
+            if let Some(table) = raw_gbk_like_table(sql) {
+                let rows = self
+                    .query(&format!("SHOW FULL COLUMNS FROM {table}"))
+                    .await?;
+                for row in rows.values {
+                    if row
+                        .get(2)
+                        .and_then(|v| v.as_deref())
+                        .is_some_and(|collation| {
+                            collation.to_ascii_lowercase().starts_with("latin1_")
+                        })
+                        && let Some(Some(name)) = row.first()
+                    {
+                        latin1.insert(name.to_lowercase());
+                    }
+                }
+            }
+            let query = raw_gbk_like_query(sql, &latin1)?;
+            unsafe { legacy_workbench_rows(self.raw, self.library, &query, self.charset, true) }
         })
     }
     fn query_data_counted<'a>(
@@ -1127,6 +1149,7 @@ mod tests {
         assert_eq!(resolved.target_version, "5.6.21");
 
         assert!(!p.supports_mutation());
+        assert!(p.supports_grid_mutation());
         let op = |action| Operation {
             kind: OperationKind::Workbench(Box::new(crate::database::workbench::Request {
                 database: "fixture".into(),
@@ -1212,5 +1235,128 @@ mod tests {
             ..Default::default()
         };
         assert!(!crate::mysql::uses_legacy(&p));
+    }
+}
+
+fn raw_gbk_like_table(sql: &str) -> Option<String> {
+    if sql.is_ascii() || !sql.to_ascii_uppercase().contains("LIKE") {
+        return None;
+    }
+    use sqlparser::{
+        ast::{SetExpr, Statement, TableFactor},
+        dialect::MySqlDialect,
+        parser::Parser,
+    };
+    crate::database::notebook_query::query_table_name(crate::DatabaseKind::MySql, sql)?;
+    let statements = Parser::parse_sql(&MySqlDialect {}, sql).ok()?;
+    let Statement::Query(query) = statements.first()? else {
+        return None;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return None;
+    };
+    let TableFactor::Table { name, .. } = &select.from.first()?.relation else {
+        return None;
+    };
+    Some(name.to_string())
+}
+fn raw_gbk_like_query(
+    sql: &str,
+    latin1: &std::collections::BTreeSet<String>,
+) -> Result<String, String> {
+    use sqlparser::{
+        ast::{Expr, Value, visit_expressions_mut},
+        dialect::MySqlDialect,
+        parser::Parser,
+    };
+    use std::ops::ControlFlow;
+    let mut statements =
+        Parser::parse_sql(&MySqlDialect {}, sql).map_err(|_| "mysql.gbk.query_invalid")?;
+    if statements.len() != 1 {
+        return Err("mysql.gbk.query_invalid".into());
+    }
+    let mut changed = false;
+    let result = visit_expressions_mut(&mut statements, |node| {
+        let Expr::Like {
+            expr,
+            pattern,
+            negated,
+            any: false,
+            escape_char: None,
+        } = node
+        else {
+            return ControlFlow::Continue(());
+        };
+        if !matches!(
+            expr.as_ref(),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+        ) {
+            return ControlFlow::Continue(());
+        }
+        let column = match expr.as_ref() {
+            Expr::Identifier(id) => &id.value,
+            Expr::CompoundIdentifier(ids) => &ids.last().unwrap().value,
+            _ => return ControlFlow::Continue(()),
+        };
+        if !latin1.contains(&column.to_lowercase()) {
+            return ControlFlow::Continue(());
+        }
+        let Expr::Value(value) = pattern.as_ref() else {
+            return ControlFlow::Continue(());
+        };
+        let Value::SingleQuotedString(text) = &value.value else {
+            return ControlFlow::Continue(());
+        };
+        if text.is_ascii() {
+            return ControlFlow::Continue(());
+        }
+        let (gbk, _, errors) = encoding_rs::GBK.encode(text);
+        if errors {
+            return ControlFlow::Break("mysql.gbk.encode".to_string());
+        }
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let op = if *negated { "NOT LIKE" } else { "LIKE" };
+        let query = format!("CAST({expr} AS BINARY) {op} X'{}'", hex(&gbk));
+        match Parser::new(&MySqlDialect {})
+            .try_with_sql(&query)
+            .and_then(|mut parser| parser.parse_expr())
+        {
+            Ok(replacement) => {
+                *node = replacement;
+                changed = true;
+                ControlFlow::Continue(())
+            }
+            Err(_) => ControlFlow::Break("mysql.gbk.query_invalid".to_string()),
+        }
+    });
+    if let ControlFlow::Break(error) = result {
+        return Err(error);
+    }
+    Ok(if changed {
+        statements[0].to_string()
+    } else {
+        sql.to_string()
+    })
+}
+#[cfg(test)]
+mod raw_like_tests {
+    #[test]
+    fn chinese_like_uses_gbk_bytes_only_for_latin1_columns() {
+        let columns = ["name".to_string()].into_iter().collect();
+        let original = "SELECT * FROM db.t a WHERE a.name LIKE '%张%'";
+        let query = super::raw_gbk_like_query(original, &columns).unwrap();
+        assert!(query.contains("CAST(a.name AS BINARY)"));
+        assert!(query.to_lowercase().contains("25d5c525"));
+        assert_eq!(
+            super::raw_gbk_like_query(original, &Default::default()).unwrap(),
+            original
+        );
+        let sql = "SELECT * FROM t WHERE id=1";
+        assert_eq!(super::raw_gbk_like_query(sql, &columns).unwrap(), sql);
+        assert!(
+            super::raw_gbk_like_query("SELECT * FROM t WHERE name LIKE '%😀%'", &columns).is_err()
+        );
+        assert_eq!(super::raw_gbk_like_table(original).as_deref(), Some("db.t"));
+        assert!(super::raw_gbk_like_table("SELECT * FROM t JOIN u ON t.id=u.id").is_none());
     }
 }

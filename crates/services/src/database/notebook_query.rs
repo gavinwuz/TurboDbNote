@@ -1183,6 +1183,34 @@ fn number(expr: &Expr) -> Result<usize, String> {
         _ => Err("分页 LIMIT/OFFSET 暂不支持表达式".into()),
     }
 }
+fn execution_error(kind: DatabaseKind, read_only: bool, error: &str) -> String {
+    // Only fixed adapter categories may reach the UI; never relay raw server text.
+    let safe_mysql = [
+        crate::mysql::SQL_SYNTAX_ERROR,
+        crate::mysql::TABLE_MISSING,
+        "mysql.error.column_1054",
+        "mysql.error.command_denied",
+        "mysql.error.privilege_1227",
+        "mysql.error.variable_1193",
+        "mysql.error.binlog_1381",
+        "mysql.error.trigger_missing_1360",
+        "mysql.error.trigger_privilege_1419",
+        "mysql.error.collation",
+        "mysql.error.encoding",
+        "mysql.error.result_decode",
+        "mysql.gbk.encode",
+        "mysql.gbk.query_invalid",
+    ];
+    if kind == DatabaseKind::MySql && safe_mysql.contains(&error) {
+        return error.into();
+    }
+    if read_only {
+        "notes.query.read_failed".into()
+    } else {
+        "notes.query.write_failed".into()
+    }
+}
+
 pub fn page_sql(
     kind: DatabaseKind,
     sql: &str,
@@ -1589,18 +1617,8 @@ async fn execute_inner(
             })
             .await;
     }
-    let (mut rows, driver_affected) = result.map_err(|error| {
-        if kind == DatabaseKind::MySql
-            && matches!(
-                error.as_str(),
-                crate::mysql::SQL_SYNTAX_ERROR | crate::mysql::TABLE_MISSING
-            )
-        {
-            error
-        } else {
-            "SQL 执行失败，请检查语法、权限及对象是否存在；写入可能已生效，请勿盲目重试".to_string()
-        }
-    })?;
+    let (mut rows, driver_affected) =
+        result.map_err(|error| execution_error(kind, plan.read_only, &error))?;
     let (created_tables, skipped_tables) = if let Statement::CreateTable(create) = &stmt {
         if !create.if_not_exists {
             (Some(1), Some(0))
@@ -3164,5 +3182,30 @@ mod table_entry_tests {
             DatabaseKind::MySql,
             "SELECT price INTO @p FROM items"
         ));
+    }
+}
+
+#[cfg(test)]
+mod execution_error_tests {
+    use super::*;
+    #[test]
+    fn errors_preserve_safe_categories_without_server_payload_or_false_write_warning() {
+        for code in [1054, 1142, 1267, 1270, 1271, 1300, 1366] {
+            let safe = crate::mysql::statement_error(code).unwrap();
+            assert_eq!(execution_error(DatabaseKind::MySql, true, safe), safe);
+        }
+        let secret = "server rejected SELECT secret_password FROM private_table";
+        assert_eq!(
+            execution_error(DatabaseKind::MySql, true, secret),
+            "notes.query.read_failed"
+        );
+        assert_eq!(
+            execution_error(DatabaseKind::MySql, false, secret),
+            "notes.query.write_failed"
+        );
+        assert_eq!(
+            execution_error(DatabaseKind::MySql, true, "mysql.error.result_decode"),
+            "mysql.error.result_decode"
+        );
     }
 }

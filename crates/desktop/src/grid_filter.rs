@@ -247,6 +247,34 @@ impl TableView {
                     .h_flex()
                     .gap_2()
                     .min_w_0()
+                    .when(
+                        self.notebook.is_none() && self.target.mode == Mode::Grid,
+                        |bar| {
+                            bar.child(
+                                Button::new("grid-open-sql-note")
+                                    .ghost()
+                                    .small()
+                                    .child(
+                                        div()
+                                            .h_flex()
+                                            .gap_1()
+                                            .items_center()
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child("SQL"),
+                                            )
+                                            .child(t(cx, "grid.query")),
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let mut target = this.target.clone();
+                                        target.mode = Mode::Note;
+                                        let _ = this.source.update(cx, |_, cx| cx.emit(target));
+                                    })),
+                            )
+                        },
+                    )
                     .child(
                         Button::new("grid-filter-toggle")
                             .ghost()

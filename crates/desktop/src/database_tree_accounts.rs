@@ -110,6 +110,12 @@ impl DatabaseView {
             !self.tree.filter.collapsed.contains(&key)
         };
         Button::new(SharedString::from(key.clone()))
+            .loading(
+                self.tree
+                    .databases
+                    .get(&scope.id)
+                    .is_some_and(|state| state.busy),
+            )
             .ghost()
             .w_full()
             .justify_start()

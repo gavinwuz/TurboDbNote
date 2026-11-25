@@ -69,6 +69,10 @@ pub(super) struct Tree {
     pub(super) catalog_revision: u64,
     pages: HashMap<(Scope, String), Page>,
     scroll: UniformListScrollHandle,
+    sticky_offset: Pixels,
+    scroll_layout: Option<(bool, Option<Uuid>)>,
+    layout_scrolls: HashMap<(bool, Option<Uuid>), UniformListScrollHandle>,
+    sticky_markers: Vec<(usize, bool)>,
     revision: u64,
     fingerprint: Option<u64>,
     rows: std::rc::Rc<Vec<Row>>,
@@ -92,6 +96,20 @@ enum Row {
     FilterUnindexed(Uuid),
     Notice(&'static str),
     LayoutSettings(Scope),
+}
+/// Markers include project boundaries so an old connection never sticks over another project.
+fn sticky_header(markers: &[(usize, bool)], offset: f32) -> Option<(usize, f32)> {
+    let marker = markers
+        .partition_point(|(index, _)| (*index as f32) * 32. < offset)
+        .checked_sub(1)?;
+    let (index, connection) = markers[marker];
+    if !connection {
+        return None;
+    }
+    let top = markers
+        .get(marker + 1)
+        .map_or(0., |(next, _)| (*next as f32 * 32. - offset - 32.).min(0.));
+    Some((index, top))
 }
 impl DatabaseView {
     pub(super) fn tree_cached_note_columns(
@@ -147,6 +165,23 @@ impl DatabaseView {
             .get(&id)
             .is_some_and(|filter| filter.open || !filter.input.read(cx).value().is_empty())
     }
+    fn ensure_database_filter(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree.database_filters.entry(id).or_insert_with(|| {
+            let input = cx.new(|cx| {
+                InputState::new(window, cx).placeholder(t(cx, "database.tree.database_filter"))
+            });
+            let subscription = cx.subscribe(&input, |_, _, event, cx| {
+                if matches!(event, gpui_component::input::InputEvent::Change) {
+                    cx.notify();
+                }
+            });
+            DatabaseFilter {
+                input,
+                open: false,
+                _subscription: subscription,
+            }
+        });
+    }
     pub(super) fn toggle_database_filter(
         &mut self,
         id: Uuid,
@@ -164,21 +199,8 @@ impl DatabaseView {
                 .unwrap_or_default(),
             generation: self.note_generation(id),
         };
-        let filter = self.tree.database_filters.entry(id).or_insert_with(|| {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder(t(cx, "database.tree.database_filter"))
-            });
-            let subscription = cx.subscribe(&input, |_, _, event, cx| {
-                if matches!(event, gpui_component::input::InputEvent::Change) {
-                    cx.notify();
-                }
-            });
-            DatabaseFilter {
-                input,
-                open: false,
-                _subscription: subscription,
-            }
-        });
+        self.ensure_database_filter(id, window, cx);
+        let filter = self.tree.database_filters.get_mut(&id).unwrap();
         filter.open = !filter.open || !self.navigation.tree_connections.contains(&id);
         if filter.open {
             self.navigation
@@ -190,7 +212,7 @@ impl DatabaseView {
                 .tree
                 .rows
                 .iter()
-                .position(|row| matches!(row, Row::Connection(profile) if profile.id == id))
+                .position(|row| matches!(row, Row::Databases(scope) if scope.id == id))
             {
                 let handle = self.tree.scroll.0.borrow().base_handle.clone();
                 if px((index + 2) as f32 * 32.) + handle.offset().y > handle.bounds().size.height {
@@ -720,6 +742,27 @@ impl DatabaseView {
         })
         .detach();
     }
+    pub(crate) fn table_card_action(
+        &mut self,
+        target: OpenTable,
+        mode: Option<crate::table_view::Mode>,
+        action: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.tree_action(
+            Scope {
+                id: target.connection,
+                database: target.database,
+                generation: target.generation,
+            },
+            target.object,
+            mode,
+            action,
+            window,
+            cx,
+        );
+    }
     fn tree_action(
         &mut self,
         scope: Scope,
@@ -744,7 +787,8 @@ impl DatabaseView {
                 mode,
                 generation: scope.generation,
                 kind: p.kind,
-                writable: p.supports_mutation(),
+                writable: p.supports_mutation()
+                    || (mode == crate::table_view::Mode::Grid && p.supports_grid_mutation()),
                 mysql_raw_gbk: p.mysql_raw_gbk,
             });
         } else if action == "structure" {
@@ -777,9 +821,40 @@ impl DatabaseView {
     }
     pub(super) fn render_merged_navigation(
         &mut self,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.render_database_navigation_tree(false, window, cx)
+    }
+    pub(super) fn render_database_navigation_tree(
+        &mut self,
+        split: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let selected = self.selected_database.as_ref().map(|(id, _)| *id);
+        if split && let Some(id) = selected {
+            self.ensure_database_filter(id, window, cx);
+        }
+
+        let layout = (split, if split { selected } else { None });
+        self.tree.layout_scrolls.retain(|(_, id), _| {
+            id.is_none_or(|id| self.profiles.iter().any(|profile| profile.id == id))
+        });
+        if self.tree.scroll_layout != Some(layout) {
+            if let Some(previous) = self.tree.scroll_layout {
+                self.tree
+                    .layout_scrolls
+                    .insert(previous, self.tree.scroll.clone());
+            }
+            self.tree.scroll = self
+                .tree
+                .layout_scrolls
+                .get(&layout)
+                .cloned()
+                .unwrap_or_default();
+            self.tree.scroll_layout = Some(layout);
+        }
         self.tree_filter_update(cx);
         let filtering = !self.tree_object_query(cx).is_empty();
         let valid: HashSet<_> = self
@@ -796,6 +871,10 @@ impl DatabaseView {
             .retain(|id, _| self.profiles.iter().any(|profile| profile.id == *id));
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        split.hash(&mut hasher);
+        if split {
+            selected.hash(&mut hasher);
+        }
         self.tree.revision.hash(&mut hasher);
         self.tree.search_scope.hash(&mut hasher);
         self.search.read(cx).value().hash(&mut hasher);
@@ -834,32 +913,70 @@ impl DatabaseView {
             self.tree.rows.clone()
         } else if filtering {
             let rows = self.tree_filter_rows(cx);
+            let rows = if split {
+                std::rc::Rc::new(
+                    rows.iter()
+                        .filter(|row| match row {
+                            Row::Database(s)
+                            | Row::Category(s, _)
+                            | Row::Object(s, _, _)
+                            | Row::Column(s, _)
+                            | Row::Page(s, _)
+                            | Row::LayoutSettings(s) => Some(s.id) == selected,
+                            Row::Notice(_) => true,
+                            _ => false,
+                        })
+                        .cloned()
+                        .collect(),
+                )
+            } else {
+                rows
+            };
             self.tree.fingerprint = Some(fingerprint);
+            self.tree.sticky_markers = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| match row {
+                    Row::Connection(_) if !split => Some((index, true)),
+                    Row::Database(_) if split => Some((index, true)),
+                    Row::Users(_) if split => Some((index, false)),
+                    Row::Group(_) => Some((index, false)),
+                    _ => None,
+                })
+                .collect();
             self.tree.rows = rows.clone();
             rows
         } else {
             let search = self.tree_connection_query(cx);
             let mut rows = vec![];
             for group in self.ordered_groups() {
-                rows.push(Row::Group(group.clone()));
+                if !split {
+                    rows.push(Row::Group(group.clone()));
+                }
                 let group_key = if self.navigation.mode == navigation::GroupMode::Environment {
                     format!("environment:{group}")
                 } else {
                     group.clone()
                 };
-                if search.is_empty() && self.navigation.collapsed.contains(&group_key) {
+                if !split && search.is_empty() && self.navigation.collapsed.contains(&group_key) {
                     continue;
                 }
                 for p in self.profiles.iter().filter(|p| self.group_key(p) == group) {
-                    if !self.connection_matches(p, &search) {
+                    if (split && selected != Some(p.id)) || !self.connection_matches(p, &search) {
                         continue;
                     }
-                    rows.push(Row::Connection(std::rc::Rc::new(p.clone())));
-                    if !self.navigation.tree_connections.contains(&p.id) {
+                    if !split {
+                        rows.push(Row::Connection(std::rc::Rc::new(p.clone())));
+                    }
+                    if !split && !self.navigation.tree_connections.contains(&p.id) {
                         continue;
                     }
                     if self.note_connection_state(p.id) != Some(true) {
-                        rows.push(Row::Notice("dbwork.switch.disconnected"));
+                        rows.push(Row::Notice(if self.note_connection_state(p.id).is_none() {
+                            "database.branch.connecting"
+                        } else {
+                            "dbwork.switch.disconnected"
+                        }));
                         continue;
                     }
                     let branch = Scope {
@@ -890,7 +1007,11 @@ impl DatabaseView {
                         let database_query = filter
                             .map(|filter| filter.input.read(cx).value().trim().to_lowercase())
                             .unwrap_or_default();
-                        if filter.is_some_and(|filter| filter.open) {
+                        if !split
+                            && filter.is_some_and(|filter| {
+                                filter.open || !filter.input.read(cx).value().is_empty()
+                            })
+                        {
                             rows.push(Row::DatabaseFilter(p.id));
                         }
                         if let Some(state) = self.tree.databases.get(&p.id).filter(|state| {
@@ -1016,14 +1137,29 @@ impl DatabaseView {
                     }
                 }
             }
+            if split && selected.is_none() {
+                rows.push(Row::Notice("notes.choose_connection"));
+            }
             let rows = std::rc::Rc::new(rows);
             self.tree.fingerprint = Some(fingerprint);
+            self.tree.sticky_markers = rows
+                .iter()
+                .enumerate()
+                .filter_map(|(index, row)| match row {
+                    Row::Connection(_) if !split => Some((index, true)),
+                    Row::Database(_) if split => Some((index, true)),
+                    Row::Users(_) if split => Some((index, false)),
+                    Row::Group(_) => Some((index, false)),
+                    _ => None,
+                })
+                .collect();
             self.tree.rows = rows.clone();
             rows
         };
         if !filtering
             && let Some(id) = self.profiles.iter().find_map(|p| {
-                if !self.navigation.tree_connections.contains(&p.id)
+                if (split && selected != Some(p.id))
+                    || (!split && !self.navigation.tree_connections.contains(&p.id))
                     || self.note_connection_state(p.id) != Some(true)
                 {
                     return None;
@@ -1091,29 +1227,48 @@ impl DatabaseView {
                 });
             }
         }
+        let offset = f32::from(-self.tree.scroll.0.borrow().base_handle.offset().y).max(0.);
+        let sticky = sticky_header(&self.tree.sticky_markers, offset).and_then(|(index, top)| {
+            match &rows[index] {
+                Row::Connection(_) | Row::Database(_) => Some((index, rows[index].clone(), top)),
+                _ => None,
+            }
+        });
         div()
             .size_full()
             .min_h_0()
             .v_flex()
             .p_2()
             .gap_2()
-            .child(
-                Button::new("tree-new-connection")
-                    .icon(IconName::Plus)
-                    .label(t(cx, "dbwork.connection.new"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if this.dirty(cx) {
+            .when(!split, |body| {
+                body.child(
+                    Button::new("tree-new-connection")
+                        .icon(IconName::Plus)
+                        .label(t(cx, "dbwork.connection.new"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if this.dirty(cx) {
+                                cx.emit(OpenDatabase);
+                                feedback::error(t(cx, "database.tree.unsaved"), cx);
+                                return;
+                            }
+                            this.typed_drafts.clear();
+                            this.fill(Self::empty_profile(DatabaseKind::MySql), window, cx);
+                            this.choosing_type = true;
                             cx.emit(OpenDatabase);
-                            feedback::error(t(cx, "database.tree.unsaved"), cx);
-                            return;
-                        }
-                        this.typed_drafts.clear();
-                        this.fill(Self::empty_profile(DatabaseKind::MySql), window, cx);
-                        this.choosing_type = true;
-                        cx.emit(OpenDatabase);
-                    })),
-            )
-            .child(self.tree_search_control(cx))
+                        })),
+                )
+            })
+            .child(if split {
+                selected
+                    .map(|id| self.tree_row(Row::DatabaseFilter(id), cx))
+                    .unwrap_or_else(|| {
+                        div()
+                            .child(t(cx, "notes.choose_connection"))
+                            .into_any_element()
+                    })
+            } else {
+                self.tree_search_control(cx)
+            })
             .when(
                 filtering && self.tree.filter.phase != search::Phase::Ready,
                 |body| body.child(self.tree_filter_status(cx)),
@@ -1132,6 +1287,11 @@ impl DatabaseView {
                             "merged-database-tree",
                             rows.len(),
                             cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                                let offset = this.tree.scroll.0.borrow().base_handle.offset().y;
+                                if this.tree.sticky_offset != offset {
+                                    this.tree.sticky_offset = offset;
+                                    cx.notify();
+                                }
                                 range
                                     .map(|i| {
                                         div()
@@ -1146,6 +1306,139 @@ impl DatabaseView {
                         .size_full()
                         .min_h_0(),
                     )
+                    .when_some(sticky, |body, (index, row, top)| {
+                        if let Row::Database(scope) = row {
+                            let owner = cx.entity().downgrade();
+                            let menu_scope = scope.clone();
+                            let toggle_scope = scope.clone();
+                            return body.child(
+                                div()
+                                    .absolute()
+                                    .left_0()
+                                    .right(px(12.))
+                                    .top(px(top))
+                                    .h(px(32.))
+                                    .overflow_hidden()
+                                    .bg(cx.theme().background)
+                                    .border_b_1()
+                                    .border_color(cx.theme().border)
+                                    .child(crate::context_menu::scoped(
+                                        SharedString::from(format!(
+                                            "sticky-db-{}-{}",
+                                            scope.id, scope.database
+                                        )),
+                                        div()
+                                            .h_flex()
+                                            .size_full()
+                                            .child(
+                                                Button::new(("sticky-db-toggle", index))
+                                                    .ghost()
+                                                    .icon(IconName::ChevronDown)
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.tree_toggle_branch(
+                                                                toggle_scope.key("database"),
+                                                                cx,
+                                                            );
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new(("sticky-db-locate", index))
+                                                    .ghost()
+                                                    .flex_1()
+                                                    .label(scope.database.clone())
+                                                    .on_click(cx.listener(
+                                                        move |this, _, _, cx| {
+                                                            this.tree.scroll.scroll_to_item(
+                                                                index,
+                                                                ScrollStrategy::Top,
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                            ),
+                                        move |menu, _, cx| {
+                                            let owner = owner.clone();
+                                            let scope = menu_scope.clone();
+                                            menu.item(
+                                                PopupMenuItem::new(t(cx, "database.note.new"))
+                                                    .on_click(move |_, _, cx| {
+                                                        let _ = owner.update(cx, |this, cx| {
+                                                            this.open_scoped_note(
+                                                                scope.id,
+                                                                Some(scope.database.clone()),
+                                                                cx,
+                                                            )
+                                                        });
+                                                    }),
+                                            )
+                                        },
+                                    )),
+                            );
+                        }
+                        let Row::Connection(profile) = row else {
+                            return body;
+                        };
+                        let id = profile.id;
+                        let owner = cx.entity().downgrade();
+                        body.child(
+                            div()
+                                .absolute()
+                                .left_0()
+                                .right(px(12.))
+                                .top(px(top))
+                                .h(px(32.))
+                                .overflow_hidden()
+                                .bg(cx.theme().background)
+                                .border_b_1()
+                                .border_color(cx.theme().border)
+                                .child(crate::context_menu::scoped(
+                                    SharedString::from(format!("sticky-connection-{id}")),
+                                    div()
+                                        .h_flex()
+                                        .size_full()
+                                        .items_center()
+                                        .child(
+                                            Button::new(("sticky-toggle", index))
+                                                .ghost()
+                                                .icon(if self.tree_connection_open(id, cx) {
+                                                    IconName::ChevronDown
+                                                } else {
+                                                    IconName::ChevronRight
+                                                })
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        this.tree_toggle_connection(id, window, cx)
+                                                    },
+                                                )),
+                                        )
+                                        .child(
+                                            Button::new(("sticky-locate", index))
+                                                .ghost()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .icon(super::navigation::type_icon(profile.kind))
+                                                .label(profile.name.clone())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.tree
+                                                        .scroll
+                                                        .scroll_to_item(index, ScrollStrategy::Top);
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                    move |menu, _, cx| {
+                                        if let Some(owner) = owner.upgrade() {
+                                            owner.update(cx, |this, cx| {
+                                                this.connection_menu(menu, id, false, cx)
+                                            })
+                                        } else {
+                                            menu
+                                        }
+                                    },
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .absolute()
@@ -1179,14 +1472,15 @@ impl DatabaseView {
                     .items_center()
                     .child(
                         Button::new(SharedString::from(format!("tree-connection-{id}")))
+                            .loading(self.note_connection_state(id).is_none())
                             .ghost()
                             .icon(if self.tree_connection_open(id, cx) {
                                 IconName::ChevronDown
                             } else {
                                 IconName::ChevronRight
                             })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.tree_toggle_connection(id, cx);
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.tree_toggle_connection(id, window, cx);
                             })),
                     )
                     .child(
@@ -1234,7 +1528,15 @@ impl DatabaseView {
                 };
                 let input = filter.input.clone();
                 div()
-                    .pl(px(36.))
+                    .pl(px(
+                        if cx.global::<Preferences>().database.sidebar_layout
+                            == crate::preferences::SidebarLayout::Split
+                        {
+                            0.
+                        } else {
+                            36.
+                        },
+                    ))
                     .pr_1()
                     .h_flex()
                     .gap_1()
@@ -1297,6 +1599,12 @@ impl DatabaseView {
                         )
                     });
                 let button = Button::new(SharedString::from(key.clone()))
+                    .loading(
+                        self.tree
+                            .pages
+                            .iter()
+                            .any(|((s, _), page)| s == &scope && !page.busy.is_empty()),
+                    )
                     .ghost()
                     .w_full()
                     .justify_start()
@@ -1334,6 +1642,7 @@ impl DatabaseView {
                     .child(
                         Button::new(SharedString::from(scope.key("refresh-cache")))
                             .ghost()
+                            .loading(busy)
                             .icon(if busy {
                                 gpui_component::Icon::new(IconName::LoaderCircle)
                             } else {
@@ -1378,6 +1687,7 @@ impl DatabaseView {
                             ("dbwork.database.copy", "copy", copy),
                             ("dbwork.import", "import", writable),
                             ("dbwork.export", "export", true),
+                            ("database.note.new", "new-note", true),
                             ("dbwork.refresh", "refresh", true),
                         ] {
                             let owner = owner.clone();
@@ -1391,6 +1701,11 @@ impl DatabaseView {
                                                 return;
                                             }
                                             match action {
+                                                "new-note" => this.open_scoped_note(
+                                                    scope.id,
+                                                    Some(scope.database.clone()),
+                                                    cx,
+                                                ),
                                                 "create" => this
                                                     .create_database_dialog(scope.id, window, cx),
                                                 "copy" => this.transfer_dialog(
@@ -1420,6 +1735,11 @@ impl DatabaseView {
                 .into_any_element()
             }
             Row::Category(scope, category) => {
+                let loading = self
+                    .tree
+                    .pages
+                    .get(&page_key(&scope, &category))
+                    .is_some_and(|page| page.busy.contains("catalog"));
                 let key = scope.key(&category);
                 let open = self.tree_branch_open(&key, cx);
                 let label = t(
@@ -1435,43 +1755,73 @@ impl DatabaseView {
                         _ => "dbwork.objects",
                     },
                 );
-                Button::new(SharedString::from(key.clone()))
-                    .ghost()
-                    .w_full()
-                    .justify_start()
-                    .pl(px(58.))
-                    .icon(if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .label(label)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if category == "index" && this.tree_select(&scope, cx) {
-                            this.open_table(
-                                Object {
-                                    schema: String::new(),
-                                    name: String::new(),
-                                    kind: "table".into(),
-                                    comment: String::new(),
-                                    parent: String::new(),
-                                },
-                                crate::table_view::Mode::Indexes,
-                                cx,
-                            );
+                let owner = cx.entity().downgrade();
+                let menu_scope = scope.clone();
+                let table_category = category == "table";
+                crate::context_menu::scoped(
+                    SharedString::from(format!("cards-menu-{key}")),
+                    Button::new(SharedString::from(key.clone()))
+                        .loading(loading)
+                        .ghost()
+                        .w_full()
+                        .justify_start()
+                        .pl(px(58.))
+                        .icon(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .label(label)
+                        .on_mouse_down(MouseButton::Left, {
+                            let scope = scope.clone();
+                            let table = category == "table";
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                if table && event.click_count == 2 {
+                                    this.open_table_cards(scope.id, scope.database.clone(), cx);
+                                }
+                            })
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if category == "index" && this.tree_select(&scope, cx) {
+                                this.open_table(
+                                    Object {
+                                        schema: String::new(),
+                                        name: String::new(),
+                                        kind: "table".into(),
+                                        comment: String::new(),
+                                        parent: String::new(),
+                                    },
+                                    crate::table_view::Mode::Indexes,
+                                    cx,
+                                );
+                            }
+                            if this.tree_toggle_branch(key.clone(), cx)
+                                && this.tree_object_query(cx).is_empty()
+                                && !this
+                                    .tree
+                                    .pages
+                                    .get(&page_key(&scope, &category))
+                                    .is_some_and(|p| p.loaded)
+                            {
+                                this.tree_load(scope.clone(), category.clone(), false, cx);
+                            }
+                        })),
+                    move |menu, _, cx| {
+                        if !table_category {
+                            return menu;
                         }
-                        if this.tree_toggle_branch(key.clone(), cx)
-                            && this.tree_object_query(cx).is_empty()
-                            && !this
-                                .tree
-                                .pages
-                                .get(&page_key(&scope, &category))
-                                .is_some_and(|p| p.loaded)
-                        {
-                            this.tree_load(scope.clone(), category.clone(), false, cx);
-                        }
-                    }))
-                    .into_any_element()
+                        let owner = owner.clone();
+                        let scope = menu_scope.clone();
+                        menu.item(PopupMenuItem::new(t(cx, "database.cards.title")).on_click(
+                            move |_, _, cx| {
+                                let _ = owner.update(cx, |this, cx| {
+                                    this.open_table_cards(scope.id, scope.database.clone(), cx)
+                                });
+                            },
+                        ))
+                    },
+                )
+                .into_any_element()
             }
             Row::Object(scope, category, object) => {
                 let key = scope.key(&Self::object_key(&object));
@@ -1496,6 +1846,14 @@ impl DatabaseView {
                     .items_center()
                     .child(
                         Button::new(SharedString::from(key.clone()))
+                            .loading(
+                                self.tree
+                                    .pages
+                                    .get(&page_key(&scope, &category))
+                                    .is_some_and(|page| {
+                                        page.busy.contains(&Self::object_key(&object))
+                                    }),
+                            )
                             .ghost()
                             .icon(if open {
                                 IconName::ChevronDown
@@ -1701,8 +2059,23 @@ impl DatabaseView {
             }
             Row::FilterMore(id) => self.tree_filter_more_row(id, cx),
             Row::FilterUnindexed(id) => self.tree_filter_unindexed_row(id, cx),
+            Row::Notice(key) if matches!(key, "ddl.loading" | "database.branch.connecting") => {
+                Button::new(SharedString::from(format!("tree-loading-{key}")))
+                    .ghost()
+                    .loading(true)
+                    .label(t(cx, key))
+                    .into_any_element()
+            }
             Row::Notice(key) => div()
-                .pl(px(38.))
+                .pl(px(
+                    if cx.global::<Preferences>().database.sidebar_layout
+                        == crate::preferences::SidebarLayout::Split
+                    {
+                        0.
+                    } else {
+                        38.
+                    },
+                ))
                 .text_xs()
                 .truncate()
                 .child(t(cx, key))
@@ -1747,5 +2120,20 @@ mod tests {
         let mut special = a.clone();
         special.database = "first\",\"table".into();
         assert_ne!(a.key("table"), special.key("table"));
+    }
+}
+
+#[cfg(test)]
+mod sticky_tests {
+    #[test]
+    fn header_follows_viewport_and_is_pushed_by_next_connection_or_project() {
+        let markers = [(0, false), (1, true), (12, true), (20, false), (21, true)];
+        assert_eq!(super::sticky_header(&markers, 32.), None);
+        assert_eq!(super::sticky_header(&markers, 33.), Some((1, 0.)));
+        assert_eq!(super::sticky_header(&markers, 368.), Some((1, -16.)));
+        assert_eq!(super::sticky_header(&markers, 385.), Some((12, 0.)));
+        assert_eq!(super::sticky_header(&markers, 641.), None);
+        assert_eq!(super::sticky_header(&markers, 673.), Some((21, 0.)));
+        assert_eq!(super::sticky_header(&[], 100.), None);
     }
 }

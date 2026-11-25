@@ -44,7 +44,9 @@ impl GridDelegate {
             .skip(1)
             .find(|c| c.name.as_ref() == field)
         {
-            *column = column.clone().width(px(width));
+            *column = column
+                .clone()
+                .width(px(width.max(crate::grid_metrics::minimum_width(14.))));
         }
     }
     pub fn new() -> Self {
@@ -69,7 +71,7 @@ impl GridDelegate {
             preview_order: Default::default(),
         }
     }
-    pub fn snapshot(view: &TableView, owner: WeakEntity<TableView>) -> Self {
+    pub fn snapshot(view: &TableView, owner: WeakEntity<TableView>, font: f32) -> Self {
         let mut columns = vec![
             GridColumn::new("__row_number", "#")
                 .p_0()
@@ -96,7 +98,8 @@ impl GridDelegate {
                         } else {
                             220.
                         },
-                    )))
+                    )
+                    .max(crate::grid_metrics::minimum_width(font))))
         }));
         Self {
             mongo: view.mongo.is_some(),
@@ -145,7 +148,7 @@ impl GridDelegate {
 pub(crate) fn column_icon(c: Option<&workbench::Column>, cx: &App) -> AnyElement {
     column_icon_variant(c, false, cx)
 }
-fn column_icon_variant(c: Option<&workbench::Column>, compact: bool, cx: &App) -> AnyElement {
+fn column_icon_variant(c: Option<&workbench::Column>, _compact: bool, cx: &App) -> AnyElement {
     let color = |dark, light| {
         rgb(if cx.theme().mode.is_dark() {
             dark
@@ -196,13 +199,7 @@ fn column_icon_variant(c: Option<&workbench::Column>, compact: bool, cx: &App) -
         } else {
             color(0x60a5fa, 0x2563eb)
         })
-        .child(if numeric {
-            if compact { "#" } else { "123" }
-        } else if compact {
-            "T"
-        } else {
-            "ABC"
-        })
+        .child(if numeric { "123" } else { "ABC" })
         .into_any_element()
 }
 impl TableDelegate for GridDelegate {
@@ -267,7 +264,7 @@ impl TableDelegate for GridDelegate {
                     .unwrap_or_else(|| default_highlight_color(cx))
                     .opacity(0.22))
             })
-            .when(resize_width < 140., |el| el.px_1().gap_0())
+            .when(resize_width < 140., |el| el.px_1().gap_1())
             .child(column_icon_variant(meta, resize_width < 140., cx))
             .child(
                 div()
@@ -485,6 +482,22 @@ impl TableDelegate for GridDelegate {
         let menu_owner = owner.clone();
         let mongo = self.mongo;
         let active = self.selection == Some((row, col));
+        let modified = self.pending.contains(&row)
+            && owner
+                .as_ref()
+                .and_then(|owner| owner.upgrade())
+                .is_some_and(|owner| {
+                    let view = owner.read(cx);
+                    view.changes
+                        .get(&row)
+                        .and_then(|change| change.values.as_ref())
+                        .is_some_and(|values| {
+                            view.rows
+                                .columns
+                                .get(col)
+                                .is_some_and(|name| values.contains_key(name))
+                        })
+                });
         let related = self.highlight && self.selection.is_some_and(|(r, c)| r == row || c == col);
         let cell = div()
             .id(("data-cell", row * 513 + index))
@@ -510,6 +523,9 @@ impl TableDelegate for GridDelegate {
                 })
                 .border_1()
                 .border_color(cx.theme().primary)
+            })
+            .when(modified, |el| {
+                el.bg(default_highlight_color(cx).opacity(0.42))
             })
             .when(missing || self.deleted.contains(&row), |el| {
                 el.text_color(cx.theme().muted_foreground)
@@ -563,7 +579,12 @@ impl TableDelegate for GridDelegate {
                     .as_ref()
                     .and_then(|owner| owner.upgrade())
                     .is_some_and(|owner| owner.read(cx).can_delete_row(row));
+                let editable = menu_owner
+                    .as_ref()
+                    .and_then(|owner| owner.upgrade())
+                    .is_some_and(|owner| owner.read(cx).can_edit_row(row));
                 for (key, action) in [
+                    ("grid.edit", "edit"),
                     ("grid.copy.cell", "cell"),
                     ("grid.copy.row", "txt"),
                     ("grid.delete.row", "delete"),
@@ -572,10 +593,14 @@ impl TableDelegate for GridDelegate {
                     let owner = menu_owner.clone();
                     menu = menu.item(
                         PopupMenuItem::new(t(cx, key))
-                            .disabled(action == "delete" && !writable)
+                            .disabled(
+                                (action == "delete" && !writable)
+                                    || (action == "edit" && !editable),
+                            )
                             .icon(match action {
                                 "delete" => IconName::Delete,
                                 "inspect" => IconName::Inspector,
+                                "edit" => IconName::Settings2,
                                 _ => IconName::Copy,
                             })
                             .on_click(move |_, window, cx| {
@@ -584,6 +609,7 @@ impl TableDelegate for GridDelegate {
                                         this.select_cell(row, col, window, cx);
                                         match action {
                                             "delete" => this.delete_row(row, window, cx),
+                                            "edit" => this.edit_cell(row, col, window, cx),
                                             "inspect" => this.show_details(Some(row), false, cx),
                                             format => this.copy(row, col, format, cx),
                                         }

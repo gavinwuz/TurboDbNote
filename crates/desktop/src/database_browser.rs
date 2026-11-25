@@ -659,69 +659,118 @@ impl DatabaseView {
                                         "function" => "dbwork.function",
                                         _ => "dbwork.event",
                                     };
-                                    Button::new(SharedString::from(format!(
-                                        "object-root-{category}"
-                                    )))
-                                    .ghost()
-                                    .icon(if folded {
-                                        IconName::ChevronRight
-                                    } else {
-                                        IconName::ChevronDown
-                                    })
-                                    .label(if count.is_empty() {
-                                        t(cx, label).to_string()
-                                    } else {
-                                        format!("{} ({count})", t(cx, label))
-                                    })
-                                    .justify_start()
-                                    .w_full()
-                                    .h(px(30.))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if category == "index" {
-                                            this.open_table(
-                                                Object {
-                                                    schema: String::new(),
-                                                    name: String::new(),
-                                                    kind: "table".into(),
-                                                    comment: String::new(),
-                                                    parent: String::new(),
+                                    let owner = cx.entity().downgrade();
+                                    let context = this.selected_database.clone();
+                                    crate::context_menu::scoped(
+                                        SharedString::from(format!("split-cards-menu-{category}")),
+                                        Button::new(SharedString::from(format!(
+                                            "object-root-{category}"
+                                        )))
+                                        .ghost()
+                                        .icon(if folded {
+                                            IconName::ChevronRight
+                                        } else {
+                                            IconName::ChevronDown
+                                        })
+                                        .label(if count.is_empty() {
+                                            t(cx, label).to_string()
+                                        } else {
+                                            format!("{} ({count})", t(cx, label))
+                                        })
+                                        .justify_start()
+                                        .w_full()
+                                        .h(px(30.))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                move |this, event: &MouseDownEvent, _, cx| {
+                                                    if category == "table"
+                                                        && event.click_count == 2
+                                                        && let Some((id, database)) =
+                                                            this.selected_database.clone()
+                                                    {
+                                                        this.open_table_cards(id, database, cx);
+                                                    }
                                                 },
-                                                crate::table_view::Mode::Indexes,
-                                                cx,
-                                            );
-                                        }
-                                        let key = if category == "table" {
-                                            category.into()
-                                        } else {
-                                            format!("root-open:{category}")
-                                        };
-                                        if !this.expanded_objects.remove(&key) {
-                                            this.expanded_objects.insert(key.clone());
-                                        }
-                                        let open = if category == "table" {
-                                            !this.expanded_objects.contains(&key)
-                                        } else {
-                                            this.expanded_objects.contains(&key)
-                                        };
-                                        let query = this
-                                            .object_filter
-                                            .read(cx)
-                                            .value()
-                                            .trim()
-                                            .to_lowercase();
-                                        if open
-                                            && this.browser.supported
-                                            && !this
-                                                .browser
-                                                .pages
-                                                .get(&(bucket(category).into(), query.clone()))
-                                                .is_some_and(|p| p.loaded)
-                                        {
-                                            this.browser.page(bucket(category), &query, false);
-                                            this.pump_browser(cx);
-                                        }
-                                        cx.notify();
-                                    }))
+                                            ),
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                if category == "index" {
+                                                    this.open_table(
+                                                        Object {
+                                                            schema: String::new(),
+                                                            name: String::new(),
+                                                            kind: "table".into(),
+                                                            comment: String::new(),
+                                                            parent: String::new(),
+                                                        },
+                                                        crate::table_view::Mode::Indexes,
+                                                        cx,
+                                                    );
+                                                }
+                                                let key = if category == "table" {
+                                                    category.into()
+                                                } else {
+                                                    format!("root-open:{category}")
+                                                };
+                                                if !this.expanded_objects.remove(&key) {
+                                                    this.expanded_objects.insert(key.clone());
+                                                }
+                                                let open = if category == "table" {
+                                                    !this.expanded_objects.contains(&key)
+                                                } else {
+                                                    this.expanded_objects.contains(&key)
+                                                };
+                                                let query = this
+                                                    .object_filter
+                                                    .read(cx)
+                                                    .value()
+                                                    .trim()
+                                                    .to_lowercase();
+                                                if open
+                                                    && this.browser.supported
+                                                    && !this
+                                                        .browser
+                                                        .pages
+                                                        .get(&(
+                                                            bucket(category).into(),
+                                                            query.clone(),
+                                                        ))
+                                                        .is_some_and(|p| p.loaded)
+                                                {
+                                                    this.browser.page(
+                                                        bucket(category),
+                                                        &query,
+                                                        false,
+                                                    );
+                                                    this.pump_browser(cx);
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ),
+                                        move |menu, _, cx| {
+                                            if category != "table" {
+                                                return menu;
+                                            }
+                                            let owner = owner.clone();
+                                            let context = context.clone();
+                                            menu.item(
+                                                PopupMenuItem::new(t(cx, "database.cards.title"))
+                                                    .on_click(move |_, _, cx| {
+                                                        if let Some((id, database)) = &context {
+                                                            let _ = owner.update(cx, |this, cx| {
+                                                                this.open_table_cards(
+                                                                    *id,
+                                                                    database.clone(),
+                                                                    cx,
+                                                                )
+                                                            });
+                                                        }
+                                                    }),
+                                            )
+                                        },
+                                    )
                                     .into_any_element()
                                 }
                             }

@@ -331,7 +331,8 @@ pub async fn grid_request(
             if !confirmed || !source.editable {
                 return Err("此查询结果不可写入或尚未确认".into());
             }
-            if kind == DatabaseKind::MySql && !crate::mysql::modern_version(version) {
+            if kind == DatabaseKind::MySql && !crate::mysql::modern_version(version) && !c.raw_gbk()
+            {
                 return Err("旧 MySQL 查询结果暂不支持编辑".into());
             }
             workbench::grid::commit_columns(

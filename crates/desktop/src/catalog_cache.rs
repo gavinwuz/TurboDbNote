@@ -28,12 +28,21 @@ pub struct SearchPage {
     pub indexed: bool,
     pub complete: bool,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DatabaseRule {
     pub enabled: bool,
     pub include: Vec<String>,
     pub exclude: Vec<String>,
+}
+impl Default for DatabaseRule {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        }
+    }
 }
 impl DatabaseRule {
     pub fn valid(&self) -> bool {
@@ -858,5 +867,20 @@ mod prefix_tests {
         c.execute("UPDATE directory_version SET version=2", [])
             .unwrap();
         assert!(cache.table_prefix("cq", None, 8).is_err());
+    }
+}
+
+#[cfg(test)]
+mod default_rule_tests {
+    use super::DatabaseRule;
+    #[test]
+    fn default_filter_is_enabled_but_empty_matches_all_and_explicit_disable_survives() {
+        let rule = DatabaseRule::default();
+        assert!(rule.enabled);
+        assert!(rule.matches("anything"));
+        let saved: DatabaseRule =
+            serde_json::from_str(r#"{"enabled":false,"include":["other"]}"#).unwrap();
+        assert!(!saved.enabled);
+        assert!(saved.matches("anything"));
     }
 }

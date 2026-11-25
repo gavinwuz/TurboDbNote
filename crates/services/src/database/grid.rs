@@ -352,6 +352,24 @@ pub(super) async fn count(
         .ok_or("行数统计结果无效")?;
     Ok(Reply::Count(count))
 }
+fn edit_literal(
+    kind: DatabaseKind,
+    schema: &Schema,
+    name: &str,
+    value: &str,
+) -> Result<String, String> {
+    if kind == DatabaseKind::MySql && schema.raw_gbk_columns.contains(name) {
+        let (bytes, _, errors) = encoding_rs::GBK.encode(value);
+        if errors {
+            return Err("mysql.gbk.encode".into());
+        }
+        return Ok(format!(
+            "_binary X'{}'",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        ));
+    }
+    Ok(literal_for(kind, value))
+}
 fn identity(kind: DatabaseKind, s: &Schema, row: &[Option<String>]) -> Result<String, String> {
     if row.len() != s.columns.len() {
         return Err("行数据与表结构不一致".into());
@@ -360,17 +378,22 @@ fn identity(kind: DatabaseKind, s: &Schema, row: &[Option<String>]) -> Result<St
     if primary.is_empty() || primary.iter().any(|c| !key_supported(c)) {
         return Err("修改或删除需要可可靠定位的主键".into());
     }
-    Ok(s.columns
+    s.columns
         .iter()
         .enumerate()
         .filter(|(_, c)| c.primary)
         .map(|(i, c)| match &row[i] {
-            Some(v) => format!("{}={}", quote(kind, &c.name), literal_for(kind, v)),
-            None => format!("{} IS NULL", quote(kind, &c.name)),
+            Some(value) => Ok(format!(
+                "{}={}",
+                quote(kind, &c.name),
+                edit_literal(kind, s, &c.name, value)?
+            )),
+            None => Ok(format!("{} IS NULL", quote(kind, &c.name))),
         })
-        .collect::<Vec<_>>()
-        .join(" AND "))
+        .collect::<Result<Vec<_>, String>>()
+        .map(|parts| parts.join(" AND "))
 }
+
 pub fn edit_preview(
     kind: DatabaseKind,
     db: &str,
@@ -391,12 +414,39 @@ pub fn edit_preview(
     }
     let name = qualified(kind, db, object);
     let mut statements = Vec::new();
+    let myisam = kind == DatabaseKind::MySql && crate::mysql::myisam_table_ddl(&s.ddl);
+    if myisam
+        && (changes.len() != 1 || changes[0].original.is_none() || changes[0].values.is_none())
+    {
+        return Err("mysql.myisam.single_update".into());
+    }
     for change in changes {
-        let predicate = change
+        let mut predicate = change
             .original
             .as_ref()
             .map(|row| identity(kind, s, row))
             .transpose()?;
+        if myisam {
+            let original = change.original.as_ref().ok_or("缺少原始行")?;
+            let mut parts = vec![predicate.take().ok_or("缺少主键")?];
+            for (column, value) in s.columns.iter().zip(original) {
+                if ["blob", "binary", "float", "double", "real"]
+                    .iter()
+                    .any(|ty| column.data_type.to_lowercase().contains(ty))
+                {
+                    return Err("mysql.myisam.unsupported".into());
+                }
+                parts.push(match value {
+                    None => format!("{} IS NULL", quote(kind, &column.name)),
+                    Some(value) => format!(
+                        "BINARY {} <=> BINARY {}",
+                        quote(kind, &column.name),
+                        edit_literal(kind, s, &column.name, value)?
+                    ),
+                });
+            }
+            predicate = Some(parts.join(" AND "));
+        }
         let sql = match (&change.values, predicate) {
             (None, Some(predicate)) => format!("DELETE FROM {name} WHERE {predicate}"),
             (Some(values), predicate) => {
@@ -415,12 +465,10 @@ pub fn edit_preview(
                         return Err("编辑值不能包含 NUL 字符".into());
                     }
                     columns.push(quote(kind, name));
-                    literals.push(
-                        value
-                            .as_ref()
-                            .map(|v| literal_for(kind, v))
-                            .unwrap_or_else(|| "NULL".into()),
-                    );
+                    literals.push(match value {
+                        Some(value) => edit_literal(kind, s, name, value)?,
+                        None => "NULL".into(),
+                    });
                 }
                 if let Some(predicate) = predicate {
                     if columns.is_empty() {
@@ -454,6 +502,11 @@ pub fn edit_preview(
         statements.push(sql);
     }
     let sql = statements.join(";\n");
+    let sql = if myisam {
+        format!("-- MyISAM: immediate write, no transaction rollback.\n{sql} LIMIT 1")
+    } else {
+        sql
+    };
     if sql.len() > 60_000 {
         return Err("修改超过 60 KB，请减少本次修改量".into());
     }
@@ -510,8 +563,32 @@ pub(in crate::database) async fn commit_columns(
         return Err("表结构已变化，请刷新后重新编辑".into());
     }
     edit_preview(kind, db, object, &s, changes)?;
-    if kind == DatabaseKind::MySql && !s.ddl.to_lowercase().contains("engine=innodb") {
+    if kind == DatabaseKind::MySql && crate::mysql::myisam_table_ddl(&s.ddl) {
+        let sql = edit_preview(kind, db, object, &s, changes)?;
+        let (_, affected) = c
+            .query_counted(&sql)
+            .await
+            .map_err(|_| "mysql.myisam.unknown".to_string())?;
+        let affected = match affected {
+            Some(n) => Some(n),
+            None => c
+                .query("SELECT ROW_COUNT()")
+                .await
+                .ok()
+                .and_then(|r| r.values.first().and_then(|v| v.first()).cloned().flatten())
+                .and_then(|v| v.parse::<u64>().ok()),
+        };
+        return if affected == Some(1) {
+            Ok(Reply::Executed)
+        } else {
+            Err("mysql.myisam.conflict".into())
+        };
+    }
+    if kind == DatabaseKind::MySql && !crate::mysql::transactional_table_ddl(&s.ddl) {
         return Err("批量编辑需要 InnoDB 事务表".into());
+    }
+    if c.raw_gbk() && keys(&s).is_empty() {
+        return Err("修改或删除需要可可靠定位的主键".into());
     }
     c.query(if kind == DatabaseKind::Sqlite {
         "BEGIN IMMEDIATE"
@@ -545,7 +622,7 @@ pub(in crate::database) async fn commit_columns(
                         " FOR UPDATE"
                     }
                 );
-                let current = c.query(&sql).await?;
+                let current = c.query_data(&sql).await?;
                 if current.values.len() != 1 || &current.values[0] != original {
                     return Err("数据已被其他操作修改，已取消提交；请刷新后重试".into());
                 }
@@ -978,5 +1055,94 @@ mod readable_filter_tests {
         )
         .unwrap();
         assert!(ordinary.contains("'O''Reilly'"));
+    }
+}
+
+#[cfg(test)]
+mod raw_gbk_edit_tests {
+    use super::*;
+    #[test]
+    fn latin1_storage_is_gbk_hex_and_utf8_columns_keep_unicode() {
+        let mut schema = Schema {
+            columns: vec![
+                Column {
+                    name: "id".into(),
+                    data_type: "int".into(),
+                    primary: true,
+                    ..Default::default()
+                },
+                Column {
+                    name: "name".into(),
+                    data_type: "varchar(32)".into(),
+                    ..Default::default()
+                },
+                Column {
+                    name: "label".into(),
+                    data_type: "varchar(32)".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        schema.raw_gbk_columns.insert("name".into());
+        assert_eq!(
+            edit_literal(DatabaseKind::MySql, &schema, "name", "张").unwrap(),
+            "_binary X'd5c5'"
+        );
+        assert_ne!(
+            edit_literal(DatabaseKind::MySql, &schema, "label", "张").unwrap(),
+            "_binary X'd5c5'"
+        );
+        assert!(edit_literal(DatabaseKind::MySql, &schema, "name", "😀").is_err());
+        let object = Object {
+            schema: String::new(),
+            name: "items".into(),
+            kind: "table".into(),
+            comment: String::new(),
+            parent: String::new(),
+        };
+        let change = Change {
+            original: Some(vec![
+                Some("1".into()),
+                Some("张".into()),
+                Some("原值".into()),
+            ]),
+            values: Some(
+                [("name".into(), Some("李'\\".into()))]
+                    .into_iter()
+                    .collect(),
+            ),
+        };
+        let sql = edit_preview(
+            DatabaseKind::MySql,
+            "db",
+            &object,
+            &schema,
+            std::slice::from_ref(&change),
+        )
+        .unwrap();
+        schema.ddl = "CREATE TABLE items(id int PRIMARY KEY, name varchar(32), label varchar(32)) ENGINE=MyISAM".into();
+        let guarded = edit_preview(
+            DatabaseKind::MySql,
+            "db",
+            &object,
+            &schema,
+            std::slice::from_ref(&change),
+        )
+        .unwrap();
+        assert!(guarded.contains("BINARY `name` <=> BINARY _binary X'd5c5'"));
+        assert!(guarded.ends_with(" LIMIT 1"));
+        assert!(
+            edit_preview(
+                DatabaseKind::MySql,
+                "db",
+                &object,
+                &schema,
+                &[change.clone(), change]
+            )
+            .is_err()
+        );
+        assert!(sql.contains("_binary X'"));
+        assert!(!sql.contains("李"));
     }
 }

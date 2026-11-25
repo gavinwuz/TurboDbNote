@@ -396,6 +396,8 @@ pub(crate) fn statement_error(number: u32) -> Option<&'static str> {
         1193 => Some("mysql.error.variable_1193"),
         1381 => Some("mysql.error.binlog_1381"),
         1054 => Some("mysql.error.column_1054"),
+        1267 | 1270 | 1271 => Some("mysql.error.collation"),
+        1300 | 1366 => Some("mysql.error.encoding"),
         1064 => Some(SQL_SYNTAX_ERROR),
         1146 => Some(TABLE_MISSING),
         1142 | 1143 => Some("mysql.error.command_denied"),
@@ -426,6 +428,9 @@ pub(crate) fn error_message(error: sqlx::Error) -> String {
             Some(code) => format!("数据库拒绝请求（错误码 {code}），请检查服务器配置/权限"),
             None => "数据库拒绝请求".into(),
         },
+        sqlx::Error::ColumnDecode { .. } | sqlx::Error::Decode(_) => {
+            "mysql.error.result_decode".into()
+        }
         sqlx::Error::Tls(_) => TlsIssue::Handshake.message().into(),
         sqlx::Error::Io(error) if error.kind() == std::io::ErrorKind::InvalidData => {
             "服务器响应格式或协议异常；不能据此判断为 TLS 问题".into()
@@ -956,5 +961,64 @@ mod tests {
         p.port = 3306;
         p.client_cert = "cert.pem".into();
         assert!(p.validate().is_err());
+    }
+}
+
+/// Inspect only top-level table options; comments and string values cannot fake an engine.
+pub fn transactional_table_ddl(ddl: &str) -> bool {
+    table_engine_is(ddl, "InnoDB")
+}
+pub fn myisam_table_ddl(ddl: &str) -> bool {
+    table_engine_is(ddl, "MyISAM")
+}
+fn table_engine_is(ddl: &str, expected: &str) -> bool {
+    use sqlparser::{
+        dialect::MySqlDialect,
+        tokenizer::{Token, Tokenizer},
+    };
+    let Ok(tokens) = Tokenizer::new(&MySqlDialect {}, ddl).tokenize() else {
+        return false;
+    };
+    let tokens = tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect::<Vec<_>>();
+    let mut depth = 0usize;
+    let mut body = false;
+    for (i, token) in tokens.iter().enumerate() {
+        match token {
+            Token::LParen => {
+                depth += 1;
+                body = true;
+            }
+            Token::RParen => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        if depth == 0
+            && body
+            && let Token::Word(word) = token
+            && (word.value.eq_ignore_ascii_case("ENGINE")
+                || word.value.eq_ignore_ascii_case("TYPE"))
+            && tokens.get(i + 1) == Some(&Token::Eq)
+            && let Some(Token::Word(engine)) = tokens.get(i + 2)
+        {
+            return engine.value.eq_ignore_ascii_case(expected);
+        }
+    }
+    false
+}
+#[cfg(test)]
+mod transaction_engine_tests {
+    #[test]
+    fn engine_options_ignore_comments_and_spacing() {
+        assert!(super::transactional_table_ddl(
+            "CREATE TABLE t(id INT) ENGINE = InnoDB"
+        ));
+        assert!(super::transactional_table_ddl(
+            "CREATE TABLE t(id INT) TYPE=InnoDB"
+        ));
+        assert!(!super::transactional_table_ddl(
+            "CREATE TABLE t(id INT) ENGINE=MyISAM COMMENT='ENGINE=InnoDB'"
+        ));
     }
 }

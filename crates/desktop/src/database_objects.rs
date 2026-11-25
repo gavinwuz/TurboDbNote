@@ -171,13 +171,7 @@ impl DatabaseView {
             self.selected_database = Some((id, database.clone()));
             self.navigation.databases.insert(id, database);
             self.persist_navigation();
-            if self.browser.query.is_empty() {
-                self.browser.page("relations", "", false);
-            } else {
-                let categories = self.browser_search_categories(cx);
-                self.browser.search(self.browser.query.clone(), &categories);
-            }
-            self.pump_browser(cx);
+            // Both relational sidebar layouts now load only explicitly expanded tree branches.
             cx.notify();
             return;
         }
@@ -311,7 +305,9 @@ impl DatabaseView {
         }
         match result {
             Ok(OperationResult::Workbench(reply)) => match *reply {
-                Reply::AccountGrants(_) | Reply::CatalogPage { .. } => {}
+                Reply::AccountGrants(_)
+                | Reply::CatalogPage { .. }
+                | Reply::TableCardDetails(_) => {}
                 Reply::Catalog { objects, notice } => {
                     self.browser.unknown_limit = !notice.is_empty();
                     for o in &objects {
@@ -1083,6 +1079,7 @@ pub(super) fn is_metadata_read(kind: &OperationKind) -> bool {
                 | Action::AccountPermissions { .. }
                 | Action::Accounts { .. }
                 | Action::BrowseCatalog { .. }
+                | Action::TableCardDetails(_)
                 | Action::BrowseColumns(_)
                 | Action::BrowseSection { .. }
                 | Action::Catalog

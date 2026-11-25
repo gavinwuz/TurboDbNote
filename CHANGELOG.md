@@ -4,6 +4,26 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-25
+
+- Add guarded single-row MyISAM updates with original-value predicates, explicit confirmation and no rollback or automatic retry. Fix MySQL 5.7 native-client TLS parameter selection. Real MyISAM server writes remain unverified.
+
+- Enable confirmed InnoDB grid edits in raw GBK mode with per-column GBK hex encoding, decoded original-row locking checks and rollback; arbitrary SQL writes/scripts remain blocked. Align card remarks to the right.
+
+- Bind split-sidebar filtering to the current connection database names and shared include/exclude rules. Compact table cards into two rows with ellipsized remarks, primary keys and optional numeric next-auto-increment snapshots.
+
+- Preserve full data-header type markers and readable minimum widths, improve SQL query entry and generated aliases, tolerate spaced/legacy InnoDB engine options, and compare Chinese LIKE against confirmed latin1/GBK-byte fields only in explicit read-only raw-GBK mode.
+
+- Rename table-card browsing to View tables, add responsive columns and shared table context menus, and load bounded visible-card metadata lazily. MySQL auto-increment values are next-value snapshots, not MAX(id).
+
+- Replace the split sidebar database picker with an all-visible-databases tree and sticky database headers; connect only on explicit expansion, show per-node loading, and reuse name-first paged catalogs with lazy details.
+
+- Keep the merged database tree hierarchy and pin the viewport connection header while scrolling; the next connection/project pushes it away, with scoped context actions and click-to-locate.
+
+- Add scoped Note creation from connection/database context menus and filterable, virtualized table-card tabs from Tables categories in both sidebar layouts. Opening a Note does not execute SQL.
+
+- Preserve safe MySQL Note error categories for columns, permissions, collations and result decoding; distinguish read-only failures from uncertain writes.
+
 ## [0.1.10] - 2026-11-19
 
 - Add four built-in light styles, defaulting to Celadon White, and preserve the chosen light palette across dark/light switching. Hide unloaded-count placeholders in database object trees.

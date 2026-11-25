@@ -1010,6 +1010,19 @@ fn credential_file(password: &str) -> Result<tempfile::NamedTempFile, String> {
     file.flush().map_err(io_error)?;
     Ok(file)
 }
+fn mysql_pre8_client(version: &str) -> bool {
+    version.contains("Distrib 5.") || version.contains("Distrib 4.")
+}
+
+#[test]
+fn mysql_client_tls_generation() {
+    assert!(mysql_pre8_client(
+        "mysql Ver 14.14 Distrib 5.7.44, for Win64"
+    ));
+    assert!(mysql_pre8_client("mysqldump Ver 10.13 Distrib 5.6.21"));
+    assert!(!mysql_pre8_client("mysql Ver 8.0.40 for Win64"));
+}
+
 fn mysql_command(endpoint: &Endpoint, name: &str) -> Result<NativeCommand, String> {
     let path = tool(&endpoint.profile, name)?;
     let version = command(&path)
@@ -1017,7 +1030,7 @@ fn mysql_command(endpoint: &Endpoint, name: &str) -> Result<NativeCommand, Strin
         .output()
         .map_err(io_error)?;
     let version = String::from_utf8_lossy(&version.stdout);
-    let old = version.contains("Distrib 5.1") || version.contains("Distrib 5.6");
+    let old = mysql_pre8_client(&version);
     let p = &endpoint.profile;
     let mut cmd = command(&path);
     let credentials = credential_file(&endpoint.password)?;

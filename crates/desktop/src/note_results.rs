@@ -125,8 +125,9 @@ impl TableView {
         note.access_mode = mode;
         self.target.writable = mode != turbodbn_services::access_mode::AccessMode::ReadOnly
             && note.source.editable
-            && note.saved.profile.supports_mutation()
+            && note.saved.profile.supports_grid_mutation()
             && !(note.saved.profile.kind == turbodbn_services::DatabaseKind::MySql
+                && !note.saved.profile.mysql_raw_gbk
                 && turbodbn_services::mysql::uses_legacy(&note.saved.profile));
         cx.notify();
     }

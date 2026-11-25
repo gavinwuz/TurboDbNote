@@ -206,3 +206,5 @@ Missing or inaccessible Note files offer recovery actions: retry, locate the ori
 Light appearance includes Celadon White (default), Mist Blue, Warm Paper and Graphite Purple in Settings → General → Themes. Object categories omit unloaded-count placeholders.
 
 SQL file cells support manual source reload, scrollable statement selection with per-statement skipping, and a full SQL viewer with line numbers, search and wrapping. Reload never runs SQL; changed content resets session-only skip selections.
+
+Connection and database context menus can create a scoped Note without running SQL. Double-click the Tables category or use its context menu to open a filterable table-card tab; double-click a card to browse data.

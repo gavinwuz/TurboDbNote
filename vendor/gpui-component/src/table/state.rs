@@ -276,11 +276,12 @@ where
     }
 
     fn prepare_col_groups(&mut self, cx: &mut Context<Self>) {
+        let header_min = px(f32::from(cx.theme().font_size) * 0.65 * 8. + 90.);
         self.col_groups = (0..self.delegate.columns_count(cx))
             .map(|col_ix| {
                 let column = self.delegate().column(col_ix, cx);
                 ColGroup {
-                    width: column.width,
+                    width: if column.resizable && column.fixed.is_none() { column.width.max(header_min) } else { column.width },
                     bounds: Bounds::default(),
                     column: column.clone(),
                 }
@@ -471,7 +472,7 @@ where
             return;
         }
 
-        const MIN_WIDTH: Pixels = px(10.0);
+        let minimum_width = px(f32::from(cx.theme().font_size) * 0.65 * 8. + 90.);
         const MAX_WIDTH: Pixels = px(1200.0);
         let Some(col_group) = self.col_groups.get_mut(ix) else {
             return;
@@ -484,7 +485,7 @@ where
 
         let old_width = col_group.width;
         let new_width = size;
-        if new_width < MIN_WIDTH {
+        if new_width < if col_group.column.fixed.is_some() { px(10.) } else { minimum_width } {
             return;
         }
         let changed_width = new_width - old_width;

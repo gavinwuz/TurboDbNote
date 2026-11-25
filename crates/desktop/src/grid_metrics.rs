@@ -9,6 +9,9 @@ fn cells(value: &str) -> usize {
         .map(|c| if c == '\t' { 4 } else { c.width().unwrap_or(0) })
         .sum()
 }
+pub fn minimum_width(font: f32) -> f32 {
+    font.clamp(10., 32.) * 0.65 * 8. + 90.
+}
 pub fn widths(rows: &Rows, font: f32) -> Vec<f32> {
     estimate(rows, font, 54., false)
 }
@@ -22,9 +25,9 @@ fn estimate(rows: &Rows, font: f32, header_controls: f32, compact_header: bool) 
         .enumerate()
         .map(|(col, name)| {
             let header_cells = if compact_header {
-                cells(name).min(4)
+                cells(name).min(8)
             } else {
-                cells(name)
+                cells(name).max(8)
             };
             let header = header_cells as f32 * unit + header_controls;
             let mut sizes = rows
@@ -43,11 +46,7 @@ fn estimate(rows: &Rows, font: f32, header_controls: f32, compact_header: bool) 
                 .copied()
                 .unwrap_or(0.);
             header.max(sample).clamp(
-                if compact_header {
-                    (100. * font / 14.).clamp(80., 200.)
-                } else {
-                    64.
-                },
+                minimum_width(font),
                 (280. * font.clamp(10., 32.) / 14.).clamp(180., 640.),
             )
         })
@@ -71,7 +70,7 @@ mod tests {
             ]],
         };
         let widths = data_widths(&rows, 14.);
-        assert_eq!(widths[0], 100.);
+        assert_eq!(widths[0], super::minimum_width(14.));
         assert!(widths[1] > widths[0] && widths[1] < 180.);
         assert!(widths[2] > widths[1]);
         assert_eq!(rows.columns[0], "original_identity_type");
@@ -107,8 +106,8 @@ mod tests {
         };
         let values = widths(&rows, 14.);
         let data = data_widths(&rows, 14.);
-        assert!(data[0] >= 80. && data[0] < data[1]);
-        assert!(values[0] < values[1]);
+        assert!(data[0] >= super::minimum_width(14.) && data[0] <= data[1]);
+        assert!(values[0] <= values[1]);
         assert!(values[1] < values[2]);
         assert!(values.iter().all(|v| *v >= 64. && *v <= 280.));
         assert_eq!(rows.values[0][2].as_ref().unwrap().len(), 10000);

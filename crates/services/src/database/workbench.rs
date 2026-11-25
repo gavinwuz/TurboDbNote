@@ -28,6 +28,9 @@ pub struct Rows {
 pub type Query<'a> = Pin<Box<dyn Future<Output = Result<Rows, String>> + 'a>>;
 pub type CountedQuery<'a> = Pin<Box<dyn Future<Output = Result<(Rows, Option<u64>), String>> + 'a>>;
 pub trait Access {
+    fn raw_gbk(&self) -> bool {
+        false
+    }
     fn supports_keyset(&self) -> bool {
         true
     }
@@ -88,6 +91,8 @@ pub struct IndexColumn {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Schema {
     #[serde(default)]
+    pub raw_gbk_columns: std::collections::BTreeSet<String>,
+    #[serde(default)]
     pub index_columns: std::collections::BTreeMap<String, Vec<IndexColumn>>,
     pub columns: Vec<Column>,
     pub indexes: Rows,
@@ -102,6 +107,7 @@ pub struct Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Action {
+    TableCardDetails(Vec<Object>),
     AccountGrants {
         user: String,
         host: String,
@@ -204,8 +210,17 @@ pub enum Action {
         guard: Option<(Object, String)>,
     },
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TableCardDetails {
+    pub schema: String,
+    pub name: String,
+    pub comment: String,
+    pub primary: Vec<String>,
+    pub next_auto_increment: Option<String>,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    TableCardDetails(Vec<TableCardDetails>),
     AccountGrants(Vec<account_admin::Grant>),
     CatalogPage {
         objects: Vec<Object>,
@@ -357,6 +372,71 @@ async fn catalog(
         notice: notices.join(" · "),
     })
 }
+async fn table_card_details(
+    c: &mut impl Access,
+    kind: DatabaseKind,
+    db: &str,
+    version: &str,
+    objects: &[Object],
+) -> Result<Reply, String> {
+    if objects.is_empty() || objects.len() > 12 {
+        return Err("browser.response_limit".into());
+    }
+    let mut details = objects
+        .iter()
+        .map(|o| TableCardDetails {
+            schema: o.schema.clone(),
+            name: o.name.clone(),
+            ..Default::default()
+        })
+        .collect::<Vec<_>>();
+    if kind == DatabaseKind::MySql && !version.starts_with("4.") {
+        let names = objects
+            .iter()
+            .map(|o| metadata_literal(kind, &o.name))
+            .collect::<Vec<_>>()
+            .join(",");
+        let database = metadata_literal(kind, db);
+        let rows = c.query(&format!("SELECT TABLE_NAME,TABLE_COMMENT,AUTO_INCREMENT FROM information_schema.TABLES WHERE TABLE_SCHEMA={database} AND TABLE_NAME IN ({names}) LIMIT 12")).await?;
+        for row in rows.values {
+            if let Some(detail) = details.iter_mut().find(|d| d.name == value(&row, 0)) {
+                detail.comment = value(&row, 1);
+                detail.next_auto_increment = row.get(2).cloned().flatten();
+            }
+        }
+        let rows = c.query(&format!("SELECT TABLE_NAME,COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA={database} AND CONSTRAINT_NAME='PRIMARY' AND TABLE_NAME IN ({names}) ORDER BY TABLE_NAME,ORDINAL_POSITION LIMIT 1024")).await?;
+        for row in rows.values {
+            if let Some(detail) = details.iter_mut().find(|d| d.name == value(&row, 0)) {
+                detail.primary.push(value(&row, 1));
+            }
+        }
+    } else {
+        for (object, detail) in objects.iter().zip(&mut details) {
+            if kind == DatabaseKind::Sqlite {
+                let rows = c
+                    .query(&format!("PRAGMA table_info({})", quote(kind, &object.name)))
+                    .await?;
+                let mut keys = rows
+                    .values
+                    .into_iter()
+                    .filter(|row| value(row, 5) != "0")
+                    .collect::<Vec<_>>();
+                keys.sort_by_key(|row| value(row, 5).parse::<u64>().unwrap_or(0));
+                detail.primary = keys.iter().map(|row| value(row, 1)).collect();
+            } else {
+                let schema = schema(c, kind, db, object, false).await?;
+                detail.primary = schema
+                    .columns
+                    .into_iter()
+                    .filter(|column| column.primary)
+                    .map(|column| column.name)
+                    .collect();
+                detail.comment = object.comment.clone();
+            }
+        }
+    }
+    Ok(Reply::TableCardDetails(details))
+}
 pub(super) async fn schema(
     c: &mut impl Access,
     kind: DatabaseKind,
@@ -377,6 +457,10 @@ pub(super) async fn schema(
                 // 4.0 omits Collation; locate fields using the returned headers in future server variants.
                 let modern = r.len() >= 9;
                 let key = if modern { 4 } else { 3 };
+                if c.raw_gbk() && modern && value(&r, 2).to_lowercase().starts_with("latin1_") {
+                    s.raw_gbk_columns.insert(value(&r, 0));
+                }
+
                 s.columns.push(Column {
                     name: value(&r, 0),
                     data_type: value(&r, 1),
@@ -743,6 +827,9 @@ pub async fn run(
             ddl,
             changes,
         } => grid::commit(c, kind, &r.database, object, ddl, changes).await,
+        Action::TableCardDetails(objects) => {
+            table_card_details(c, kind, &r.database, version, objects).await
+        }
         Action::BrowseCatalog {
             category,
             search,
@@ -1409,3 +1496,89 @@ pub fn filter_select(
 #[cfg(test)]
 #[path = "workbench_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod table_card_tests {
+    use super::*;
+    struct Fixture {
+        calls: Vec<String>,
+        replies: std::collections::VecDeque<Rows>,
+    }
+    impl Access for Fixture {
+        fn query<'a>(&'a mut self, sql: &'a str) -> Query<'a> {
+            self.calls.push(sql.into());
+            let reply = self
+                .replies
+                .pop_front()
+                .ok_or_else(|| "unexpected query".to_string());
+            Box::pin(async move { reply })
+        }
+    }
+    #[tokio::test]
+    async fn visible_card_details_are_batched_and_never_scan_ids_or_advance_sequences() {
+        let mut fixture = Fixture {
+            calls: vec![],
+            replies: [
+                Rows {
+                    columns: vec![],
+                    values: vec![vec![
+                        Some("items".into()),
+                        Some("Table comment".into()),
+                        Some("42".into()),
+                    ]],
+                },
+                Rows {
+                    columns: vec![],
+                    values: vec![
+                        vec![Some("items".into()), Some("tenant_id".into())],
+                        vec![Some("items".into()), Some("id".into())],
+                    ],
+                },
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let object = Object {
+            schema: String::new(),
+            name: "items".into(),
+            kind: "table".into(),
+            comment: String::new(),
+            parent: String::new(),
+        };
+        let Reply::TableCardDetails(details) = table_card_details(
+            &mut fixture,
+            crate::DatabaseKind::MySql,
+            "db",
+            "5.6",
+            std::slice::from_ref(&object),
+        )
+        .await
+        .unwrap() else {
+            panic!("wrong response")
+        };
+        assert_eq!(fixture.calls.len(), 2);
+        assert_eq!(details[0].primary, vec!["tenant_id", "id"]);
+        assert_eq!(details[0].comment, "Table comment");
+        assert_eq!(details[0].next_auto_increment.as_deref(), Some("42"));
+        assert!(
+            fixture
+                .calls
+                .iter()
+                .all(|sql| sql.contains("information_schema.")
+                    && !sql.contains("MAX(")
+                    && !sql.contains("nextval"))
+        );
+        assert!(
+            table_card_details(
+                &mut fixture,
+                crate::DatabaseKind::MySql,
+                "db",
+                "5.6",
+                &vec![object; 13]
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fixture.calls.len(), 2);
+    }
+}

@@ -1,6 +1,6 @@
 use super::*;
 use crate::locale::t;
-use gpui_component::WindowExt;
+use gpui_component::{WindowExt, menu::ContextMenuExt};
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct OpenTable {
@@ -98,6 +98,79 @@ pub(super) fn index_menu_items(
 }
 impl EventEmitter<OpenTable> for DatabaseView {}
 impl DatabaseView {
+    pub(crate) fn table_card_menu(
+        mut menu: gpui_component::menu::PopupMenu,
+        source: WeakEntity<Self>,
+        target: OpenTable,
+        cx: &App,
+    ) -> gpui_component::menu::PopupMenu {
+        let writable = target.writable;
+        for &(key, action, mode) in TABLE_MENU_ACTIONS {
+            if key.is_empty() {
+                menu = menu.separator();
+                continue;
+            }
+            let source = source.clone();
+            let target = target.clone();
+            menu = menu.item(
+                PopupMenuItem::new(t(cx, key))
+                    .disabled(!writable && matches!(action, "rename" | "delete" | "import"))
+                    .on_click(move |_, window, cx| {
+                        let _ = source.update(cx, |this, cx| {
+                            this.table_card_action(target.clone(), mode, action, window, cx)
+                        });
+                    }),
+            );
+        }
+        menu
+    }
+
+    pub(super) fn open_scoped_note(
+        &self,
+        id: Uuid,
+        database: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(profile) = self.profiles.iter().find(|p| p.id == id) {
+            cx.emit(OpenTable {
+                connection: id,
+                database: database.unwrap_or_else(|| profile.database.clone()),
+                object: Object {
+                    schema: String::new(),
+                    name: String::new(),
+                    kind: "note-scope".into(),
+                    comment: profile.group.clone(),
+                    parent: String::new(),
+                },
+                mode: crate::table_view::Mode::Note,
+                generation: self.note_generation(id),
+                kind: profile.kind,
+                writable: profile.supports_mutation(),
+                mysql_raw_gbk: profile.mysql_raw_gbk,
+            });
+        }
+    }
+    pub(super) fn open_table_cards(&self, id: Uuid, database: String, cx: &mut Context<Self>) {
+        if let Some(profile) = self.note_profile(id) {
+            cx.emit(OpenTable {
+                connection: id,
+                database,
+                object: Object {
+                    schema: String::new(),
+                    name: String::new(),
+                    kind: "table".into(),
+                    comment: String::new(),
+                    parent: String::new(),
+                },
+                mode: crate::table_view::Mode::Cards,
+                generation: self.note_generation(id),
+                kind: profile.kind,
+                writable: profile.supports_mutation(),
+                mysql_raw_gbk: profile.mysql_raw_gbk,
+            });
+        }
+    }
+
     pub(crate) fn mongo_context_current(&self, id: Uuid, generation: u64) -> bool {
         self.generation.get(&id).copied() == Some(generation)
             && self.states.get(&id).is_some_and(|s| s == "已连接")
@@ -217,12 +290,20 @@ impl DatabaseView {
                 mode,
                 generation: self.generation.get(&id).copied().unwrap_or_default(),
                 kind: p.kind,
-                writable: p.supports_mutation(),
+                writable: p.supports_mutation()
+                    || (mode == crate::table_view::Mode::Grid && p.supports_grid_mutation()),
                 mysql_raw_gbk: p.mysql_raw_gbk,
             });
         }
     }
     pub(super) fn render_object_tree(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_object_tree_legacy(window, cx)
+    }
+    fn render_object_tree_legacy(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -485,6 +566,14 @@ impl DatabaseView {
                             }),
                     ),
             );
+        if profile
+            .as_ref()
+            .is_none_or(|p| !matches!(p.kind, DatabaseKind::Redis | DatabaseKind::External))
+        {
+            return body
+                .child(self.render_database_navigation_tree(true, window, cx))
+                .into_any_element();
+        }
         if let Some(p) = profile {
             let id = p.id;
             let names = self.catalog(&p);
@@ -557,6 +646,29 @@ impl DatabaseView {
                 if let Some(picker) = &self.object_database_picker {
                     body = body.child(
                         div()
+                            .context_menu({
+                                let owner = cx.entity().downgrade();
+                                let scope = self.selected_database.clone();
+                                move |menu, _, cx| {
+                                    let owner = owner.clone();
+                                    let scope = scope.clone();
+                                    menu.item(
+                                        PopupMenuItem::new(t(cx, "database.note.new")).on_click(
+                                            move |_, _, cx| {
+                                                if let Some((id, database)) = &scope {
+                                                    let _ = owner.update(cx, |this, cx| {
+                                                        this.open_scoped_note(
+                                                            *id,
+                                                            Some(database.clone()),
+                                                            cx,
+                                                        )
+                                                    });
+                                                }
+                                            },
+                                        ),
+                                    )
+                                }
+                            })
                             .flex()
                             .items_center()
                             .gap_1()

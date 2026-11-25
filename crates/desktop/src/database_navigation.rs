@@ -1140,6 +1140,7 @@ impl DatabaseView {
                 div().flex_1().min_w_0().child(crate::context_menu::scoped(
                     SharedString::from(format!("connection-menu-{scope}-{id}")),
                     Button::new(SharedString::from(format!("connection-{scope}-{id}")))
+                        .loading(self.note_connection_state(id).is_none())
                         .ghost()
                         .icon(type_icon(p.kind))
                         .child(

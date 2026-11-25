@@ -187,16 +187,6 @@ impl CellView {
         self.query_only = true;
         self.set_editing(true, window, cx);
         self.editor.update(cx, |input, cx| input.focus(window, cx));
-        let Some(kind) = self.assist_context(cx).0 else {
-            return;
-        };
-        let sql = self.editor.read(cx).value();
-        let safe = turbodbn_services::database::notebook_query::automatic_table_read(kind, &sql);
-        if safe {
-            self.run(0, window, cx);
-        } else {
-            feedback::error(t(cx, "query_note.manual_run"), cx);
-        }
     }
     pub(crate) fn set_query_only(&mut self, value: bool) {
         self.query_only = value;

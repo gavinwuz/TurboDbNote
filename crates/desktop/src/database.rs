@@ -1839,6 +1839,7 @@ impl DatabaseView {
                 IconName::ArrowRight,
                 "connect",
             ),
+            ("database.note.new", IconName::Plus, "new-note"),
             ("restore.open", IconName::ArrowDown, "import-script"),
             ("dbwork.connection.edit", IconName::Settings2, "edit"),
             ("dbwork.connection.copy", IconName::Copy, "copy"),
@@ -1857,6 +1858,7 @@ impl DatabaseView {
                                 return;
                             }
                             match action {
+                                "new-note" => this.open_scoped_note(id, None, cx),
                                 "connect" => {
                                     if this.sessions.contains_key(&id) {
                                         this.disconnect(id, cx);

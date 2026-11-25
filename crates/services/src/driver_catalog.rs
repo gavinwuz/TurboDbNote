@@ -195,6 +195,9 @@ impl DriverSpec {
     }
 }
 impl Profile {
+    pub fn supports_grid_mutation(&self) -> bool {
+        self.supports_mutation() || (self.kind == DatabaseKind::MySql && self.mysql_raw_gbk)
+    }
     pub fn supports_mutation(&self) -> bool {
         !self.mysql_raw_gbk
             && self.kind != DatabaseKind::External
@@ -230,6 +233,7 @@ pub(crate) fn check_operation(p: &Profile, op: &crate::database::Operation) -> R
             | OperationKind::Objects { .. }
             | OperationKind::Details { .. } => true,
             OperationKind::Workbench(r) => match &r.action {
+                Action::Commit { .. } | Action::TableCardDetails(_) => true,
                 Action::AccountGrants { .. }
                 | Action::AccountMode
                 | Action::AccountPermissions { .. }
@@ -277,7 +281,12 @@ pub(crate) fn check_operation(p: &Profile, op: &crate::database::Operation) -> R
                 }
                 Action::NoteGrid { plan, action, .. } => {
                     plan.read_only
-                        && matches!(action, GridAction::Page { .. } | GridAction::Count { .. })
+                        && matches!(
+                            action,
+                            GridAction::Page { .. }
+                                | GridAction::Count { .. }
+                                | GridAction::Commit { .. }
+                        )
                 }
                 _ => false,
             },

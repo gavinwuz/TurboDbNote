@@ -812,6 +812,11 @@ impl NoteLibrary {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if target.object.kind == "note-scope" {
+            let project = target.object.comment.clone();
+            self.create_note(Some(target), project, window, cx);
+            return;
+        }
         if !matches!(
             target.kind,
             turbodbn_services::DatabaseKind::MySql
@@ -832,7 +837,7 @@ impl NoteLibrary {
                 view: view.clone(),
             });
             cx.defer_in(window, move |_, window, cx| {
-                view.update(cx, |note, cx| note.open_table_query(window, cx))
+                view.update(cx, |note, cx| note.open_table_query(window, cx));
             });
             return;
         }
@@ -853,7 +858,6 @@ impl NoteLibrary {
             return;
         }
         self.opening = true;
-        let query_open = target.is_some();
         let mut note = Note::new("");
         note.project = project.clone();
         self.collapsed.remove(&project);
@@ -869,22 +873,25 @@ impl NoteLibrary {
             note.title = target.object.name.clone();
             note.default_connection_id = Some(target.connection);
             note.default_database = Some(target.database.clone());
-            note.table_query = Some((target.object.schema.clone(), target.object.name.clone()));
-            note.table_query_origin = Some(turbodbn_core::notebook::TableQueryOrigin {
-                connection: target.connection,
-                database: target.database.clone(),
-                schema: target.object.schema.clone(),
-                table: target.object.name.clone(),
-            });
-            if let CellContent::Sql { source, .. } = &mut note.cells[0].content {
-                *source = format!(
-                    "SELECT * FROM {};",
-                    turbodbn_services::database::workbench::qualified(
-                        target.kind,
-                        &target.database,
-                        &target.object
-                    )
-                );
+            if target.object.kind != "note-scope" {
+                note.table_query = Some((target.object.schema.clone(), target.object.name.clone()));
+                note.table_query_origin = Some(turbodbn_core::notebook::TableQueryOrigin {
+                    connection: target.connection,
+                    database: target.database.clone(),
+                    schema: target.object.schema.clone(),
+                    table: target.object.name.clone(),
+                });
+                if let CellContent::Sql { source, .. } = &mut note.cells[0].content {
+                    *source = format!(
+                        "SELECT * FROM {} AS {};",
+                        turbodbn_services::database::workbench::qualified(
+                            target.kind,
+                            &target.database,
+                            &target.object
+                        ),
+                        table_alias(&target.object.name)
+                    );
+                }
             }
         }
         let directory = Self::directory(cx);
@@ -900,19 +907,17 @@ impl NoteLibrary {
                     let success = result.is_ok();
                     match result {
                         Ok((path, loaded)) => {
+                            let table_query = loaded.note.table_query.is_some();
                             this.install(path.clone(), true, loaded, window, cx);
-                            if query_open {
-                                cx.defer_in(window, move |this, window, cx| {
-                                    if let Some(view) = this
-                                        .documents
-                                        .values()
-                                        .find(|v| v.read(cx).path == path)
-                                        .cloned()
-                                    {
-                                        view.update(cx, |note, cx| {
-                                            note.open_table_query(window, cx)
-                                        });
-                                    }
+                            if table_query
+                                && let Some(view) = this
+                                    .documents
+                                    .values()
+                                    .find(|v| v.read(cx).path == path)
+                                    .cloned()
+                            {
+                                cx.defer_in(window, move |_, window, cx| {
+                                    view.update(cx, |note, cx| note.open_table_query(window, cx))
                                 });
                             }
                         }
@@ -1476,5 +1481,34 @@ impl NoteLibrary {
                 );
         }
         body.into_any_element()
+    }
+}
+
+fn table_alias(name: &str) -> String {
+    let alias = name
+        .split('_')
+        .filter_map(|part| part.chars().next())
+        .filter(char::is_ascii_alphabetic)
+        .map(|c| c.to_ascii_lowercase())
+        .collect::<String>();
+    if alias.is_empty() {
+        "t".into()
+    } else if [
+        "as", "on", "in", "or", "by", "if", "is", "to", "do", "of", "at",
+    ]
+    .contains(&alias.as_str())
+    {
+        format!("t{alias}")
+    } else {
+        alias
+    }
+}
+#[cfg(test)]
+mod table_alias_tests {
+    #[test]
+    fn aliases_follow_table_segments() {
+        assert_eq!(super::table_alias("cq_itemtype"), "ci");
+        assert_eq!(super::table_alias("client_update_log"), "cul");
+        assert_eq!(super::table_alias("表"), "t");
     }
 }

@@ -8,6 +8,8 @@ mod mongo_ui;
 mod note_results;
 #[path = "redis_editor.rs"]
 mod redis_editor;
+#[path = "table_cards.rs"]
+mod table_cards;
 #[path = "grid_value.rs"]
 mod value_ui;
 #[path = "grid_width.rs"]
@@ -33,6 +35,7 @@ use turbodbn_services::database::workbench::{self, Action, Reply, Request, Rows,
 use workbench::{Change, Filter, FilterJoin, FilterSet, PageOptions};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Mode {
+    Cards,
     Grid,
     Design,
     Indexes,
@@ -51,6 +54,19 @@ pub struct FilterSqlReady(pub String);
 impl EventEmitter<FilterSqlReady> for TableView {}
 pub struct TableView {
     _lifetime: crate::lifecycle::Guard,
+    cards: Vec<workbench::Object>,
+    cards_more: bool,
+    cards_offset: usize,
+    cards_search: Entity<InputState>,
+    cards_scroll: UniformListScrollHandle,
+    _cards_subscription: Subscription,
+    cards_query: String,
+    cards_columns: usize,
+    cards_visible: std::ops::Range<usize>,
+    cards_details: BTreeMap<String, workbench::TableCardDetails>,
+    cards_details_failed: std::collections::BTreeSet<String>,
+    cards_detail_task: Option<Task<()>>,
+    cards_detail_epoch: u64,
     _pane_focus: Subscription,
     compare_subscription: Option<Subscription>,
     restored: bool,
@@ -175,6 +191,7 @@ impl TableView {
         let label = t(
             cx,
             match self.target.mode {
+                Mode::Cards => "database.cards.title",
                 Mode::Grid => "dbwork.data",
                 Mode::Design => "designer.title",
                 Mode::Indexes => "indexes.title",
@@ -256,7 +273,7 @@ impl TableView {
             return;
         }
         self.target.generation = database.note_generation(profile.id);
-        self.target.writable = profile.supports_mutation();
+        self.target.writable = profile.supports_grid_mutation();
         self.target.mysql_raw_gbk = profile.mysql_raw_gbk;
         self.restored = false;
         if matches!(self.target.mode, Mode::Compare | Mode::StructureCompare) {
@@ -402,7 +419,31 @@ impl TableView {
         let pane_focus = cx.on_focus_in(&focus, window, |this, _, cx| {
             crate::tabs::layout(crate::tabs::LayoutAction::Activate(this.key.clone()), cx)
         });
+        let cards_search =
+            cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "database.cards.search")));
+        let cards_subscription = cx.subscribe(&cards_search, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) && this.target.mode == Mode::Cards {
+                this.reset_card_details();
+                this.cards.clear();
+                this.cards_offset = 0;
+                this.cards_more = false;
+                this.load(cx);
+            }
+        });
         Self {
+            cards: vec![],
+            cards_more: false,
+            cards_offset: 0,
+            cards_search,
+            cards_scroll: UniformListScrollHandle::new(),
+            _cards_subscription: cards_subscription,
+            cards_query: String::new(),
+            cards_columns: 2,
+            cards_visible: 0..0,
+            cards_details: BTreeMap::new(),
+            cards_details_failed: Default::default(),
+            cards_detail_task: None,
+            cards_detail_epoch: 0,
             _lifetime: crate::lifecycle::Guard::new(crate::lifecycle::Kind::TableView),
             compare_subscription: None,
             restored: false,
@@ -519,6 +560,24 @@ impl TableView {
         cx.notify();
     }
     fn load(&mut self, cx: &mut Context<Self>) {
+        if self.target.mode == Mode::Cards {
+            if self.busy {
+                return;
+            }
+            self.cards_query = self.cards_search.read(cx).value().to_string();
+            self.request(
+                Action::BrowseCatalog {
+                    category: "relations".into(),
+                    search: self.cards_search.read(cx).value().to_string(),
+                    offset: self.cards_offset,
+                    limit: 200,
+                    include_comments: false,
+                },
+                cx,
+            );
+            return;
+        }
+
         if self.mongo_pending() {
             crate::feedback::error(t(cx, "mongo.document.pending"), cx);
             return;
@@ -568,6 +627,25 @@ impl TableView {
         self.busy = false;
         self.counting = false;
         match result {
+            Ok(Reply::CatalogPage { objects, more }) if self.target.mode == Mode::Cards => {
+                if self.cards_query != self.cards_search.read(cx).value().as_ref() {
+                    self.cards.clear();
+                    self.cards_offset = 0;
+                    self.load(cx);
+                    return;
+                }
+                self.notice.clear();
+                self.cards_offset += objects.len();
+                self.cards
+                    .extend(objects.into_iter().filter(|object| object.kind == "table"));
+                self.cards.truncate(20_000);
+                if self.cards.len() >= 20_000 && more {
+                    self.notice = t(cx, "database.cards.limit").to_string();
+                }
+                self.cards_more = more && self.cards.len() < 20_000;
+                cx.notify();
+                return;
+            }
             Ok(Reply::MongoPage(page)) => {
                 self.receive_mongo(page, cx);
                 return;
@@ -1019,7 +1097,13 @@ impl TableView {
             let rows = self.display_rows();
             document.update(cx, |document, cx| document.set_rows(rows, cx));
         }
-        let data = grid_ui::GridDelegate::snapshot(self, cx.entity().downgrade());
+        let data = grid_ui::GridDelegate::snapshot(
+            self,
+            cx.entity().downgrade(),
+            cx.global::<crate::preferences::Preferences>()
+                .general
+                .font_size,
+        );
         self.grid_state.update(cx, |table, cx| {
             let columns_changed = table.delegate().column_layout() != data.column_layout();
             table.clear_selection(cx);
@@ -1055,6 +1139,11 @@ impl TableView {
     }
     fn can_insert(&self) -> bool {
         self.target.mode == Mode::Grid
+            && (!self.target.mysql_raw_gbk
+                || self
+                    .schema
+                    .as_ref()
+                    .is_some_and(|s| s.columns.iter().any(|c| c.primary)))
             && !self.notebook.as_ref().is_some_and(|n| n.stale)
             && self.target.writable
             && self.target.object.kind == "table"
@@ -1066,11 +1155,18 @@ impl TableView {
             )
             && self.schema.as_ref().is_some_and(|s| {
                 self.target.kind != turbodbn_services::DatabaseKind::MySql
-                    || s.ddl.to_lowercase().contains("engine=innodb")
+                    || turbodbn_services::mysql::transactional_table_ddl(&s.ddl)
             })
     }
     fn can_edit(&self) -> bool {
-        self.can_insert()
+        (self.can_insert()
+            || (self.target.writable
+                && self.target.mode == Mode::Grid
+                && !self.notebook.as_ref().is_some_and(|n| n.stale)
+                && self
+                    .schema
+                    .as_ref()
+                    .is_some_and(|s| turbodbn_services::mysql::myisam_table_ddl(&s.ddl))))
             && self.schema.as_ref().is_some_and(|s| {
                 s.columns.iter().any(|c| c.primary)
                     && s.columns.iter().filter(|c| c.primary).all(|c| {
@@ -1085,6 +1181,20 @@ impl TableView {
             self.can_insert()
         } else {
             self.can_edit()
+                && self.schema.as_ref().is_some_and(|schema| {
+                    schema
+                        .columns
+                        .iter()
+                        .filter(|column| column.primary)
+                        .all(|column| {
+                            self.rows
+                                .columns
+                                .iter()
+                                .position(|name| name == &column.name)
+                                .and_then(|index| self.rows.values[row].get(index))
+                                .is_some_and(Option::is_some)
+                        })
+                })
         }
     }
     fn add_row(&mut self, duplicate: bool, cx: &mut Context<Self>) {
@@ -1136,7 +1246,24 @@ impl TableView {
             return;
         }
         if self.busy || !self.can_edit_row(row) {
-            crate::feedback::error(t(cx, "grid.readonly"), cx);
+            let reason = if self.busy {
+                "grid.edit.loading"
+            } else if self.notebook.as_ref().is_some_and(|note| {
+                note.access_mode == turbodbn_services::access_mode::AccessMode::ReadOnly
+            }) {
+                "grid.edit.note_readonly"
+            } else if self.target.writable
+                && self.target.kind == turbodbn_services::DatabaseKind::MySql
+                && self.target.object.kind == "table"
+                && self.schema.as_ref().is_some_and(|schema| {
+                    !turbodbn_services::mysql::transactional_table_ddl(&schema.ddl)
+                })
+            {
+                "grid.edit.innodb"
+            } else {
+                "grid.readonly"
+            };
+            crate::feedback::error(t(cx, reason), cx);
             return;
         }
         let Some(name) = self.rows.columns.get(col).cloned() else {
@@ -1363,7 +1490,11 @@ impl TableView {
         });
     }
     fn can_delete_row(&self, row: usize) -> bool {
-        self.can_edit_row(row)
+        !self
+            .schema
+            .as_ref()
+            .is_some_and(|s| turbodbn_services::mysql::myisam_table_ddl(&s.ddl))
+            && self.can_edit_row(row)
             && (row >= self.rows.values.len()
                 || self
                     .notebook
@@ -2002,6 +2133,18 @@ impl TableView {
         if !self.focus.is_focused(window) {
             return;
         }
+        if self.notebook.is_none()
+            && self.target.mode == Mode::Grid
+            && event.keystroke.key.eq_ignore_ascii_case("f5")
+        {
+            cx.stop_propagation();
+            if !self.changes.is_empty() || self.mongo_pending() {
+                crate::feedback::error(t(cx, "grid.pending"), cx);
+            } else if !self.busy {
+                self.load(cx);
+            }
+            return;
+        }
         let Some((row, col)) = self.selected else {
             return;
         };
@@ -2219,6 +2362,10 @@ impl TableView {
 
 impl Render for TableView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.target.mode == Mode::Cards && !self.restored {
+            return self.render_cards(cx);
+        }
+
         let body = self.render_body(window, cx);
         div()
             .id(SharedString::from(format!("workbench-pane-{}", self.key)))
@@ -2233,6 +2380,7 @@ impl Render for TableView {
                 }),
             )
             .child(body)
+            .into_any_element()
     }
 }
 
@@ -2390,21 +2538,6 @@ impl TableView {
                             this.focus.focus(window);
                         })),
                 )
-                .child(
-                    Button::new("grid-edit")
-                        .ghost()
-                        .small()
-                        .icon(IconName::Settings2)
-                        .tooltip(t(cx, "grid.edit"))
-                        .disabled(
-                            self.busy || self.selected.is_none_or(|(r, _)| !self.can_edit_row(r)),
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some((r, c)) = this.selected {
-                                this.edit_cell(r, c, window, cx);
-                            }
-                        })),
-                )
             })
             .when(editable, |bar| {
                 bar.child(
@@ -2413,6 +2546,7 @@ impl TableView {
                         .small()
                         .icon(IconName::Check)
                         .tooltip(t(cx, "grid.submit"))
+                        .selected(!self.changes.is_empty())
                         .disabled(self.busy || self.changes.is_empty())
                         .on_click(cx.listener(|this, _, window, cx| this.submit(window, cx))),
                 )
@@ -2422,6 +2556,7 @@ impl TableView {
                         .small()
                         .icon(IconName::Undo2)
                         .tooltip(t(cx, "grid.rollback"))
+                        .selected(!self.changes.is_empty())
                         .disabled(self.busy || self.changes.is_empty())
                         .on_click(cx.listener(|this, _, window, cx| this.rollback(window, cx))),
                 )

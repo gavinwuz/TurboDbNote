@@ -54,7 +54,11 @@ impl QueryGrid {
             .skip(usize::from(self.row_numbers))
             .zip(widths)
         {
-            column.width = px(*width);
+            column.width = px(if column.fixed.is_some() {
+                *width
+            } else {
+                width.max(crate::grid_metrics::minimum_width(14.))
+            });
         }
         self
     }

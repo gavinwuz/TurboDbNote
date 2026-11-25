@@ -1,7 +1,7 @@
 //! Deferred resizing: only the drag guide moves; data/layout changes once on drop.
 use super::*;
 use serde::{Deserialize, Serialize};
-const MIN: f32 = 64.;
+const MIN: f32 = 140.;
 const MAX: f32 = 1200.;
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub(super) struct Layout {
@@ -13,7 +13,7 @@ impl Layout {
             && self
                 .widths
                 .iter()
-                .all(|(k, v)| k.len() <= 4096 && v.is_finite() && (MIN..=MAX).contains(v))
+                .all(|(k, v)| k.len() <= 4096 && v.is_finite() && (64.0..=MAX).contains(v))
     }
 }
 #[derive(Clone)]
@@ -159,6 +159,12 @@ impl TableView {
         if !width.is_finite() {
             return;
         }
+        let minimum = crate::grid_metrics::minimum_width(
+            cx.global::<crate::preferences::Preferences>()
+                .general
+                .font_size,
+        );
+        let width = width.max(minimum);
         if !self.widths.widths.contains_key(field) && self.widths.widths.len() >= 512 {
             return;
         }
