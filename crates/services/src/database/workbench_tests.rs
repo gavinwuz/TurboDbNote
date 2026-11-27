@@ -912,3 +912,47 @@ async fn account_directories_are_read_only_paged_and_driver_scoped() {
         .is_err()
     );
 }
+
+#[tokio::test]
+async fn database_er_details_preserve_all_fields_and_foreign_keys() {
+    let mut connection = sqlx::SqliteConnection::connect(":memory:").await.unwrap();
+    let fields = (0..16)
+        .map(|i| format!("field_{i} TEXT"))
+        .collect::<Vec<_>>()
+        .join(",");
+    sqlx::raw_sql(&format!("CREATE TABLE parent(id INTEGER PRIMARY KEY); CREATE TABLE child(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES parent(id),{fields});")).execute(&mut connection).await.unwrap();
+    let object = Object {
+        schema: String::new(),
+        name: "child".into(),
+        kind: "table".into(),
+        comment: "Child table".into(),
+        parent: String::new(),
+    };
+    let request = Request {
+        database: "fixture".into(),
+        action: Action::ErCardDetails(vec![object.clone()]),
+    };
+    let Reply::TableCardDetails(details) = run(&mut connection, DatabaseKind::Sqlite, "", &request)
+        .await
+        .unwrap()
+    else {
+        panic!("Expected ER metadata");
+    };
+    assert_eq!(details[0].columns.len(), 18);
+    assert!(details[0].columns[0].primary);
+    assert!(details[0].has_foreign_keys);
+    assert_eq!(details[0].comment, "Child table");
+    assert!(
+        run(
+            &mut connection,
+            DatabaseKind::Sqlite,
+            "",
+            &Request {
+                database: "fixture".into(),
+                action: Action::ErCardDetails(vec![object; 5])
+            }
+        )
+        .await
+        .is_err()
+    );
+}

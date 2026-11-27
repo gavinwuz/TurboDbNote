@@ -57,9 +57,24 @@ pub fn statements(sql: &str) -> Result<Vec<String>, String> {
             i += 1;
             continue;
         }
-        if (i == 0 || b[i - 1] == b'\n') && b[i..].starts_with(b"DELIMITER ") {
+        let line_start = i == 0 || b[i - 1] == b'\n';
+        let directive_start = if line_start {
+            i + b[i..]
+                .iter()
+                .take_while(|c| **c == b' ' || **c == b'\t')
+                .count()
+        } else {
+            i
+        };
+        if line_start
+            && b.get(directive_start..directive_start + 9)
+                .is_some_and(|s| s.eq_ignore_ascii_case(b"DELIMITER"))
+            && b.get(directive_start + 9)
+                .is_some_and(u8::is_ascii_whitespace)
+        {
+            let directive = directive_start;
             let end = sql[i..].find('\n').map_or(b.len(), |n| i + n);
-            let d = sql[i + 10..end].trim();
+            let d = sql[directive + 10..end].trim();
             if d.is_empty()
                 || d.len() > 16
                 || d.bytes()
@@ -589,5 +604,16 @@ mod tests {
         assert!(adapt("USE a; USE b;", &options()).is_err());
         assert!(adapt("USE a; DROP DATABASE a;", &options()).is_err());
         assert!(adapt("USE a; SOURCE local.sql;", &options()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod delimiter_compatibility_tests {
+    #[test]
+    fn indented_case_insensitive_directive_keeps_body_whole() {
+        let statements = super::statements("  delimiter $$\nCREATE PROCEDURE p() BEGIN SELECT ';'; SELECT 2; END$$\n\tdelimiter ;\nCALL p();").unwrap();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("SELECT 2; END"));
+        assert!(!statements[0].to_ascii_lowercase().contains("delimiter"));
     }
 }

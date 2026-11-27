@@ -1807,7 +1807,7 @@ impl DatabaseView {
             .unwrap_or_else(|| Self::empty_profile(self.editing.kind));
         self.fill(profile, window, cx);
     }
-    fn connect_saved(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn connect_saved(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving
             || self.sessions.contains_key(&id)
             || self.states.get(&id).is_some_and(|s| s.ends_with("中…"))

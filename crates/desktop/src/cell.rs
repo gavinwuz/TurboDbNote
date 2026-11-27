@@ -837,6 +837,7 @@ impl CellView {
                                     for (key, action) in [
                                         ("notes.file.replace", 0),
                                         ("script.reload", 6),
+                                        ("script.native_import", 7),
                                         ("restore.open", 5),
                                         ("clickhouse.sql.reanalyze", 4),
                                         ("script.copy_path", 1),
@@ -867,6 +868,21 @@ impl CellView {
                                                                                 script.copy_path(cx)
                                                                             },
                                                                         );
+                                                                    }
+                                                                }
+                                                                7=>{
+                                                                    match this.binding(cx) {
+                                                                        Ok((saved,database)) => {
+                                                                            if let Some(script)=&this.script {
+                                                                                let script=script.read(cx);
+                                                                                if let Some(parent)=script.path.parent() {
+                                                                                    let file=parent.join(".turbodbnote-scripts").join(format!("{}.sql",script.script.source_hash));
+                                                                                    let connections=this.connections.clone(); let id=saved.profile.id;
+                                                                                    cx.defer_in(window,move|_,window,cx|connections.update(cx,|db,cx|db.transfer_file_dialog(crate::transfer::Mode::ImportFile,id,database,Some(file),window,cx)));
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                        Err(error)=>feedback::error(error,cx),
                                                                     }
                                                                 }
                                                                 5=>{
@@ -1552,7 +1568,15 @@ impl CellView {
                 | DatabaseKind::Sqlite
                 | DatabaseKind::ClickHouse
         ) {
-            return Err(t(cx, "notes.sql_driver").to_string());
+            return Err(crate::locale::tr(
+                cx,
+                "notes.sql_driver_target",
+                &[
+                    ("connection", &saved.profile.name),
+                    ("kind", saved.profile.kind.label()),
+                ],
+            )
+            .to_string());
         }
         let db = self.database.read(cx).value().trim().to_string();
         let db = if saved.profile.kind == DatabaseKind::Sqlite {

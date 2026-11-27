@@ -1,4 +1,5 @@
 param(
+    [switch]$LowMemory,
     [string]$OutputDirectory = 'dist',
     [string]$FxcPath,
     [string]$LegacyDriverArchive,
@@ -71,7 +72,12 @@ try {
     $buildTarget = Join-Path $root 'target'
     Push-Location $buildWorkspace
     try {
-        Invoke-Checked cargo @('build', '--locked', '-j', '1', '--release', '--target', 'x86_64-pc-windows-msvc', '--target-dir', $buildTarget, '-p', 'turbodbnote', '-p', 'turbodbnote-driver-host')
+        $releaseArgs = @('build', '--locked', '-j', '1', '--release', '--target', 'x86_64-pc-windows-msvc', '--target-dir', $buildTarget, '-p', 'turbodbnote', '-p', 'turbodbnote-driver-host')
+        if ($LowMemory) {
+            $releaseArgs += @('--config', 'profile.release.package.turbodbnote.opt-level=1', '--config', 'profile.release.package.turbodbnote.codegen-units=16')
+            Write-Output 'Local low-memory build: desktop opt-level=1, codegen-units=16'
+        }
+        Invoke-Checked cargo $releaseArgs
     } finally { Pop-Location }
     $exe = Join-Path $buildTarget 'x86_64-pc-windows-msvc/release/turbodbnote.exe'
     Invoke-Checked python @('scripts/verify-windows-icon.py', $exe)

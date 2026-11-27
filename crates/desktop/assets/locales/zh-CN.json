@@ -1595,7 +1595,7 @@
     "designer.comment_escape": "新注释包含反斜杠，请通过 SQL 单元按服务器转义模式填写。",
     "dbwork.queue.full": "待处理请求较多，请等待当前操作完成后重试。",
     "dbwork.session.closed": "连接已断开。写入可能已生效，请重新连接并核对结果后再操作。",
-    "tabs.restore_hint": "页签已恢复。请先连接数据源，再点击加载；不会恢复结果或自动执行 SQL。",
+    "tabs.restore_hint": "页签已恢复。点击“加载页签”可连接数据源并加载；不会自动执行 Note SQL。",
     "tabs.restore_load": "加载页签",
     "tabs.restore_missing": "原连接已不存在，请从已保存的连接重新打开表。",
     "tabs.restore_changed": "连接类型或数据库已变化，请从库对象重新打开此表。",
@@ -2221,7 +2221,7 @@
     "script.reload.choose": "尚未关联源文件，请先通过“更换文件”选择 SQL 源文件。",
     "script.reload.done": "SQL 脚本已重新加载；内容变化时已重置跳过标记。",
     "script.view_full": "查看完整 SQL",
-    "script.selection.unsupported_hint": "请跳过不支持的语句；执行前仍会校验所有选中语句。",
+    "script.selection.unsupported_hint": "部分语句需要原生整文件导入，请勿跳过有依赖的语句。请使用“更多 → 原生导入整份 SQL 文件”，核对连接和目标数据库后确认。",
     "script.selection.dependencies": "跳过 USE、SET 或事务控制可能影响后续语句；应用不会自动补执行已跳过的语句。",
     "script.full.search": "搜索 SQL 行",
     "script.full.wrap": "自动换行",
@@ -2248,10 +2248,18 @@
     "mysql.gbk.encode": "查询包含 GBK 无法表示的字符，请更换兼容的关键词，本次未执行查询。",
     "mysql.gbk.query_invalid": "该查询无法在原始 GBK 模式下安全处理，请使用单条 SELECT 并检查语法。",
     "database.cards.primary": "主键：",
-    "grid.edit.note_readonly": "当前 Note 为只读模式，请先切换为“读写”再暂存表格修改；切换模式不会执行 SQL。"
-  },
-  "mysql.myisam.single_update": "MyISAM 每次仅支持一行更新，不支持新增或删除；请保留其它草稿",
-  "mysql.myisam.unsupported": "MyISAM 结果含无法精确校验的列，请查询主键及可编辑列",
-  "mysql.myisam.unknown": "MyISAM 提交结果未知，请刷新核对，勿直接重试；已写入内容不能回滚",
-  "mysql.myisam.conflict": "原始数据已变化或修改未生效，请刷新核对；草稿已保留"
+    "grid.edit.note_readonly": "当前 Note 为只读模式，请先切换为“读写”再暂存表格修改；切换模式不会执行 SQL。",
+    "mysql.myisam.single_update": "MyISAM 每次仅支持一行更新，不支持新增或删除；请保留其它草稿",
+    "mysql.myisam.unsupported": "MyISAM 结果含无法精确校验的列，请查询主键及可编辑列",
+    "mysql.myisam.unknown": "MyISAM 提交结果未知，请刷新核对，勿直接重试；已写入内容不能回滚",
+    "mysql.myisam.conflict": "原始数据已变化或修改未生效，请刷新核对；草稿已保留",
+    "notes.sql_driver_target": "当前 SQL 单元绑定连接“{connection}”（{kind}），此类型不支持 Note SQL。请在单元或 Note 顶部选择 MySQL、PostgreSQL、SQLite 或 ClickHouse 连接，并核对目标数据库；切换不会执行 SQL。",
+    "mysql.script.downgrade": "导出来源版本高于目标 MySQL，已在写入前停止导入。",
+    "mysql.script.version_unknown": "无法核实 MySQL 服务器版本，已停止导入。",
+    "mysql.script.version_family": "MySQL/MariaDB 跨系列导入需要单独核对兼容性。",
+    "transfer.drop.single_sql": "请拖入一个 SQL 文件。拖放仅选择文件，不会执行导入。",
+    "script.native_import": "原生导入整份 SQL 文件…",
+    "database.er.all": "查看全部表 ER 图",
+    "er.width.auto": "自动宽度"
+  }
 }

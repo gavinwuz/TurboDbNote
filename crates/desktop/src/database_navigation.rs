@@ -1239,38 +1239,6 @@ impl DatabaseView {
                         )
                     },
                 )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "refresh-database-directory-{id}"
-                    )))
-                    .ghost()
-                    .icon(crate::assets::refresh_icon())
-                    .opacity(0.)
-                    .group_hover("database-connection-row", |style| style.opacity(1.))
-                    .focus(|style| style.opacity(1.))
-                    .tooltip(crate::locale::t(cx, "database.cache.refresh_databases"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.request_operation(id, OperationKind::Databases, cx);
-                    })),
-                )
-                .child(
-                    Button::new(SharedString::from(format!(
-                        "filter-connection-databases-{id}"
-                    )))
-                    .ghost()
-                    .icon(IconName::Search)
-                    .when(!self.database_filter_active(id, cx), |button| {
-                        button
-                            .opacity(0.)
-                            .group_hover("database-connection-row", |style| style.opacity(1.))
-                            .focus(|style| style.opacity(1.))
-                    })
-                    .selected(self.database_filter_active(id, cx))
-                    .tooltip(crate::locale::t(cx, "database.tree.database_filter"))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.toggle_database_filter(id, window, cx)
-                    })),
-                )
             })
             .child(
                 div()

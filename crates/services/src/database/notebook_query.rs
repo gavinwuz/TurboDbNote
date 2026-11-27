@@ -843,14 +843,7 @@ pub fn extension_required(kind: DatabaseKind, sql: &str) -> Option<&'static str>
             return None;
         }
 
-        let predicate = suffix[1..]
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(" ");
-        let query = format!("SELECT 1 WHERE {predicate}");
-        let safe = matches!(parse(kind,&query).and_then(|stmt|inspect(&stmt,kind)),Ok(info) if !info.writes && !info.functions && info.tables.is_empty());
-        return safe.then_some(category);
+        return safe_metadata_predicate(&suffix[1..]).then_some(category);
     }
     if suffix.is_empty()
         || matches!(suffix, [like, Token::SingleQuotedString(_)] if word(like).as_deref() == Some("LIKE") && !sql.contains('\\'))
@@ -860,6 +853,16 @@ pub fn extension_required(kind: DatabaseKind, sql: &str) -> Option<&'static str>
         None
     }
 }
+fn safe_metadata_predicate(tokens: &[sqlparser::tokenizer::Token]) -> bool {
+    let predicate = tokens
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let query = format!("SELECT 1 WHERE {predicate}");
+    matches!(parse(DatabaseKind::MySql, &query).and_then(|stmt| inspect(&stmt, DatabaseKind::MySql)), Ok(info) if !info.writes && !info.functions && info.tables.is_empty())
+}
+
 // MySQL metadata reads have their own bounded result path, never SELECT pagination.
 fn mysql_metadata(kind: DatabaseKind, sql: &str) -> bool {
     use sqlparser::tokenizer::{Token, Tokenizer};
@@ -934,6 +937,9 @@ fn mysql_metadata(kind: DatabaseKind, sql: &str) -> bool {
             return false;
         }
         i += 1;
+    }
+    if !create && keyword(tokens.get(i), "WHERE") && !sql.contains('\\') {
+        return safe_metadata_predicate(&tokens[i + 1..]);
     }
     i == tokens.len()
 }
@@ -3207,5 +3213,28 @@ mod execution_error_tests {
             execution_error(DatabaseKind::MySql, true, "mysql.error.result_decode"),
             "mysql.error.result_decode"
         );
+    }
+}
+
+#[cfg(test)]
+mod index_where_tests {
+    use super::*;
+    #[test]
+    fn show_index_where_is_a_bounded_read_not_select_pagination() {
+        let sql = "SHOW INDEX FROM recruit_posts WHERE Key_name IN ('idx_rp_type_fire_id','idx_rp_prof_online_fire_id','idx_rp_prof_fire_id');";
+        assert!(mysql_metadata(DatabaseKind::MySql, sql));
+        assert_eq!(
+            command_required(DatabaseKind::MySql, sql),
+            Some("show_columns")
+        );
+        assert!(validate_script_statement(DatabaseKind::MySql, sql).unwrap());
+        for unsafe_sql in [
+            "SHOW INDEX FROM t WHERE SLEEP(1)=0",
+            "SHOW INDEX FROM t WHERE 1 IN (SELECT id FROM secret)",
+            "SHOW INDEX FROM t WHERE 1=1; DELETE FROM t",
+            "SHOW CREATE TABLE t WHERE 1=1",
+        ] {
+            assert!(!mysql_metadata(DatabaseKind::MySql, unsafe_sql));
+        }
     }
 }

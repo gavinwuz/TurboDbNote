@@ -1279,15 +1279,30 @@ fn mysql_import(
     c: &Control,
     tx: &async_channel::Sender<Event>,
 ) -> Result<(), String> {
+    c.check()?;
+    let snapshot = freeze_file(path, c)?;
+    let mut header = vec![];
+    File::open(snapshot.path())
+        .map_err(io_error)?
+        .take(64 * 1024)
+        .read_to_end(&mut header)
+        .map_err(io_error)?;
+    let version = query(target, "SELECT VERSION();")?;
+    super::mysql_script_version::check(&String::from_utf8_lossy(&header), version.trim())?;
     let mut cmd = mysql_command(target, "mysql")?;
-    cmd.args(["--binary-mode", "--local-infile=0", "--skip-reconnect"]);
+    cmd.args(["--local-infile=0", "--skip-reconnect"]);
+    // The bundled 5.1 client predates binary-mode. Its batch parser is
+    // required for DELIMITER and stored routines in legacy SQL files.
+    if !crate::mysql::uses_legacy(&target.profile) {
+        cmd.arg("--binary-mode");
+    }
     if !target.profile.database.is_empty() {
         cmd.arg(format!("--database={}", target.profile.database));
     }
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    feed_command(cmd, path, c, tx)
+    feed_command(cmd, snapshot.path(), c, tx)
 }
 fn feed_command(
     mut cmd: NativeCommand,

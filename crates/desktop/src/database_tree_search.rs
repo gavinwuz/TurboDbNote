@@ -670,6 +670,9 @@ impl DatabaseView {
             .into_any_element()
     }
     pub(super) fn tree_connection_open(&self, id: Uuid, cx: &App) -> bool {
+        if self.note_connection_state(id) != Some(true) {
+            return false;
+        }
         if !self.tree_object_query(cx).is_empty() && self.tree.filter.results.is_some() {
             !self
                 .tree
@@ -686,6 +689,15 @@ impl DatabaseView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.note_connection_state(id) != Some(true) {
+            if self.note_connection_state(id) == Some(false) {
+                self.navigation.tree_connections.insert(id);
+                self.persist_navigation();
+                self.connect_saved(id, window, cx);
+            }
+            cx.notify();
+            return;
+        }
         if !self.tree_object_query(cx).is_empty() {
             let key = format!("connection:{id}");
             if !self.tree.filter.collapsed.remove(&key) {

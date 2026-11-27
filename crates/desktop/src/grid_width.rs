@@ -1,15 +1,20 @@
 //! Deferred resizing: only the drag guide moves; data/layout changes once on drop.
 use super::*;
 use serde::{Deserialize, Serialize};
+pub(super) const ER_WIDTH_KEY: &str = "\0er-card-width";
 const MIN: f32 = 140.;
 const MAX: f32 = 1200.;
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub(super) struct Layout {
+    #[serde(default)]
+    pub er_width: Option<f32>,
     pub widths: BTreeMap<String, f32>,
 }
 impl Layout {
     fn valid(&self) -> bool {
-        self.widths.len() <= 512
+        self.er_width
+            .is_none_or(|v| v.is_finite() && (200.0..=600.0).contains(&v))
+            && self.widths.len() <= 512
             && self
                 .widths
                 .iter()
@@ -53,6 +58,10 @@ pub(super) fn handle(
             let field = fit_field.clone();
             window.defer(cx, move |window, cx| {
                 let _ = owner.update(cx, |this, cx| {
+                    if field == ER_WIDTH_KEY {
+                        this.reset_er_width(cx);
+                        return;
+                    }
                     if let Some(col) = this.rows.columns.iter().position(|name| name == &field) {
                         this.width_action(col, "fit", window, cx);
                     }
@@ -155,8 +164,29 @@ impl TableView {
         })
         .detach();
     }
+    pub(super) fn reset_er_width(&mut self, cx: &mut Context<Self>) {
+        self.widths.er_width = None;
+        self.width_revision += 1;
+        if self.widths_writable
+            && let Some(sender) = &self.width_sender
+        {
+            let _ = sender.force_send(self.widths.clone());
+        }
+        cx.notify();
+    }
     pub(super) fn apply_width(&mut self, field: &str, width: f32, cx: &mut Context<Self>) {
         if !width.is_finite() {
+            return;
+        }
+        if field == ER_WIDTH_KEY {
+            self.widths.er_width = Some(width.clamp(200., 600.));
+            self.width_revision += 1;
+            if self.widths_writable
+                && let Some(sender) = &self.width_sender
+            {
+                let _ = sender.force_send(self.widths.clone());
+            }
+            cx.notify();
             return;
         }
         let minimum = crate::grid_metrics::minimum_width(
@@ -267,5 +297,21 @@ impl TableView {
                     ]
                 })
         });
+    }
+}
+
+#[cfg(test)]
+mod er_width_tests {
+    #[test]
+    fn legacy_width_settings_keep_auto_er_width_and_invalid_overrides_are_rejected() {
+        let layout: super::Layout = serde_json::from_str(r#"{"widths":{"id":180.0}}"#).unwrap();
+        assert!(layout.er_width.is_none());
+        assert!(layout.valid());
+        let layout: super::Layout =
+            serde_json::from_str(r#"{"widths":{},"er_width":320.0}"#).unwrap();
+        assert!(layout.valid());
+        let layout: super::Layout =
+            serde_json::from_str(r#"{"widths":{},"er_width":-1.0}"#).unwrap();
+        assert!(!layout.valid());
     }
 }

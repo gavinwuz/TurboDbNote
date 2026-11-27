@@ -159,13 +159,12 @@ impl DatabaseView {
             output.update(cx, |output, cx| output.operation(record, cx));
         }
     }
-    pub(super) fn database_filter_active(&self, id: Uuid, cx: &App) -> bool {
-        self.tree
-            .database_filters
-            .get(&id)
-            .is_some_and(|filter| filter.open || !filter.input.read(cx).value().is_empty())
-    }
-    fn ensure_database_filter(&mut self, id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn ensure_database_filter(
+        &mut self,
+        id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.tree.database_filters.entry(id).or_insert_with(|| {
             let input = cx.new(|cx| {
                 InputState::new(window, cx).placeholder(t(cx, "database.tree.database_filter"))
@@ -181,49 +180,6 @@ impl DatabaseView {
                 _subscription: subscription,
             }
         });
-    }
-    pub(super) fn toggle_database_filter(
-        &mut self,
-        id: Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.note_connection_state(id) != Some(true) {
-            return;
-        }
-        let branch = Scope {
-            id,
-            database: self
-                .note_profile(id)
-                .map(|profile| profile.database.clone())
-                .unwrap_or_default(),
-            generation: self.note_generation(id),
-        };
-        self.ensure_database_filter(id, window, cx);
-        let filter = self.tree.database_filters.get_mut(&id).unwrap();
-        filter.open = !filter.open || !self.navigation.tree_connections.contains(&id);
-        if filter.open {
-            self.navigation
-                .tree_nodes
-                .remove(&branch.key("databases-closed"));
-            self.navigation.tree_connections.insert(id);
-            filter.input.update(cx, |input, cx| input.focus(window, cx));
-            if let Some(index) = self
-                .tree
-                .rows
-                .iter()
-                .position(|row| matches!(row, Row::Databases(scope) if scope.id == id))
-            {
-                let handle = self.tree.scroll.0.borrow().base_handle.clone();
-                if px((index + 2) as f32 * 32.) + handle.offset().y > handle.bounds().size.height {
-                    self.tree
-                        .scroll
-                        .scroll_to_item(index + 1, ScrollStrategy::Bottom);
-                }
-            }
-            self.persist_navigation();
-        }
-        cx.notify();
     }
     pub(super) fn tree_sync_databases(&mut self, id: Uuid, cx: &mut Context<Self>) {
         let Some(profile) = self.note_profile(id).cloned() else {
@@ -972,6 +928,9 @@ impl DatabaseView {
                         continue;
                     }
                     if self.note_connection_state(p.id) != Some(true) {
+                        if !split {
+                            continue;
+                        }
                         rows.push(Row::Notice(if self.note_connection_state(p.id).is_none() {
                             "database.branch.connecting"
                         } else {
@@ -1007,11 +966,7 @@ impl DatabaseView {
                         let database_query = filter
                             .map(|filter| filter.input.read(cx).value().trim().to_lowercase())
                             .unwrap_or_default();
-                        if !split
-                            && filter.is_some_and(|filter| {
-                                filter.open || !filter.input.read(cx).value().is_empty()
-                            })
-                        {
+                        if filter.is_some_and(|filter| filter.open) {
                             rows.push(Row::DatabaseFilter(p.id));
                         }
                         if let Some(state) = self.tree.databases.get(&p.id).filter(|state| {
@@ -1258,17 +1213,7 @@ impl DatabaseView {
                         })),
                 )
             })
-            .child(if split {
-                selected
-                    .map(|id| self.tree_row(Row::DatabaseFilter(id), cx))
-                    .unwrap_or_else(|| {
-                        div()
-                            .child(t(cx, "notes.choose_connection"))
-                            .into_any_element()
-                    })
-            } else {
-                self.tree_search_control(cx)
-            })
+            .when(!split, |body| body.child(self.tree_search_control(cx)))
             .when(
                 filtering && self.tree.filter.phase != search::Phase::Ready,
                 |body| body.child(self.tree_filter_status(cx)),
@@ -1528,15 +1473,7 @@ impl DatabaseView {
                 };
                 let input = filter.input.clone();
                 div()
-                    .pl(px(
-                        if cx.global::<Preferences>().database.sidebar_layout
-                            == crate::preferences::SidebarLayout::Split
-                        {
-                            0.
-                        } else {
-                            36.
-                        },
-                    ))
+                    .pl(px(36.))
                     .pr_1()
                     .h_flex()
                     .gap_1()
@@ -1687,6 +1624,7 @@ impl DatabaseView {
                             ("dbwork.database.copy", "copy", copy),
                             ("dbwork.import", "import", writable),
                             ("dbwork.export", "export", true),
+                            ("compare.database_scope", "compare", true),
                             ("database.note.new", "new-note", true),
                             ("dbwork.refresh", "refresh", true),
                         ] {
@@ -1706,6 +1644,17 @@ impl DatabaseView {
                                                     Some(scope.database.clone()),
                                                     cx,
                                                 ),
+                                                "compare" => {
+                                                    if let Some(profile) = this.note_profile(scope.id) {
+                                                        cx.emit(OpenTable {
+                                                            connection: scope.id,
+                                                            database: scope.database.clone(),
+                                                            object: turbodbn_services::database::workbench::Object { schema: String::new(), name: String::new(), kind: "table".into(), comment: String::new(), parent: String::new() },
+                                                            mode: crate::table_view::Mode::StructureCompare,
+                                                            generation: this.note_generation(scope.id), kind: profile.kind, writable: false, mysql_raw_gbk: profile.mysql_raw_gbk,
+                                                        });
+                                                    }
+                                                }
                                                 "create" => this
                                                     .create_database_dialog(scope.id, window, cx),
                                                 "copy" => this.transfer_dialog(
@@ -1812,6 +1761,20 @@ impl DatabaseView {
                         }
                         let owner = owner.clone();
                         let scope = menu_scope.clone();
+                        let er_owner = owner.clone();
+                        let er_scope = scope.clone();
+                        let menu =
+                            menu.item(PopupMenuItem::new(t(cx, "database.er.all")).on_click(
+                                move |_, _, cx| {
+                                    let _ = er_owner.update(cx, |this, cx| {
+                                        this.open_database_er(
+                                            er_scope.id,
+                                            er_scope.database.clone(),
+                                            cx,
+                                        )
+                                    });
+                                },
+                            ));
                         menu.item(PopupMenuItem::new(t(cx, "database.cards.title")).on_click(
                             move |_, _, cx| {
                                 let _ = owner.update(cx, |this, cx| {

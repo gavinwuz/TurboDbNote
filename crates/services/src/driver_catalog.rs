@@ -233,7 +233,9 @@ pub(crate) fn check_operation(p: &Profile, op: &crate::database::Operation) -> R
             | OperationKind::Objects { .. }
             | OperationKind::Details { .. } => true,
             OperationKind::Workbench(r) => match &r.action {
-                Action::Commit { .. } | Action::TableCardDetails(_) => true,
+                Action::Commit { .. } | Action::TableCardDetails(_) | Action::ErCardDetails(_) => {
+                    true
+                }
                 Action::AccountGrants { .. }
                 | Action::AccountMode
                 | Action::AccountPermissions { .. }

@@ -1595,7 +1595,7 @@
     "designer.comment_escape": "For backslashes in a new comment, edit the SQL preview according to the server SQL mode.",
     "dbwork.queue.full": "Too many pending workbench requests. Wait for a current operation, then retry.",
     "dbwork.session.closed": "The connection closed. Reconnect and check the result before retrying; a write may have taken effect.",
-    "tabs.restore_hint": "Tab restored. Connect the source, then load explicitly. Saved results and SQL execution are never restored.",
+    "tabs.restore_hint": "Tab restored. Load tab connects the data source and loads the tab; it does not automatically execute Note SQL.",
     "tabs.restore_load": "Load tab",
     "tabs.restore_missing": "This connection no longer exists. Open the table from a saved connection.",
     "tabs.restore_changed": "The connection type or database changed. Reopen this table from database objects.",
@@ -2221,7 +2221,7 @@
     "script.reload.choose": "No source file is linked. Use Replace file to select the SQL source first.",
     "script.reload.done": "SQL script reloaded. If content changed, skipped selections were reset.",
     "script.view_full": "View full SQL",
-    "script.selection.unsupported_hint": "Skip unsupported statements before execution. Selected statements are still validated.",
+    "script.selection.unsupported_hint": "Some statements require native whole-file import. Do not skip dependent statements. Use More → Import entire SQL file and verify the target.",
     "script.selection.dependencies": "Skipping USE, SET or transaction controls can affect later statements. Skipped statements will not be run automatically.",
     "script.full.search": "Search SQL lines",
     "script.full.wrap": "Wrap lines",
@@ -2248,10 +2248,18 @@
     "mysql.gbk.encode": "The query contains characters that GBK cannot represent. Use a compatible keyword; the query was not executed.",
     "mysql.gbk.query_invalid": "This query cannot be safely processed in raw GBK mode. Use a single SELECT and check its syntax.",
     "database.cards.primary": "Primary key:",
-    "grid.edit.note_readonly": "This Note is in read-only mode. Switch its mode to Read/Write to stage grid edits; switching does not execute SQL."
-  },
-  "mysql.myisam.single_update": "MyISAM supports one row update per submission, without inserts or deletes. Keep other drafts.",
-  "mysql.myisam.unsupported": "This MyISAM result contains columns that cannot be compared exactly. Select the primary key and supported columns.",
-  "mysql.myisam.unknown": "MyISAM submission outcome is unknown. Refresh and verify before retrying; applied writes cannot be rolled back.",
-  "mysql.myisam.conflict": "The original data changed or the update did not apply. Refresh and verify; drafts are retained."
+    "grid.edit.note_readonly": "This Note is in read-only mode. Switch its mode to Read/Write to stage grid edits; switching does not execute SQL.",
+    "mysql.myisam.single_update": "MyISAM supports one row update per submission, without inserts or deletes. Keep other drafts.",
+    "mysql.myisam.unsupported": "This MyISAM result contains columns that cannot be compared exactly. Select the primary key and supported columns.",
+    "mysql.myisam.unknown": "MyISAM submission outcome is unknown. Refresh and verify before retrying; applied writes cannot be rolled back.",
+    "mysql.myisam.conflict": "The original data changed or the update did not apply. Refresh and verify; drafts are retained.",
+    "notes.sql_driver_target": "This SQL cell is bound to “{connection}” ({kind}), which does not support Note SQL. Choose a MySQL, PostgreSQL, SQLite or ClickHouse connection in the cell or Note toolbar and verify the target database. Switching does not execute SQL.",
+    "mysql.script.downgrade": "MySQL dump source version is newer than the target. Import stopped before writes.",
+    "mysql.script.version_unknown": "Cannot verify the MySQL server version. Import stopped.",
+    "mysql.script.version_family": "Cross-family MySQL/MariaDB import requires separate compatibility review.",
+    "transfer.drop.single_sql": "Drop one SQL file here. Dropping selects the file; it does not execute it.",
+    "script.native_import": "Import entire SQL file…",
+    "database.er.all": "View all tables ER",
+    "er.width.auto": "Auto width"
+  }
 }

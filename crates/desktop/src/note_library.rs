@@ -32,7 +32,7 @@ pub struct NoteLibrary {
     documents: HashMap<String, Entity<NoteView>>,
     subscriptions: HashMap<String, Subscription>,
     search: Entity<InputState>,
-    collapsed: HashSet<String>,
+    expanded: HashSet<String>,
     deleting: HashSet<PathBuf>,
     unavailable: HashMap<PathBuf, String>,
     loading: bool,
@@ -145,7 +145,7 @@ impl NoteLibrary {
             documents: HashMap::new(),
             subscriptions: HashMap::new(),
             search: search.clone(),
-            collapsed: HashSet::new(),
+            expanded: HashSet::new(),
             deleting: HashSet::new(),
             unavailable: HashMap::new(),
             loading: false,
@@ -860,7 +860,7 @@ impl NoteLibrary {
         self.opening = true;
         let mut note = Note::new("");
         note.project = project.clone();
-        self.collapsed.remove(&project);
+        self.expanded.insert(project.clone());
         note.cells.push(Cell::new(
             "",
             CellContent::Sql {
@@ -1133,7 +1133,7 @@ impl Render for NoteLibrary {
         }
         let mut list = div().v_flex().gap_1();
         for group in groups {
-            let folded = self.collapsed.contains(&group) && filter.is_empty();
+            let folded = !self.expanded.contains(&group) && filter.is_empty();
             let name = group.clone();
             let entries = self
                 .index
@@ -1181,8 +1181,8 @@ impl Render for NoteLibrary {
                                 group.into()
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.collapsed.remove(&name) {
-                                    this.collapsed.insert(name.clone());
+                                if !this.expanded.remove(&name) {
+                                    this.expanded.insert(name.clone());
                                 }
                                 cx.notify();
                             })),

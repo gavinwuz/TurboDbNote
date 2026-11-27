@@ -1699,6 +1699,28 @@ impl TransferView {
         div()
             .h_flex()
             .gap_2()
+            .on_drop(
+                cx.listener(move |this, paths: &gpui::ExternalPaths, window, cx| {
+                    if locked || this.mode != Mode::ImportFile {
+                        return;
+                    }
+                    let [path] = paths.paths() else {
+                        feedback::error(crate::locale::t(cx, "transfer.drop.single_sql"), cx);
+                        return;
+                    };
+                    if !path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"))
+                    {
+                        feedback::error(crate::locale::t(cx, "transfer.drop.single_sql"), cx);
+                        return;
+                    }
+                    this.file.update(cx, |input, cx| {
+                        input.set_value(path.display().to_string(), window, cx)
+                    });
+                    cx.notify();
+                }),
+            )
             .child(
                 Input::new(&self.file)
                     .cleanable(true)

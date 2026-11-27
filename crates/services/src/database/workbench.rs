@@ -108,6 +108,7 @@ pub struct Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Action {
     TableCardDetails(Vec<Object>),
+    ErCardDetails(Vec<Object>),
     AccountGrants {
         user: String,
         host: String,
@@ -217,6 +218,10 @@ pub struct TableCardDetails {
     pub comment: String,
     pub primary: Vec<String>,
     pub next_auto_increment: Option<String>,
+    #[serde(default)]
+    pub columns: Vec<Column>,
+    #[serde(default)]
+    pub has_foreign_keys: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
@@ -827,6 +832,24 @@ pub async fn run(
             ddl,
             changes,
         } => grid::commit(c, kind, &r.database, object, ddl, changes).await,
+        Action::ErCardDetails(objects) => {
+            if objects.is_empty() || objects.len() > 4 {
+                return Err("browser.response_limit".into());
+            }
+            let mut details = Vec::new();
+            for object in objects {
+                let definition = schema(c, kind, &r.database, object, true).await?;
+                details.push(TableCardDetails {
+                    schema: object.schema.clone(),
+                    name: object.name.clone(),
+                    comment: object.comment.clone(),
+                    columns: definition.columns,
+                    has_foreign_keys: !definition.foreign_keys.values.is_empty(),
+                    ..Default::default()
+                });
+            }
+            Ok(Reply::TableCardDetails(details))
+        }
         Action::TableCardDetails(objects) => {
             table_card_details(c, kind, &r.database, version, objects).await
         }

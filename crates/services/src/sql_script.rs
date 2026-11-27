@@ -15,7 +15,7 @@ pub const MAX_SQL_BYTES: usize = notebook_query::SCRIPT_MAX_BYTES;
 pub const PAGE_SIZE: u64 = 6;
 const HEADER: u64 = 80;
 const RECORD: u64 = 32;
-const MAGIC: &[u8; 8] = b"TDBSQL05";
+const MAGIC: &[u8; 8] = b"TDBSQL06";
 pub fn kind(dialect: SqlDialect) -> DatabaseKind {
     match dialect {
         SqlDialect::MySql => DatabaseKind::MySql,
@@ -527,16 +527,65 @@ pub fn prepare(
         reader.consume(3);
     }
     let mut scan = Scanner::new(dialect, if bom { 3 } else { 0 });
-    for byte in reader.bytes() {
-        check_byte(&mut scan, byte.map_err(disk)?, &mut index, cancel)?;
-        if scan.offset.is_multiple_of(65536) {
-            progress(bytes, scan.count);
+    if dialect == SqlDialect::MySql && bytes <= MAX_SQL_BYTES as u64 {
+        let mut text = String::new();
+        reader
+            .read_to_string(&mut text)
+            .map_err(|_| "script.error.encoding")?;
+        let has_delimiter = text.lines().any(|line| {
+            line.trim_start()
+                .get(..9)
+                .is_some_and(|s| s.eq_ignore_ascii_case("DELIMITER"))
+        });
+        if !has_delimiter {
+            for byte in text.bytes() {
+                check_byte(&mut scan, byte, &mut index, cancel)?;
+            }
+            if !scan.finished() {
+                return Err("script.error.unterminated".into());
+            }
+            scan.emit(&mut index)?;
+        } else {
+            let base = if bom { 3 } else { 0 };
+            let mut cursor = 0;
+            for statement in crate::database::mysql_restore::statements(&text)? {
+                check(cancel)?;
+                let start = cursor
+                    + text[cursor..]
+                        .find(&statement)
+                        .ok_or("script.error.resource")?;
+                let mut end = start + statement.len();
+                if text.as_bytes().get(end) == Some(&b';') {
+                    end += 1;
+                }
+                cursor = end;
+                if leading_code_offset(&statement, dialect) >= statement.len() {
+                    continue;
+                }
+                scan.start = (base + start) as u64;
+                scan.offset = (base + end) as u64;
+                scan.first_line = 1 + text[..start + leading_code_offset(&statement, dialect)]
+                    .bytes()
+                    .filter(|b| *b == b'\n')
+                    .count() as u64;
+                scan.body = text.as_bytes()[start..end].to_vec();
+                scan.has_code = true;
+                scan.emit(&mut index)?;
+            }
         }
+        progress(bytes, scan.count);
+    } else {
+        for byte in reader.bytes() {
+            check_byte(&mut scan, byte.map_err(disk)?, &mut index, cancel)?;
+            if scan.offset.is_multiple_of(65536) {
+                progress(bytes, scan.count);
+            }
+        }
+        if !scan.finished() {
+            return Err("script.error.unterminated".into());
+        }
+        scan.emit(&mut index)?;
     }
-    if !scan.finished() {
-        return Err("script.error.unterminated".into());
-    }
-    scan.emit(&mut index)?;
     if scan.count == 0 {
         return Err("script.error.empty".into());
     }
@@ -1152,6 +1201,7 @@ pub fn refresh(note: &Path, script: &SqlScript, cancel: &AtomicBool) -> Result<S
         && &magic != b"TDBSQL02"
         && &magic != b"TDBSQL03"
         && &magic != b"TDBSQL04"
+        && &magic != b"TDBSQL05"
     {
         return Err("script.error.resource".into());
     }
@@ -1273,6 +1323,15 @@ mod tests {
         ] {
             assert!(summary.requires_authorization());
         }
+    }
+    #[test]
+    fn mysql_compound_routine_is_one_index_record_and_source_is_unchanged() {
+        let text = "DELIMITER $$\nCREATE PROCEDURE p() BEGIN SELECT 1; SELECT 2; END$$\nDELIMITER ;\nSELECT 3;";
+        let (_dir, imported) = prepared(text, SqlDialect::MySql);
+        assert_eq!(imported.script.statements, 2);
+        let rows = imported.page().unwrap();
+        assert_eq!(rows[0].line, 2);
+        assert_eq!(imported.script.unsupported, 1);
     }
     #[test]
     fn leading_comments_do_not_hide_sql_or_change_the_frozen_source() {
@@ -1426,10 +1485,7 @@ mod tests {
         let note = dir.path().join("issues.note");
         imported.publish(&note, &AtomicBool::new(false)).unwrap();
         let issues = issue_page(&note, &imported.script, 0).unwrap();
-        assert_eq!(
-            issues.iter().map(|r| r.number).collect::<Vec<_>>(),
-            vec![1, 3]
-        );
+        assert_eq!(issues.iter().map(|r| r.number).collect::<Vec<_>>(), vec![1]);
         assert_eq!(issues[0].line, 2);
         assert!(!issues[0].reason.is_empty());
         let source = (0..27)

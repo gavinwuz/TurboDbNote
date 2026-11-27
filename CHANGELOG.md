@@ -4,6 +4,16 @@ Release notes are generated from the version sections below.
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-27
+
+- Add database-wide ER cards with visible-range metadata loading, a compact masonry layout, shared single-table styling, 15-row internal field scrolling and persisted manual widths. Preserve primary-key separators and complete hover details; relation lines and foreign-key-only filtering remain unavailable.
+
+- Default Note groups and the initial right tool panel to collapsed, align split-sidebar database filters, and display ER columns in a structured table card with right-aligned table comments.
+- Keep disconnected database nodes collapsed, place database filter/refresh actions on the database category, add database context actions, and connect explicitly when loading a restored tab.
+- Support dropping SQL files into native import and opening native whole-file import from Note attachments. Preserve one-session execution without automatic reconnect or error skipping; reject downgrade imports with known source-version headers.
+- Preserve compound MySQL routine bodies in bounded attachment indexes and support SHOW INDEX WHERE predicates. Note per-statement routine/dynamic SQL execution remains restricted; use native whole-file import.
+- Add an optional local low-memory Windows packaging mode. Real MySQL 5.7 import and the latest UI interactions remain unverified.
+
 ## [0.1.11] - 2026-11-25
 
 - Add guarded single-row MyISAM updates with original-value predicates, explicit confirmation and no rollback or automatic retry. Fix MySQL 5.7 native-client TLS parameter selection. Real MyISAM server writes remain unverified.

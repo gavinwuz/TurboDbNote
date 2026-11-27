@@ -64,12 +64,18 @@ pub struct TableView {
     cards_columns: usize,
     cards_visible: std::ops::Range<usize>,
     cards_details: BTreeMap<String, workbench::TableCardDetails>,
+    er_card_scrolls: BTreeMap<String, ScrollHandle>,
+    er_masonry_scroll: ScrollHandle,
+    er_viewport: Size<Pixels>,
+    er_positions: Vec<(f32, f32, f32)>,
+    er_field_counts: BTreeMap<String, usize>,
     cards_details_failed: std::collections::BTreeSet<String>,
     cards_detail_task: Option<Task<()>>,
     cards_detail_epoch: u64,
     _pane_focus: Subscription,
     compare_subscription: Option<Subscription>,
     restored: bool,
+    restore_connection: Option<Subscription>,
     restored_comparison: Option<[OpenTable; 2]>,
     compare_view: Option<Entity<crate::table_compare::Comparison>>,
     filter_only: bool,
@@ -262,7 +268,34 @@ impl TableView {
             return;
         };
         if database.note_connection_state(profile.id) != Some(true) {
-            crate::feedback::error(t(cx, "compare.connect_first"), cx);
+            if self.restore_connection.is_some() {
+                return;
+            }
+            let id = profile.id;
+            let mut started = database.note_connection_state(id).is_none();
+            self.restore_connection = Some(cx.observe_in(
+                &source,
+                window,
+                move |this, source, window, cx| {
+                    let state = source.read(cx).note_connection_state(id);
+                    started |= state.is_none();
+                    if state == Some(true) {
+                        this.restore_connection = None;
+                        cx.defer_in(window, |this, window, cx| this.resume_restored(window, cx));
+                    } else if state == Some(false) && started {
+                        this.restore_connection = None;
+                    }
+                    cx.notify();
+                },
+            ));
+            cx.defer_in(window, move |this, window, cx| {
+                source.update(cx, |database, cx| database.connect_saved(id, window, cx));
+                if source.read(cx).note_connection_state(id) == Some(false) {
+                    this.restore_connection = None;
+                    cx.notify();
+                }
+            });
+            cx.notify();
             return;
         }
         if profile.kind != self.target.kind
@@ -272,6 +305,7 @@ impl TableView {
             crate::feedback::error(t(cx, "tabs.restore_changed"), cx);
             return;
         }
+        self.restore_connection = None;
         self.target.generation = database.note_generation(profile.id);
         self.target.writable = profile.supports_grid_mutation();
         self.target.mysql_raw_gbk = profile.mysql_raw_gbk;
@@ -422,11 +456,13 @@ impl TableView {
         let cards_search =
             cx.new(|cx| InputState::new(window, cx).placeholder(t(cx, "database.cards.search")));
         let cards_subscription = cx.subscribe(&cards_search, |this, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) && this.target.mode == Mode::Cards {
+            if matches!(event, InputEvent::Change) && this.cards_mode() {
                 this.reset_card_details();
                 this.cards.clear();
                 this.cards_offset = 0;
                 this.cards_more = false;
+                this.er_positions.clear();
+                this.er_masonry_scroll.set_offset(point(px(0.), px(0.)));
                 this.load(cx);
             }
         });
@@ -441,12 +477,18 @@ impl TableView {
             cards_columns: 2,
             cards_visible: 0..0,
             cards_details: BTreeMap::new(),
+            er_card_scrolls: BTreeMap::new(),
+            er_masonry_scroll: ScrollHandle::new(),
+            er_viewport: size(px(900.), px(700.)),
+            er_positions: vec![],
+            er_field_counts: BTreeMap::new(),
             cards_details_failed: Default::default(),
             cards_detail_task: None,
             cards_detail_epoch: 0,
             _lifetime: crate::lifecycle::Guard::new(crate::lifecycle::Kind::TableView),
             compare_subscription: None,
             restored: false,
+            restore_connection: None,
             restored_comparison: None,
             compare_view: None,
             filter_only: false,
@@ -559,8 +601,14 @@ impl TableView {
         }
         cx.notify();
     }
+    fn database_er(&self) -> bool {
+        self.target.mode == Mode::Er && self.target.object.name.is_empty()
+    }
+    fn cards_mode(&self) -> bool {
+        self.target.mode == Mode::Cards || self.database_er()
+    }
     fn load(&mut self, cx: &mut Context<Self>) {
-        if self.target.mode == Mode::Cards {
+        if self.cards_mode() {
             if self.busy {
                 return;
             }
@@ -571,7 +619,7 @@ impl TableView {
                     search: self.cards_search.read(cx).value().to_string(),
                     offset: self.cards_offset,
                     limit: 200,
-                    include_comments: false,
+                    include_comments: self.database_er(),
                 },
                 cx,
             );
@@ -627,7 +675,7 @@ impl TableView {
         self.busy = false;
         self.counting = false;
         match result {
-            Ok(Reply::CatalogPage { objects, more }) if self.target.mode == Mode::Cards => {
+            Ok(Reply::CatalogPage { objects, more }) if self.cards_mode() => {
                 if self.cards_query != self.cards_search.read(cx).value().as_ref() {
                     self.cards.clear();
                     self.cards_offset = 0;
@@ -1836,109 +1884,79 @@ impl TableView {
             );
         }
     }
-    fn er(&self, cx: &Context<Self>) -> AnyElement {
+    fn er(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(schema) = &self.schema else {
             return div().child(self.notice.clone()).into_any_element();
         };
+        let font = cx
+            .global::<crate::preferences::Preferences>()
+            .general
+            .font_size;
+        let longest = schema
+            .columns
+            .iter()
+            .map(|c| unicode_width::UnicodeWidthStr::width(c.name.as_str()))
+            .chain(std::iter::once(unicode_width::UnicodeWidthStr::width(
+                self.target.object.name.as_str(),
+            )))
+            .max()
+            .unwrap_or(8);
+        let width = self
+            .widths
+            .er_width
+            .unwrap_or((longest as f32 * font * 0.65 + 66.).clamp(200., 600.));
+        let relations = schema.foreign_keys.values.clone();
+        let card = self.render_er_table_card(
+            table_cards::ErCard {
+                object: self.target.object.clone(),
+                columns: schema.columns.clone(),
+                scroll: self.er_scroll.clone(),
+                width,
+                pending: None,
+                id: usize::MAX,
+            },
+            cx,
+        );
         div()
             .id("er-diagram")
             .flex_1()
             .min_h_0()
             .min_w_0()
-            .overflow_hidden()
+            .overflow_x_scroll()
             .v_flex()
-            .gap_4()
-            .p_4()
+            .gap_2()
+            .p_3()
+            .on_drop(width_ui::drop_width)
             .child(
-                div()
-                    .w_full()
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(cx.theme().border)
-                    .rounded_lg()
-                    .p_3()
-                    .v_flex()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .text_lg()
-                            .child(self.target.object.name.clone()),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .child(
-                                div()
-                                    .id("er-fields")
-                                    .track_scroll(&self.er_scroll)
-                                    .size_full()
-                                    .pr_4()
-                                    .overflow_y_scroll()
-                                    .v_flex()
-                                    .children(schema.columns.iter().map(|c| {
-                                        div()
-                                            .h_flex()
-                                            .gap_2()
-                                            .child(if c.primary {
-                                                gpui_component::Icon::default()
-                                                    .path("icons/key.svg")
-                                                    .into_any_element()
-                                            } else {
-                                                div().child("·").into_any_element()
-                                            })
-                                            .child(c.name.clone())
-                                            .child(
-                                                div()
-                                                    .text_color(cx.theme().muted_foreground)
-                                                    .child(c.data_type.clone()),
-                                            )
-                                            .when(!c.comment.is_empty(), |el| {
-                                                el.child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .whitespace_normal()
-                                                        .text_color(cx.theme().muted_foreground)
-                                                        .child(c.comment.clone()),
-                                                )
-                                            })
-                                    }))
-                                    .children(schema.foreign_keys.values.iter().map(|r| {
-                                        div().py_2().whitespace_normal().child(format!(
-                                            "→ {}",
-                                            r.iter()
-                                                .filter_map(|v| v.as_deref())
-                                                .collect::<Vec<_>>()
-                                                .join(" · ")
-                                        ))
-                                    }))
-                                    .when(schema.foreign_keys.values.is_empty(), |el| {
-                                        el.child(t(cx, "dbwork.er.empty"))
-                                    }),
-                            )
-                            .child(
-                                div()
-                                    .absolute()
-                                    .right_0()
-                                    .top_0()
-                                    .bottom_0()
-                                    .w(px(16.))
-                                    .child(
-                                        gpui_component::scroll::Scrollbar::vertical(
-                                            &self.er_scroll,
-                                        )
-                                        .scrollbar_show(
-                                            gpui_component::scroll::ScrollbarShow::Always,
-                                        ),
-                                    ),
-                            ),
-                    ),
+                div().h_flex().gap_2().child(
+                    Button::new("single-er-auto-width")
+                        .ghost()
+                        .label(t(cx, "er.width.auto"))
+                        .on_click(cx.listener(|this, _, _, cx| this.reset_er_width(cx))),
+                ),
             )
+            .child(card)
+            .children(relations.iter().map(|row| {
+                div()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(format!(
+                        "→ {}",
+                        row.iter()
+                            .filter_map(|v| v.as_deref())
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    ))
+            }))
+            .when(relations.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_sm()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(t(cx, "dbwork.er.empty")),
+                )
+            })
             .into_any_element()
     }
 }
@@ -2007,6 +2025,8 @@ impl TableView {
                     Button::new("resume-restored-table")
                         .icon(crate::assets::refresh_icon())
                         .label(t(cx, "tabs.restore_load"))
+                        .loading(self.restore_connection.is_some())
+                        .disabled(self.restore_connection.is_some())
                         .on_click(
                             cx.listener(|this, _, window, cx| this.resume_restored(window, cx)),
                         ),
@@ -2362,7 +2382,7 @@ impl TableView {
 
 impl Render for TableView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.target.mode == Mode::Cards && !self.restored {
+        if self.cards_mode() && !self.restored {
             return self.render_cards(cx);
         }
 

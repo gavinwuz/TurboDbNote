@@ -170,6 +170,26 @@ impl DatabaseView {
             });
         }
     }
+    pub(super) fn open_database_er(&self, id: Uuid, database: String, cx: &mut Context<Self>) {
+        if let Some(profile) = self.note_profile(id) {
+            cx.emit(OpenTable {
+                connection: id,
+                database,
+                object: Object {
+                    schema: String::new(),
+                    name: String::new(),
+                    kind: "table".into(),
+                    comment: String::new(),
+                    parent: String::new(),
+                },
+                mode: crate::table_view::Mode::Er,
+                generation: self.note_generation(id),
+                kind: profile.kind,
+                writable: profile.supports_mutation(),
+                mysql_raw_gbk: profile.mysql_raw_gbk,
+            });
+        }
+    }
 
     pub(crate) fn mongo_context_current(&self, id: Uuid, generation: u64) -> bool {
         self.generation.get(&id).copied() == Some(generation)

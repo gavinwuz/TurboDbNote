@@ -264,7 +264,7 @@ impl Workspace {
                 Some(px(
                     (f32::from(window.viewport_size().width) * 0.38).clamp(360., 640.)
                 )),
-                true,
+                false,
                 window,
                 cx,
             );

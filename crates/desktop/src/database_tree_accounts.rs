@@ -109,41 +109,108 @@ impl DatabaseView {
         } else {
             !self.tree.filter.collapsed.contains(&key)
         };
-        Button::new(SharedString::from(key.clone()))
-            .loading(
-                self.tree
-                    .databases
-                    .get(&scope.id)
-                    .is_some_and(|state| state.busy),
-            )
-            .ghost()
+        let id = scope.id;
+        let owner = cx.entity().downgrade();
+        let menu_scope = scope.clone();
+        let row = div()
+            .h_flex()
             .w_full()
-            .justify_start()
-            .pl(px(26.))
-            .icon(if open {
-                IconName::ChevronDown
-            } else {
-                IconName::ChevronRight
-            })
             .child(
-                gpui_component::Icon::default()
-                    .path("icons/database.svg")
-                    .size_4(),
+                Button::new(SharedString::from(key.clone()))
+                    .loading(
+                        self.tree
+                            .databases
+                            .get(&scope.id)
+                            .is_some_and(|state| state.busy),
+                    )
+                    .ghost()
+                    .flex_1()
+                    .min_w_0()
+                    .justify_start()
+                    .pl(px(26.))
+                    .icon(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .child(
+                        gpui_component::Icon::default()
+                            .path("icons/database.svg")
+                            .size_4(),
+                    )
+                    .child(t(cx, "database.branch.databases"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.tree_object_query(cx).is_empty() {
+                            this.tree_toggle(key.clone(), cx);
+                        } else if !this.tree.filter.collapsed.remove(&key) {
+                            this.tree.filter.collapsed.insert(key.clone());
+                            this.tree.revision += 1;
+                            cx.notify();
+                        } else {
+                            this.tree.revision += 1;
+                            cx.notify();
+                        }
+                    })),
             )
-            .child(t(cx, "database.branch.databases"))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if this.tree_object_query(cx).is_empty() {
-                    this.tree_toggle(key.clone(), cx);
-                } else if !this.tree.filter.collapsed.remove(&key) {
-                    this.tree.filter.collapsed.insert(key.clone());
-                    this.tree.revision += 1;
-                    cx.notify();
-                } else {
-                    this.tree.revision += 1;
-                    cx.notify();
+            .child(
+                Button::new(SharedString::from(format!("refresh-databases-{id}")))
+                    .ghost()
+                    .icon(crate::assets::refresh_icon())
+                    .tooltip(t(cx, "database.cache.refresh_databases"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.request_operation(
+                            id,
+                            turbodbn_services::database::OperationKind::Databases,
+                            cx,
+                        );
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!("filter-databases-{id}")))
+                    .ghost()
+                    .icon(IconName::Search)
+                    .tooltip(t(cx, "database.tree.database_filter"))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.ensure_database_filter(id, window, cx);
+                        if let Some(filter) = this.tree.database_filters.get_mut(&id) {
+                            filter.open = !filter.open;
+                            if filter.open {
+                                filter.input.update(cx, |input, cx| input.focus(window, cx));
+                            }
+                        }
+                        cx.notify();
+                    })),
+            );
+        crate::context_menu::scoped(
+            SharedString::from(menu_scope.key("databases-menu")),
+            row,
+            move |mut menu, _, cx| {
+                for (label, action) in [
+                    ("dbwork.database.new", "create"),
+                    ("database.rule.title", "filter"),
+                    ("dbwork.refresh", "refresh"),
+                ] {
+                    let owner = owner.clone();
+                    menu = menu.item(PopupMenuItem::new(t(cx, label)).on_click(
+                        move |_, window, cx| {
+                            let _ = owner.update(cx, |this, cx| match action {
+                                "create" => this.create_database_dialog(id, window, cx),
+                                "filter" => this.database_rule_dialog(id, window, cx),
+                                _ => {
+                                    this.request_operation(
+                                        id,
+                                        turbodbn_services::database::OperationKind::Databases,
+                                        cx,
+                                    );
+                                }
+                            });
+                        },
+                    ));
                 }
-            }))
-            .into_any_element()
+                menu
+            },
+        )
+        .into_any_element()
     }
     pub(super) fn tree_users_row(&self, scope: Scope, cx: &mut Context<Self>) -> AnyElement {
         self.tree_users_row_at(scope, 26., cx)

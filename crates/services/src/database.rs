@@ -18,6 +18,7 @@ pub mod connection_import;
 pub mod copy;
 pub mod index_design;
 pub mod mysql_restore;
+mod mysql_script_version;
 pub mod notebook_query;
 pub mod redis_value;
 mod remote;

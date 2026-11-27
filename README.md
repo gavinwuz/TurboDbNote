@@ -208,3 +208,7 @@ Light appearance includes Celadon White (default), Mist Blue, Warm Paper and Gra
 SQL file cells support manual source reload, scrollable statement selection with per-statement skipping, and a full SQL viewer with line numbers, search and wrapping. Reload never runs SQL; changed content resets session-only skip selections.
 
 Connection and database context menus can create a scoped Note without running SQL. Double-click the Tables category or use its context menu to open a filterable table-card tab; double-click a card to browse data.
+
+Database table categories can open a database-wide ER tab with masonry cards, up to 15 visible field rows per card, internal scrolling, and saved manual widths. Single-table ER uses the same card layout. Schema details load near the viewport; relationship lines and foreign-key-only filtering are not implemented.
+
+SQL attachments can open native whole-file import from their More menu; the import dialog accepts one dropped SQL file. This route preserves session variables, prepared statements and stored routines in one native-client session, with confirmation and stop-on-error. Note per-statement execution remains restricted. Known mysqldump source-version headers are checked against the target before import; absent headers and cross-major upgrades do not establish full compatibility.
